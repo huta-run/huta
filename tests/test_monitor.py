@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests._util import FIXTURES, etc_copy, load
+from tests._util import FIXTURES, ROOT, etc_copy, load
 from tests import fakemon as FM
 
 from huta.cfg import ConfigError
@@ -526,3 +526,182 @@ class EnsureCrash(_EnsureBase):
                 self.assertTrue(self.dsn_file().read_text().endswith(f"/{proj['id']}"))
                 caps = (self.etc / "secrets" / "_monitor" / "CAPABILITIES").read_text().split()
                 self.assertEqual(caps, [rows["uptime"]["remote_id"]])
+
+
+class StrictLookups(_EnsureBase):
+    """An answer huta can't fully read never leads to a create (codex review of milestone 1)."""
+
+    def answer(self, match: str, body):
+        real = self.fm.handle
+
+        def handle(method, url, headers, data, timeout=10):
+            if match in url + (data or b"").decode() and method in ("GET", "POST") \
+                    and "addSite" not in (data or b"").decode():
+                return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()
+            return real(method, url, headers, data, timeout)
+        return mock.patch.object(self.M, "transport", handle)
+
+    def test_matomo_unreadable_entry(self):
+        with self.answer("getSitesIdFromSiteUrl", [{}]):
+            res = self.ensure(kinds=("analytics",))
+        self.assertIn("can't read", res["analytics"])
+        self.assertEqual(self.fm.creates("matomo"), 0)
+
+    def test_bugsink_unreadable_project(self):
+        with self.answer("/projects/", {"next": None, "previous": None,
+                                        "results": [{"id": "x", "name": "huta_hello_prod"}]}):
+            res = self.ensure(kinds=("errors",))
+        self.assertIn("can't read", res["errors"])
+        self.assertEqual(self.fm.creates("bugsink"), 0)
+
+    def test_bugsink_bad_next_link(self):
+        with self.answer("/projects/", {"next": "https://elsewhere.example.org/", "previous": None,
+                                        "results": []}):
+            res = self.ensure(kinds=("errors",))
+        self.assertIn("cursor", res["errors"])
+        self.assertEqual(self.fm.creates("bugsink"), 0)
+
+    def test_channels_kept_after_lost_create(self):
+        self.fm.fault("hc", "lost-create")
+        self.assertNotEqual(self.ensure(kinds=("uptime",))["uptime"], "ok")
+        self.fm.fault("hc", None)
+        s = self.fm.state()
+        c = next(iter(s["hc"]["checks"].values()))
+        self.assertEqual(c["channels"], "*")
+        c["channels"] = "pager"                      # the operator changes them meanwhile
+        self.fm._save(s)
+        self.assertEqual(self.ensure(kinds=("uptime",)), {"uptime": "ok"})
+        self.assertEqual(next(iter(self.fm.state()["hc"]["checks"].values()))["channels"], "pager")
+        self.assertEqual(self.fm.creates("hc"), 1)
+
+    def test_lock_and_store_failures_dont_raise(self):
+        with mock.patch.object(self.M.os, "open", side_effect=PermissionError("no")):
+            res = self.ensure()
+        self.assertEqual(set(res), {"errors", "analytics", "uptime"})
+        broken = mock.Mock()
+        broken.event.side_effect = RuntimeError("database is locked")
+        broken.monitor.side_effect = RuntimeError("database is locked")
+        res = self.M.ensure(self.platform, broken, self.project, self.t,
+                            log=mock.Mock(side_effect=RuntimeError("log")))
+        self.assertEqual(set(res), {"errors", "analytics", "uptime"})
+
+
+class Transport(unittest.TestCase):
+    """The real HTTP transport against a local server that misbehaves."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                import time as T
+                if self.path == "/drip-headers":
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                    for i in range(40):
+                        self.wfile.write(f"X-{i}: y\r\n".encode())
+                        self.wfile.flush()
+                        T.sleep(0.1)
+                    return
+                if self.path == "/drip-body":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000")
+                    self.end_headers()
+                    for _ in range(40):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        T.sleep(0.1)
+                    return
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.1:1/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path == "/big":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"x" * 5000)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        cls.srv.daemon_threads = True
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def get(self, path, timeout=1.5):
+        from huta import monitor as M
+        return M._transport("GET", self.base + path, {}, None, timeout)
+
+    def test_ok(self):
+        self.assertEqual(self.get("/")[0], 200)
+
+    def test_dripping_is_cut_at_the_deadline(self):
+        import time as T
+        for path in ("/drip-headers", "/drip-body"):
+            with self.subTest(path=path):
+                t0 = T.monotonic()
+                with self.assertRaises((TimeoutError, OSError)):
+                    self.get(path)
+                self.assertLess(T.monotonic() - t0, 2.5)
+
+    def test_redirect_not_followed(self):
+        self.assertEqual(self.get("/redirect")[0], 302)
+
+    def test_size_cap(self):
+        from huta import monitor as M
+        with mock.patch.object(M, "LIMIT", 1000):
+            status, _h, body = self.get("/big")
+            self.assertLessEqual(len(body), 1000 + 65536)
+            with mock.patch.object(M, "transport", lambda *a: (200, {}, body)):
+                with self.assertRaisesRegex(M.MonitorError, "too large"):
+                    M._call("GET", self.base + "/big", {}, None, M._deadline())
+
+
+class PlanWithMonitoringDown(_EnsureBase):
+    """A release is still planned when every monitoring service is down, or the ensure lock
+    can't be taken: monitoring failures are events, never outcomes."""
+
+    def plan(self):
+        from tests._util import IMAGE, SHA, app_toml
+        from huta import cli, recipe, runtime as R
+        gh = mock.Mock()
+        gh.read_file.return_value = (ROOT / "examples/hello/deploy/app.toml").read_text()
+        with mock.patch.object(recipe, "check_image_map", lambda *a, **k: None), \
+                mock.patch.object(R, "secret_value", lambda *a: "x" * 16), \
+                mock.patch.object(R, "staged", lambda *a: {}), \
+                mock.patch.object(R, "staged_list", lambda *a: []), \
+                mock.patch.object(R, "live_versions", lambda *a: {}):
+            rid = cli.plan_release(self.platform, self.project, self.st, self.t, SHA, IMAGE,
+                                   "huta-build/hello:x", gh)
+        return self.st.release(rid)
+
+    def test_services_down(self):
+        for svc in ("hc", "bugsink", "matomo"):
+            self.fm.fault(svc, "down")
+        r = self.plan()
+        self.assertEqual(r["state"], "planned")
+        fails = [e["msg"] for e in self.st.events(limit=20) if e["kind"] == "monitor-fail"]
+        self.assertEqual(sorted(m.split(":")[0] for m in fails), ["analytics", "errors"])
+
+    def test_lock_unavailable(self):
+        real_open = os.open
+
+        def no_lock(path, *a, **k):
+            if str(path).endswith("monitor-ensure.lock"):
+                raise PermissionError("no")
+            return real_open(path, *a, **k)
+        with mock.patch.object(os, "open", no_lock):
+            self.assertEqual(self.plan()["state"], "planned")

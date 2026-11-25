@@ -195,6 +195,10 @@ class FakeMonitoring:
             return 200, {"Content-Type": "text/plain"}, b"OK"
         if h.get("x-api-key") != HC_KEY:
             return _json(401, {"error": "missing api key"})
+        if u.path == "/api/v3/checks/" and method == "GET":
+            tag = urllib.parse.parse_qs(u.query).get("tag", [None])[0]
+            rows = [c for c in hc["checks"].values() if tag is None or tag in c["tags"].split()]
+            return _json(200, {"checks": [self._hc_dict(c) for c in rows]})
         if u.path == "/api/v3/checks/" and method == "POST":
             try:
                 spec = json.loads(body)

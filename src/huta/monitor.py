@@ -56,7 +56,31 @@ class MonitorError(Exception):
 def _transport(method: str, url: str, headers: dict, body: bytes | None,
                timeout: float) -> tuple[int, dict, bytes]:
     """One request: (status, headers, body). No proxy, no redirect (a 3xx comes back as its
-    status), the whole answer within `timeout`, at most LIMIT + 1 bytes read."""
+    status), at most LIMIT + 1 bytes read, and the whole exchange — connect, headers, body —
+    within `timeout`. Socket timeouts only bound each wait, so a server dripping bytes could
+    hold a read for ever: the request runs in a daemon thread and is abandoned at the deadline
+    (codex review of milestone 1, #2)."""
+    import threading
+    box: list = []
+
+    def run():
+        try:
+            box.append(("ok", _transport_once(method, url, headers, body, timeout)))
+        except BaseException as e:  # noqa: BLE001 — handed to the caller
+            box.append(("err", e))
+    th = threading.Thread(target=run, daemon=True, name="huta-monitor-http")
+    th.start()
+    th.join(timeout)
+    if not box:
+        raise TimeoutError("answer too slow")
+    kind, v = box[0]
+    if kind == "err":
+        raise v
+    return v
+
+
+def _transport_once(method: str, url: str, headers: dict, body: bytes | None,
+                    timeout: float) -> tuple[int, dict, bytes]:
     from .recipe import _OPENER
     deadline = time.monotonic() + timeout
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -92,7 +116,7 @@ def _call(method: str, url: str, headers: dict, body: bytes | None, deadline: fl
         raise MonitorError("out of time")
     try:
         status, _h, raw = transport(method, url, headers, body, left)
-    except (OSError, TimeoutError) as e:
+    except Exception as e:  # noqa: BLE001 — refused, reset, timed out, a bad status line …
         raise MonitorError(f"no answer ({type(e).__name__})") from None
     if 300 <= status < 400:
         raise MonitorError(f"redirected ({status}); a loopback Matomo with force_ssl needs "
@@ -162,6 +186,27 @@ def hc_upsert(platform: Platform, spec: dict, deadline: float) -> dict:
 HC_STATES = ("new", "up", "grace", "down", "paused", "started")
 
 
+def hc_find(platform: Platform, check_name: str, tag: str, deadline: float) -> str | None:
+    """The uuid of the check called check_name among those tagged `tag`, or None."""
+    hc = platform.monitoring["healthchecks"]
+    _s, d = _call("GET", f"{hc['url']}/api/v3/checks/?{urllib.parse.urlencode({'tag': tag})}",
+                  _hc_headers(platform), None, deadline, ok=(200,))
+    if not isinstance(d, dict) or not isinstance(d.get("checks"), list):
+        raise MonitorError("healthchecks answered with no check list")
+    found = []
+    for c in d["checks"]:
+        if not (isinstance(c, dict) and isinstance(c.get("name"), str)):
+            raise MonitorError("healthchecks listed a check huta can't read")
+        if c["name"] == check_name:
+            u = c.get("uuid")
+            if not isinstance(u, str) or not UUID_RE.match(u):
+                raise MonitorError("healthchecks gave no check id (is the API key read-only?)")
+            found.append(u)
+    if len(found) > 1:
+        raise MonitorError(f"ambiguous: {len(found)} healthchecks checks are called {check_name}")
+    return found[0] if found else None
+
+
 def hc_pause(platform: Platform, uuid: str, deadline: float) -> None:
     if not UUID_RE.match(uuid):
         raise MonitorError("bad check id")
@@ -224,11 +269,18 @@ def bs_find(platform: Platform, pname: str, deadline: float) -> dict | None:
             raise MonitorError("Bugsink answered with no project list")
         for p in page["results"]:
             q = _project_of(p)
-            if q and q["name"] == pname:
+            if q is None:
+                # A row huta can't read might be the one it is looking for: refuse rather than
+                # create a second (codex review of milestone 1, #3).
+                raise MonitorError("Bugsink listed a project huta can't read")
+            if q["name"] == pname:
                 found.append(q)
-        cursor = _cursor(page.get("next"))
-        if not cursor:
+        nxt = page.get("next")
+        if nxt is None:
             break
+        cursor = _cursor(nxt)
+        if not cursor:
+            raise MonitorError("Bugsink's next page link has no cursor huta can read")
     else:
         raise MonitorError("Bugsink has too many projects to list")
     if len(found) > 1:
@@ -292,8 +344,10 @@ def mt_find(platform: Platform, url: str, deadline: float) -> int | None:
     d = _mt(platform, "SitesManager.getSitesIdFromSiteUrl", {"url": url}, deadline)
     if not isinstance(d, list):
         raise MonitorError("Matomo answered with no site list")
-    ids = sorted({int(x["idsite"]) for x in d if isinstance(x, dict)
-                  and re.fullmatch(r"[1-9]\d{0,9}", str(x.get("idsite", "")))})
+    if not all(isinstance(x, dict) and re.fullmatch(r"[1-9]\d{0,9}", str(x.get("idsite", "")))
+               for x in d):
+        raise MonitorError("Matomo listed a site huta can't read")
+    ids = sorted({int(x["idsite"]) for x in d})
     if len(ids) > 1:
         raise MonitorError(f"ambiguous: {len(ids)} Matomo sites have {url}; set matomo = <id>")
     return ids[0] if ids else None
@@ -367,16 +421,25 @@ def ensure(platform: Platform, st, project: Project, t: Target, kinds=ENSURE_KIN
                     out[kind] = "ok"
                 except Exception as e:  # noqa: BLE001 — monitoring never fails its caller
                     out[kind] = _fail(st, t, kind, e, log)
-    except MonitorError as e:
+    except Exception as e:  # noqa: BLE001 — the lock file, the store: never the caller's problem
         for kind in want:
             out.setdefault(kind, _fail(st, t, kind, e, log))
     return out
 
 
 def _fail(st, t: Target, kind: str, e: Exception, log) -> str:
-    why = redact(str(e))[:300] if isinstance(e, (MonitorError, ConfigError)) else type(e).__name__
-    st.event("monitor-fail", f"{kind}: {why}", None, t.project, t.name)
-    log(f"monitor {kind}: {why}")
+    """Record a failure; recording may fail too (a locked or full database), and that is not
+    the caller's problem either."""
+    try:
+        why = redact(str(e))[:300] if isinstance(e, (MonitorError, ConfigError)) else type(e).__name__
+    except Exception:  # noqa: BLE001
+        why = type(e).__name__
+    for f in (lambda: st.event("monitor-fail", f"{kind}: {why}", None, t.project, t.name),
+              lambda: log(f"monitor {kind}: {why}")):
+        try:
+            f()
+        except Exception:  # noqa: BLE001
+            pass
     return why
 
 
@@ -423,12 +486,15 @@ def _ensure_uptime(platform, st, project, t, deadline) -> None:
         raise MonitorError("no [monitoring.healthchecks] on this host")
     n = name(platform, t)
     spec = {"name": n, "timeout": UPTIME_TIMEOUT, "grace": UPTIME_GRACE,
-            "tags": f"huta {project.name} {t.name} uptime",
+            "tags": f"{platform.monitoring['prefix']} {project.name} {t.name} uptime",
             "desc": f"huta probes https://{t.hosts[0]} for {project.name}/{t.name}"}
     row = st.monitor(project.name, t.name, "uptime", n)
     if row and json.loads(row["spec"] or "{}") == spec:
         return
-    first = {"channels": platform.monitoring["healthchecks"]["channels"]} if not row else {}
+    # channels only when the check is new remotely, not merely new to huta: after a create whose
+    # answer was lost, the operator may have changed them since (codex review of milestone 1, #4).
+    exists = row is not None or hc_find(platform, n, platform.monitoring["prefix"], deadline)
+    first = {} if exists else {"channels": platform.monitoring["healthchecks"]["channels"]}
     c = hc_upsert(platform, {**spec, **first}, deadline)
     remember_capability(platform, c["uuid"])
     st.set_monitor(project.name, t.name, "uptime", n, c["uuid"], spec)

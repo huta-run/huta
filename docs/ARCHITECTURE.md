@@ -323,17 +323,23 @@ Built so far (docs/PLAN-monitoring.md milestone 1): the remote resources. The re
 - It runs at planning time for `errors` and `analytics` (the kinds that will change the
   container), and for everything with `huta monitor ensure`. One ensure on the host at a time
   (`<state_dir>/monitor-ensure.lock`, outside `locks/`), 30 s for all its calls.
-- Calls: no proxy, no redirect, 10 s each with a wall-clock deadline, 8 MiB. Answers are
-  checked: ids by regex, exactly one remote resource per name (two is `ambiguous`, nothing is
-  guessed), the DSN must be `https://<32 hex>@<dsn_host>/<project id>`. healthchecks' returned
+- Calls: no proxy, no redirect, 8 MiB, and 10 s each for the whole exchange (connect,
+  headers, body: the request runs in a thread that is abandoned at the deadline, since socket
+  timeouts only bound each wait). Answers are checked: ids by regex, exactly one remote
+  resource per name (two is `ambiguous`, nothing is guessed; a listing with an entry or a page
+  link huta can't read is refused rather than taken as "not there", so it never leads to a
+  create), the DSN must be `https://<32 hex>@<dsn_host>/<project id>`. healthchecks' returned
   ping URL is never used; huta builds ping URLs from `ping` and the checked id. Matomo calls are
   POST with the token in the body and `X-Forwarded-Proto: https` (Matomo with `force_ssl`
   redirects plain loopback calls otherwise).
 - A failure is an event `monitor-fail` (kind and a short reason) and never fails a release.
 - Order and crashes: remote create → capability (check ids) → `monitors` row → DSN secret. A
   crash after a create is healed by the next `find` (same name); a row whose DSN secret is
-  missing is repaired from the project id. A new check is created with `channels` (healthchecks
-  gives API-made checks no channels otherwise); later calls don't send it.
+  missing is repaired from the project id. A check is looked up by name before the upsert;
+  only one that doesn't exist yet is created with `channels` (healthchecks gives API-made checks
+  no channels otherwise), so a create whose answer was lost never overwrites channels the
+  operator changed since. Any error in ensure, including its lock file or recording the event,
+  stays inside it.
 
 ## Crash safety
 

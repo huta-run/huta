@@ -3,6 +3,7 @@
   "hc_check": ["badge_url", "channels", "desc", "filter_body", "filter_default_fail", "filter_http_body", "filter_subject", "failure_kw", "grace", "last_ping", "manual_resume", "methods", "n_pings", "name", "next_ping", "pause_url", "ping_url", "resume_url", "slug", "start_kw", "started", "status", "subject", "subject_fail", "success_kw", "tags", "update_url", "uuid"],
   "hc_check_simple": ["timeout"],
   "hc_check_schedule": ["schedule", "tz"],
+  "hc_list": ["checks"],
   "hc_flips": ["flips"],
   "hc_flip": ["timestamp", "up"],
   "bugsink_page": ["next", "previous", "results"],
