@@ -109,8 +109,8 @@ Ask the human, and stop, when:
 - the project needs a host registry entry or a change to one;
 - the project needs something the host registry doesn't grant yet (a secret, a data volume,
   an egress entry, an upstream): write the exact request for the operator;
-- the project needs anything huta refuses: online migrations, preflight checks, plain-HTTP
-  egress, a data volume and a database together;
+- the project needs anything huta refuses: preflight checks, plain-HTTP egress, a data
+  volume and a database together;
 - a one-writer release ended `needs-human` after its switch: the human decides whether to roll
   back (`huta rollback`), because the data was already written by the new release;
 - a DNS record or certificate is missing (`huta edge` is the operator's step);

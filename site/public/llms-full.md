@@ -1,6 +1,6 @@
 # huta
 
-> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v1. Available: one recipe `web` (exactly one HTTP container), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, gateways (a public hostname for a service huta doesn't run), and Postgres per target (huta runs it: pinned image, own volume and networks, app and migrate roles, dumps, planned upgrades). and publishing to Cloudflare Pages and Workers as a step of a release (files copied out of the image without running it, a pinned wrangler with egress to Cloudflare only). Planned, not available: online migrations, unattended releases, `huta snapshot`, monitoring hooks, plain-HTTP egress.
+> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v1. Available: one recipe `web` (exactly one HTTP container), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, gateways (a public hostname for a service huta doesn't run), and Postgres per target (huta runs it: pinned image, own volume and networks, app and migrate roles, dumps, planned upgrades). and publishing to Cloudflare Pages and Workers as a step of a release (files copied out of the image without running it, a pinned wrangler with egress to Cloudflare only). Migrations can also run online (the old release serving) when the repo, the host and the old release's runs_on all allow it. Planned, not available: unattended releases, `huta snapshot`, monitoring hooks, plain-HTTP egress.
 
 If you are an agent running on an empty server and asked to **set it up as a huta host**, follow https://huta.run/host.md step by step (it diagnoses the server first, then asks the human before each change). If you are an agent asked to **install the huta client** on a machine, follow https://huta.run/install.md step by step (it tells you what to ask the human and what to confirm before touching the server). If you are an agent asked to deploy a project with huta, read the start page first, check its prerequisites, then follow it in order. Everything is also in one file: https://huta.run/llms-full.md
 
@@ -855,7 +855,7 @@ plan expired).
 Also tell the human, without being asked, when:
 
 - a prerequisite in step 0 is missing;
-- the project needs something huta does not have (online migrations, preflight checks):
+- the project needs something huta does not have (preflight checks, unattended releases):
   name the feature and say it is planned in huta, not available;
 - the host registry needs a new or changed entry (env, secrets, egress, upstreams, data): give
   them the exact file (jobs and smoke checks live in `app.toml`; the owner sees them in the
@@ -1132,7 +1132,17 @@ new schema; then the new code starts and is checked as usual.
   matter: the copy goes back).
 - The public checks fail after the switch: the new code keeps serving (`needs-human`), as for
   any one-writer release; going back means a restore.
-- `online = true` (migrating while the old release serves) and a result `check` are *planned*.
+- **Online** (`online = true`): the migration runs while the live release keeps serving, for
+  changes its code tolerates (adding a column or a table). It needs all of: `online = true`
+  here, `migrate_online = true` from the host, the live release's `runs_on` including the new
+  schema, and releases allowed to overlap. Otherwise it runs exclusive. A reference copy is
+  pinned (for a restore plan), but **nothing is restored automatically**, because the live
+  release kept writing: a failed migration ends `needs-human` while the old release serves; a
+  new release that fails its checks afterwards ends `nothing-activated` and the schema stays
+  migrated (the old code runs on it).
+- `check = ["python", "manage.py", "schema"]` (optional, argv): prints the data's schema
+  number. huta runs it when an online migration's result is unknown (it failed, or huta died
+  during it). Without it such a crash ends `needs-human`.
 
 Going back across a schema: `huta rollback` refuses code whose `runs_on` doesn't include the
 data's current schema. `huta restore <project> <target> --to <release>` plans putting back the
@@ -1373,6 +1383,7 @@ see each other: the box is the unit huta can tell apart.
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
+| `migrate_online` | bool | `false` | `true` lets a release migrate online when it asks (`[migrate] online = true`), the live release runs on the new schema, and releases may overlap |
 | `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
 | `external.<name>` | table | | where an `[external.<name>]` goes: `name` (Pages project or Worker), `account` (32 hex), `token` (a platform secret name; Cloudflare tokens are account-wide), Workers also `routes` (like `example.org/api/*`, in an allowed zone, not another target's host) and `compatibility_date`. Needs `[external] wrangler` in `huta.toml` |
 | `postgres` | table | | `version` (a name in `huta.toml` `[postgres.images]`), `size` (256m..2t), `backup` (`hourly`/`daily`/`off`/an OnCalendar, default `daily`), `limits` (default 1g memory, 2 cpus). Needs `[backup]` in `huta.toml`. A target named `<this>-pg` can't exist next to it |
@@ -2822,8 +2833,8 @@ Ask the human, and stop, when:
 - the project needs a host registry entry or a change to one;
 - the project needs something the host registry doesn't grant yet (a secret, a data volume,
   an egress entry, an upstream): write the exact request for the operator;
-- the project needs anything huta refuses: online migrations, preflight checks, plain-HTTP
-  egress, a data volume and a database together;
+- the project needs anything huta refuses: preflight checks, plain-HTTP egress, a data
+  volume and a database together;
 - a one-writer release ended `needs-human` after its switch: the human decides whether to roll
   back (`huta rollback`), because the data was already written by the new release;
 - a DNS record or certificate is missing (`huta edge` is the operator's step);

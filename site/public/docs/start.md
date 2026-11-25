@@ -194,7 +194,7 @@ plan expired).
 Also tell the human, without being asked, when:
 
 - a prerequisite in step 0 is missing;
-- the project needs something huta does not have (online migrations, preflight checks):
+- the project needs something huta does not have (preflight checks, unattended releases):
   name the feature and say it is planned in huta, not available;
 - the host registry needs a new or changed entry (env, secrets, egress, upstreams, data): give
   them the exact file (jobs and smoke checks live in `app.toml`; the owner sees them in the

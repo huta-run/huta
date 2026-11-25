@@ -18,6 +18,7 @@ secrets = ["NOTES_TOKEN"]
 job_secrets = { rotate = ["ROTATE_KEY"] }
 limits = { memory = "512m", cpus = 2, pids = 256, tmp = "64m" }
 data = { size = "2g", backup = "hourly", concurrent = true }
+migrate_online = true
 
 [targets.staging]
 hosts = ["staging.notes.example.org"]

@@ -41,6 +41,8 @@ class Scenario:
     faults: dict = {}
     schema_r1 = schema_r2 = None   # migration scenarios: the schema each release declares
     migrate_r2 = False
+    online = False                 # r2 migrates online (r1 runs on both schemas; never restores)
+    check_r2 = True                # with online: the repo's [migrate] check exists
 
     def app(self):
         """The manifest both releases use (scenarios with several components shape it)."""
@@ -61,11 +63,20 @@ class Scenario:
                 f"{t.hosts[0]} {{\n\treverse_proxy 127.0.0.1:9999\n}}\n")
             host._reload_caddy()
         if not self.first_release:
-            r1 = host.plan(project, t, versioned(app, self.schema_r1), SHA1)
+            a1 = versioned(app, self.schema_r1)
+            if self.online:
+                a1["state"]["runs_on"] = [self.schema_r1, self.schema_r2]
+            r1 = host.plan(project, t, a1, SHA1)
             self.assertEqual(host.release(project, t, r1), LIVE, "setup: r1 did not go live")
         if self.faults:
             host.fault(**self.faults)
-        r2 = host.plan(project, t, versioned(app, self.schema_r2, self.migrate_r2), SHA2)
+        a2 = versioned(app, self.schema_r2, self.migrate_r2)
+        if self.online:
+            a2["migrate"]["online"] = True
+            if self.check_r2:
+                a2["migrate"]["check"] = ["python", "/app/app.py", "schema"]
+        r2 = host.plan(project, t, a2, SHA2)
+        self.ops_before_r2 = len(host.ops())
         self.schema_before = host.schema(t)
         before = list(host.data_state(t)["writes"])
         return host, project, t, r1, r2, before
@@ -150,8 +161,19 @@ class Scenario:
                 self.assertEqual(ds["writes"][:len(before)], before,
                                  f"{where}: writes from before r2 were lost")
         if self.schema_r2 is not None:
-            want = self.schema_r2 if live and live["release_id"] == r2 else self.schema_before
-            self.assertEqual(host.schema(t), want, f"{where}: recorded schema")
+            if live and live["release_id"] == r2:
+                self.assertEqual(host.schema(t), self.schema_r2, f"{where}: recorded schema")
+            elif self.online:
+                # Online never restores: the schema is wherever the migration left it, and the
+                # record agrees with what the data reports (unless a human must look).
+                if rows[r2]["state"] != NH:
+                    self.assertEqual(host.schema(t), host.data_state(t).get("schema", self.schema_before),
+                                     f"{where}: recorded schema vs the data")
+            else:
+                self.assertEqual(host.schema(t), self.schema_before, f"{where}: recorded schema")
+        if self.online:
+            self.assertNotIn("data restore", host.ops()[self.ops_before_r2:],
+                             f"{where}: an online migration was restored")
         return live
 
     def snapshot(self, host):
@@ -482,6 +504,28 @@ class PublishFails(Scenario, unittest.TestCase):
         # r1 publishes fine; the fault applies to r2 only (the base class sets faults after r1).
         return super().setup_host()
     clean, allowed = NH, {NA, NH}
+
+
+class OnlineMigrate(Scenario, unittest.TestCase):
+    """Online: the old release keeps serving while the migration runs; nothing is restored."""
+    project_name, target_name = "notes", "prod"
+    schema_r1, schema_r2, migrate_r2, online = 1, 2, True, True
+    allowed = {LIVE, NA, NH}
+
+
+class OnlineMigrateFails(Scenario, unittest.TestCase):
+    """The online migration fails: needs-human, the old release still serves, no restore."""
+    project_name, target_name = "notes", "prod"
+    schema_r1, schema_r2, migrate_r2, online = 1, 2, True, True
+    faults = {"migrate_fail": True}
+    clean, allowed = NH, {NA, NH}
+
+
+class OnlineNoCheck(Scenario, unittest.TestCase):
+    """Online without a check: a crash mid-migration can't be resolved, so a human decides."""
+    project_name, target_name = "notes", "prod"
+    schema_r1, schema_r2, migrate_r2, online, check_r2 = 1, 2, True, True, False
+    allowed = {LIVE, NA, NH}
 
 
 class PhaseRecords(unittest.TestCase):

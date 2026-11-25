@@ -251,7 +251,17 @@ new schema; then the new code starts and is checked as usual.
   matter: the copy goes back).
 - The public checks fail after the switch: the new code keeps serving (`needs-human`), as for
   any one-writer release; going back means a restore.
-- `online = true` (migrating while the old release serves) and a result `check` are *planned*.
+- **Online** (`online = true`): the migration runs while the live release keeps serving, for
+  changes its code tolerates (adding a column or a table). It needs all of: `online = true`
+  here, `migrate_online = true` from the host, the live release's `runs_on` including the new
+  schema, and releases allowed to overlap. Otherwise it runs exclusive. A reference copy is
+  pinned (for a restore plan), but **nothing is restored automatically**, because the live
+  release kept writing: a failed migration ends `needs-human` while the old release serves; a
+  new release that fails its checks afterwards ends `nothing-activated` and the schema stays
+  migrated (the old code runs on it).
+- `check = ["python", "manage.py", "schema"]` (optional, argv): prints the data's schema
+  number. huta runs it when an online migration's result is unknown (it failed, or huta died
+  during it). Without it such a crash ends `needs-human`.
 
 Going back across a schema: `huta rollback` refuses code whose `runs_on` doesn't include the
 data's current schema. `huta restore <project> <target> --to <release>` plans putting back the
@@ -492,6 +502,7 @@ see each other: the box is the unit huta can tell apart.
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
+| `migrate_online` | bool | `false` | `true` lets a release migrate online when it asks (`[migrate] online = true`), the live release runs on the new schema, and releases may overlap |
 | `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
 | `external.<name>` | table | | where an `[external.<name>]` goes: `name` (Pages project or Worker), `account` (32 hex), `token` (a platform secret name; Cloudflare tokens are account-wide), Workers also `routes` (like `example.org/api/*`, in an allowed zone, not another target's host) and `compatibility_date`. Needs `[external] wrangler` in `huta.toml` |
 | `postgres` | table | | `version` (a name in `huta.toml` `[postgres.images]`), `size` (256m..2t), `backup` (`hourly`/`daily`/`off`/an OnCalendar, default `daily`), `limits` (default 1g memory, 2 cpus). Needs `[backup]` in `huta.toml`. A target named `<this>-pg` can't exist next to it |

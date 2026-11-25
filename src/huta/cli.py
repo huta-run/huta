@@ -312,11 +312,19 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
                        + f"; token {reg['token']} is account-wide")
     if mig and mig["run"]:
         m = app["migrate"]
-        changes.append(f"⚠️ migrates the data from schema {mig['from'] if mig['from'] is not None else 'unversioned'} "
-                       f"to {mig['to']} with {' '.join(m['cmd'])} (image {m['image']}, "
-                       f"at most {m['timeout']}). Every writer stops first and the site answers "
-                       "502 until the switch; a copy is taken and pinned, and any failure before "
-                       "the switch puts it back")
+        frm = mig['from'] if mig['from'] is not None else 'unversioned'
+        if recipe.online_ok(st, t, app, mig):
+            changes.append(f"⚠️ migrates ONLINE from schema {frm} to {mig['to']} with "
+                           f"{' '.join(m['cmd'])} (image {m['image']}, at most {m['timeout']}) "
+                           "while the live release keeps serving; a reference copy is pinned, but "
+                           "nothing is restored automatically: a failed migration is needs-human")
+        else:
+            changes.append(f"⚠️ migrates the data from schema {frm} to {mig['to']} with "
+                           f"{' '.join(m['cmd'])} (image {m['image']}, at most {m['timeout']}). "
+                           "Every writer stops first and the site answers 502 until the switch; "
+                           "a copy is taken and pinned, and any failure before the switch puts it "
+                           "back" + (" (online was asked for, but the host, the live release's "
+                                     "runs_on or overlap don't allow it)" if m.get("online") else ""))
     if not live_rel:
         changes.append("first release of this target")
         if edge.adopt_pending(platform, t):

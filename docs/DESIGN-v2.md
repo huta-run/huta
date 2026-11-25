@@ -1,7 +1,7 @@
 # huta v2: several containers, Postgres, migrations, gateways, external publishing
 
-Status: **planned**, being built in the order of `docs/BUILD-v2.md`. Each section says what is
-built; anything not marked built is planned. Reviewed as a plan by three independent reviewers
+Status: **built** on the `v2` branch, in the order of `docs/BUILD-v2.md` (each section is
+marked). Not yet installed on a host. Reviewed as a plan by three independent reviewers
 (2026-11-25) before any code; their findings are folded into the text, and the decisions they
 split on were made by the operator (listed at the end).
 
@@ -271,11 +271,11 @@ compatibility_date = "2026-11-01"  # worker only
 - **Rollback** by the recorded deployment (Pages) or version (Workers), as its own approved
   plan. Cloudflare tokens are account-wide; the plan says so.
 
-## 6. Migrations, online mode
+## 6. Migrations, online mode (built)
 
 For changes the running code tolerates (adding a column, a table): the old release keeps
 serving while the migration runs. Three yeses are needed: the repo's `[migrate] online = true`,
-the host's `migrate = { online = true }`, and the live release's `runs_on` containing the new
+the host's `migrate_online = true`, and the live release's `runs_on` containing the new
 schema. Otherwise the release runs exclusive.
 
 - Order: dump (a reference copy, never restored automatically) → phase `migrating` → migrate

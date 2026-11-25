@@ -82,6 +82,13 @@ class Migrations(unittest.TestCase):
         self.refused(MIGRATING.replace('cmd = ["python", "/app/app.py", "migrate"]',
                                        'cmd = "python /app/app.py migrate"'), "argv")
 
+    def test_online_and_check(self):
+        app = self.parse(MIGRATING.replace('"migrate"]', '"migrate"]\nonline = true\n'
+                                           'check = ["python", "/app/app.py", "schema"]'))
+        self.assertTrue(app["migrate"]["online"])
+        self.assertEqual(app["migrate"]["check"], ["python", "/app/app.py", "schema"])
+        self.refused(MIGRATING.replace('"migrate"]', '"migrate"]\ncheck = "schema"'), "argv")
+
     def test_migrate_image_must_exist(self):
         self.refused(MIGRATING.replace('[migrate]\nimage = "web"', '[migrate]\nimage = "api"'),
                      "must name one of")
@@ -208,11 +215,6 @@ class PlannedFeaturesRefused(unittest.TestCase):
 
     def test_schema_2(self):
         self.refused(HELLO.replace("schema = 1", "schema = 2"), "schema must be 1")
-
-    def test_online_migration(self):
-        with self.assertRaisesRegex(ConfigError, "not supported by huta yet"):
-            parse_app_toml(MIGRATING.replace('"migrate"]', '"migrate"]\nonline = true'), "notes")
-
 
 
 if __name__ == "__main__":

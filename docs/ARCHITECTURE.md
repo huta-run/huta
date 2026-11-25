@@ -361,6 +361,14 @@ recorded one runs exclusive: stop every writer → copy (quiet) → pin the copy
 `migrating` → the `[migrate]` container (release image, no network, `migrate_secrets` only) →
 schema recorded, phase `migrated` → start, check, switch. Any failure before the switch, or a
 crash, restores the copy and the schema: nothing but the migration wrote since the copy.
+Online migrations (DESIGN-v2 §6; `recipe.online_ok`): when the repo asks, the host's
+`migrate_online` allows it, the live release's `runs_on` includes the new schema and the two
+releases may overlap, the migration runs with the old slot serving: reference copy pinned →
+phase `migrating` (`online`) → `[migrate]` → schema recorded → the release continues as an
+ordinary overlapping one. Never restored automatically: a failure is `needs-human` (the repo's
+`check` tells the schema when it can); reconcile waits for a migration still running, asks
+`check`, stops the new slot, and records `nothing-activated`, or `needs-human` when the result
+can't be known.
 `health_timeout` (registry) sets how long a new slot has to get healthy.
 Postgres (DESIGN-v2 §4, `pg.py`): one server per target in compose project
 `huta_<p>_<t>_pg`, image from `[postgres.images]`, its own loop volume (`<t>-pg.img`, PGDATA

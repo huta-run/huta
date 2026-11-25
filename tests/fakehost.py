@@ -383,11 +383,17 @@ class FakeHost:
 
     def docker_run(self, argv, env, timeout):
         """The [migrate] container: it writes to the data (as a migration does), then exits."""
-        assert argv[:3] == ["docker", "run", "--rm"] and "none" in argv, argv
+        assert argv[:3] == ["docker", "run", "--rm"], argv
         t_key = f"{env['HUTA_PROJECT']}/{env['HUTA_TARGET']}"
+        if "run.huta.check=1" in argv:
+            # The repo's check: the schema the data is at.
+            e = self._load("data").get(t_key, {})
+            self._op("migrate check ran")
+            return 0, str(e.get("schema", env["HUTA_SCHEMA_FROM"]))
         v = self._load("data")
-        v.setdefault(t_key, {"writes": [], "copy": None, "overlaps": []})["writes"].append(
-            f"migrate:{env['RELEASE_SHA']}")
+        e = v.setdefault(t_key, {"writes": [], "copy": None, "overlaps": []})
+        e["writes"].append(f"migrate:{env['RELEASE_SHA']}")
+        e["schema"] = int(env["HUTA_SCHEMA_TO"])
         self._save("data", v)
         running = [c for c in self._load("docker")["containers"].values() if c["running"]
                    and c.get("data") and f"{c['labels']['run.huta.project']}/"
@@ -457,6 +463,7 @@ class FakeHost:
         v = self._load("data")
         e = v.setdefault(f"{t.project}/{t.name}", {"writes": [], "copy": None, "overlaps": []})
         e["copy"] = list(e["writes"])
+        e["copy_schema"] = e.get("schema")
         self._save("data", v)
         self._op("data copy")
         return self.root / "backup"
@@ -467,6 +474,7 @@ class FakeHost:
         if not e or e["copy"] is None:
             raise data.DataError("no copy to restore")
         e["writes"] = list(e["copy"])
+        e["schema"] = e.get("copy_schema")
         self._save("data", v)
         self._op("data restore")
 

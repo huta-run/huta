@@ -241,6 +241,7 @@ class Target:
     gateway: dict | None = None                      # {"to": "ip:port", "secret": NAME, "header": H}
     edge: dict = field(default_factory=dict)         # {"body": bytes, "timeout": "10m"}
     health_timeout: int = 30                         # seconds a new slot has to report healthy
+    migrate_online: bool = False                     # the host allows online migrations
     # Several containers (DESIGN-v2 §3): per component limits, env and secrets; how long a new
     # worker must stay up after the switch.
     components: dict = field(default_factory=dict)
@@ -484,6 +485,12 @@ def _components_cfg(v, target_env: dict, where: str) -> dict:
                 raise ConfigError(f"{w}: {k} is both in env and secrets")
         out[name] = {"limits": dict(limits), "env": dict(env), "secrets": list(secrets)}
     return out
+
+
+def _bool(v, where: str) -> bool:
+    if not isinstance(v, bool):
+        raise ConfigError(f"{where} must be true or false")
+    return v
 
 
 def _worker_liveness(v, where: str) -> int:
@@ -852,7 +859,8 @@ def load_project(name: str, etc: Path = ETC) -> Project:
                             "require_ci", "keep_releases", "drain", "env", "secrets",
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
                             "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
-                            "components", "worker_liveness", "postgres", "external"}
+                            "components", "worker_liveness", "postgres", "external",
+                            "migrate_online"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -930,6 +938,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             worker_liveness=_worker_liveness(t.get("worker_liveness", 10), tw),
             postgres=_postgres_cfg(t.get("postgres"), tw),
             external=_external_cfg(t.get("external", {}), tw),
+            migrate_online=_bool(t.get("migrate_online", False), f"{tw} migrate_online"),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -1208,14 +1217,12 @@ def _schema_cfg(st: dict) -> None:
 
 def _migrate_cfg(m, imgs: dict, st: dict) -> dict:
     """[migrate]: one run of the release's own image before the new code starts (DESIGN-v2 §2).
-    Argv only (no shell); online mode and a result check are not built yet."""
+    Argv only (no shell). online = true asks to migrate while the old release serves (the host
+    and the old release's runs_on must agree; DESIGN-v2 §6); check is an argv that prints the
+    data's schema number, so a crash in an online migration can be resolved."""
     if not isinstance(m, dict):
         raise ConfigError("app.toml: [migrate] must be a table")
-    for key in ("online", "check"):
-        if key in m:
-            raise ConfigError(f"app.toml: [migrate] {key} is not supported by huta yet "
-                              "(online migrations are planned)")
-    bad = set(m) - {"image", "cmd", "timeout"}
+    bad = set(m) - {"image", "cmd", "timeout", "online", "check"}
     if bad:
         raise ConfigError(f"app.toml: [migrate] has unknown keys {sorted(bad)}")
     if "schema" not in st:
@@ -1228,7 +1235,19 @@ def _migrate_cfg(m, imgs: dict, st: dict) -> dict:
         raise ConfigError("app.toml: [migrate] cmd must be an argv list of strings (no shell)")
     timeout = m.get("timeout", "10m")
     secs = duration_s(timeout, "app.toml: [migrate] timeout", 6 * 3600)
-    return {"image": m["image"], "cmd": list(cmd), "timeout": timeout, "timeout_s": secs}
+    out = {"image": m["image"], "cmd": list(cmd), "timeout": timeout, "timeout_s": secs}
+    if "online" in m:
+        if not isinstance(m["online"], bool):
+            raise ConfigError("app.toml: [migrate] online must be true or false")
+        if m["online"]:
+            out["online"] = True
+    if "check" in m:
+        chk = m["check"]
+        if not isinstance(chk, list) or not 1 <= len(chk) <= 64 or not all(
+                isinstance(a, str) and 0 < len(a) <= 1000 and "\0" not in a for a in chk):
+            raise ConfigError("app.toml: [migrate] check must be an argv list (no shell)")
+        out["check"] = list(chk)
+    return out
 
 
 RESERVED_MOUNTS = {"", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys",

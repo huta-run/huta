@@ -30,7 +30,7 @@ Rules for every milestone:
 | 3 | Several containers per target; images map | built |
 | 4 | Postgres per target | built |
 | 5 | External publishing (Pages, Workers) | built |
-| 6 | Migrations, online mode | planned |
+| 6 | Migrations, online mode | built |
 
 ## T: test harness (built)
 

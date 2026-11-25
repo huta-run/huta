@@ -153,7 +153,8 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
             # v2 keys appear only when set, so a v1 target's dict is unchanged (tests/golden).
             **({"edge": t.edge} if t.edge else {}),
             **({"health_timeout": t.health_timeout} if t.health_timeout != 30 else {}),
-            **({"migrate": app["migrate"], "migrate_secrets": list(t.migrate_secrets)}
+            **({"migrate": app["migrate"], "migrate_secrets": list(t.migrate_secrets),
+                **({"migrate_online": True} if t.migrate_online else {})}
                if app.get("migrate") else {}),
             **({"schema": app["state"]["schema"], "runs_on": app["state"]["runs_on"]}
                if (app.get("state") or {}).get("schema") else {}),
@@ -686,6 +687,11 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
 
     c = cons.get(routed)
     phase = _phase_get(platform, t)
+    if phase and phase.get("online") and phase.get("stage") in ("migrating", "migrated"):
+        _finish_online(platform, st, project, t, phase, log)
+        cons = slot_containers(t)
+        c = cons.get(routed)
+        phase = None
     if phase and phase.get("idle") != routed:
         # A one-writer release died before its switch. Stop the new slot (proven) before the
         # old one may run, put the pre-release copy back if the new slot could have written,
@@ -844,8 +850,24 @@ def _docker_run(argv: list[str], env: dict, timeout: float) -> tuple[int, str]:
     return r.returncode, (r.stdout + r.stderr)
 
 
+def run_check(platform: Platform, st: S.Store, project: Project, t: Target, app: dict,
+              rel, mig: dict, log) -> int | None:
+    """The repo's [migrate] check: the schema number the data is at, or None if it can't say
+    (DESIGN-v2 §6: how a crash in an online migration is resolved)."""
+    if not app.get("migrate", {}).get("check"):
+        return None
+    chk = {**app["migrate"], "cmd": app["migrate"]["check"], "timeout": "5m", "timeout_s": 300}
+    try:
+        out = run_migrate(platform, st, project, t, {**app, "migrate": chk}, rel, mig, log,
+                          check=True)
+    except RecipeError:
+        return None
+    last = (out or "").strip().splitlines()[-1:] or [""]
+    return int(last[0]) if re.fullmatch(r"\d{1,7}", last[0].strip()) else None
+
+
 def run_migrate(platform: Platform, st: S.Store, project: Project, t: Target, app: dict,
-                rel, mig: dict, log) -> None:
+                rel, mig: dict, log, check: bool = False) -> str:
     """The release's [migrate] command, once, in its own container: the release's named image,
     the target's limits and data volume, no network, only the registry's migrate_secrets
     (DESIGN-v2 §2). Raises RecipeError on failure or timeout."""
@@ -865,22 +887,105 @@ def run_migrate(platform: Platform, st: S.Store, project: Project, t: Target, ap
         env["DATABASE_URL"] = PG.database_url(platform, project, t, "migrate")
     labels = {"run.huta.project": project.name, "run.huta.target": t.name,
               "run.huta.migrate": rel["id"], "run.huta.sha": rel["sha"]}
+    if check:
+        name, labels = f"{name}-check", {**labels, "run.huta.check": "1"}
     sh(["docker", "rm", "-f", name], check=False)
     argv = ["docker", "run", "--rm", *R.docker_run_args(platform, project, t, app, network, env,
                                                        name, labels), image, *m["cmd"]]
-    log(f"migrating the data: schema {mig['from'] if mig['from'] is not None else 'unversioned'} "
-        f"→ {mig['to']} ({' '.join(m['cmd'])}, at most {m['timeout']})")
+    if not check:
+        log(f"migrating the data: schema {mig['from'] if mig['from'] is not None else 'unversioned'}"
+            f" → {mig['to']} ({' '.join(m['cmd'])}, at most {m['timeout']})")
     try:
         rc, out = _docker_run(argv, env, m["timeout_s"])
     except subprocess.TimeoutExpired:
         sh(["docker", "rm", "-f", name], check=False)
         raise RecipeError(f"the migration did not finish within {m['timeout']}") from None
     tail = redact(out)[-1500:]
-    st.event("migrate", f"exit {rc}: {tail}" if tail else f"exit {rc}", rel["id"],
-             project.name, t.name)
+    st.event("migrate-check" if check else "migrate", f"exit {rc}: {tail}" if tail else f"exit {rc}",
+             rel["id"], project.name, t.name)
     if rc != 0:
-        raise RecipeError(f"the migration failed (exit {rc}): {tail[-300:]}")
-    log(f"migration done: the data is at schema {mig['to']}")
+        raise RecipeError(f"the migration{' check' if check else ''} failed (exit {rc}): {tail[-300:]}")
+    if not check:
+        log(f"migration done: the data is at schema {mig['to']}")
+    return out
+
+
+def online_ok(st: S.Store, t: Target, app: dict, mig: dict | None) -> bool:
+    """Online (DESIGN-v2 §6): the repo asks, the host allows, the live code runs on the new
+    schema, and the two releases may overlap. Otherwise a migration runs exclusive (§2)."""
+    if not (mig and mig["run"] and (app.get("migrate") or {}).get("online") and t.migrate_online):
+        return False
+    live = st.live(t.project, t.name)
+    if not live:
+        return False
+    cur = json.loads(st.release(live["release_id"])["app_toml"])
+    return mig["to"] in ((cur.get("state") or {}).get("runs_on") or []) \
+        and R.concurrent_safe(app, t) and R.concurrent_safe(cur, t)
+
+
+def _migrate_online(platform, st, project, t, app, rel, mig, res, live_slot, idle, log):
+    """While the old release serves: a reference copy (pinned, never restored automatically),
+    the migration, the new schema recorded. None when done; otherwise the outcome. Never
+    restores: the old release kept writing."""
+    rid = rel["id"]
+    log(f"online migration: slot {live_slot} keeps serving while the data goes to schema {mig['to']}")
+    res.copy(platform, t, log, quiet=False)
+    path, fp = res.pin(platform, t, rid)
+    st.db.execute("INSERT INTO restore_points (id, project, target, kind, release_id, path,"
+                  " fingerprint, schema, created, state) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (rid, project.name, t.name, res.kind, rid, str(path), fp, mig["from"],
+                   time.time(), "kept"))
+    rec = dict(v=PHASE_VERSION, rid=rid, old=live_slot, idle=idle, online=True, res=res.kind,
+               schema_from=mig["from"], schema_to=mig["to"])
+    _phase_set(platform, t, stage="migrating", **rec)
+    try:
+        run_migrate(platform, st, project, t, app, rel, mig, log)
+    except RecipeError as e:
+        got = run_check(platform, st, project, t, app, rel, mig, log)
+        if got is not None:
+            st.set_resource_schema(project.name, t.name, res.kind, got, rid)
+        _phase_clear(platform, t)
+        st.set_state(rid, S.NEEDS_HUMAN, msg=f"the online migration failed while slot {live_slot} "
+                     f"kept serving: {e}; nothing was restored (it kept writing)"
+                     + (f"; the data reports schema {got}" if got is not None
+                        else "; the data's schema is unknown"))
+        return S.NEEDS_HUMAN
+    st.set_resource_schema(project.name, t.name, res.kind, mig["to"], rid)
+    _phase_set(platform, t, stage="migrated", **rec)
+    return None
+
+
+def _finish_online(platform, st, project, t, phase: dict, log) -> None:
+    """A crash during an online migration: the old release still serves. Wait for a migration
+    that may still run, learn the result from the repo's check, stop the new slot; the release
+    is nothing-activated (the schema stays wherever the migration left it), or needs-human when
+    the result can't be known. Never restores."""
+    rid = phase["rid"]
+    rel = st.release(rid)
+    app = json.loads(rel["app_toml"])
+    mig = {"from": phase.get("schema_from"), "to": phase.get("schema_to"), "run": True}
+    kind = phase.get("res") or "data"
+    deadline = time.monotonic() + (app.get("migrate") or {}).get("timeout_s", 600) + 60
+    while time.monotonic() < deadline and sh(
+            ["docker", "ps", "-q", "--filter", f"name=^{migrate_name(t)}$"], check=False).strip():
+        time.sleep(5)
+    for slot, members in slot_members(t).items():
+        if slot == phase.get("idle") and any(m["running"] for m in members.values()):
+            _stop_members(t, slot)
+    outcome, msg = S.NOTHING_ACTIVATED, "interrupted during its online migration"
+    if phase.get("stage") == "migrating":
+        got = run_check(platform, st, project, t, app, rel, mig, log)
+        if got is None:
+            outcome = S.NEEDS_HUMAN
+            msg = ("interrupted during its online migration; whether it committed is unknown "
+                   "(no [migrate] check, or it failed): the old release still serves")
+        else:
+            st.set_resource_schema(project.name, t.name, kind, got, rid)
+            msg += f"; the data reports schema {got}"
+    if st.release(rid)["state"] in (S.RUNNING, S.APPROVED):
+        st.set_state(rid, outcome, msg=msg)
+    _phase_clear(platform, t)
+    log(f"reconcile: {msg}")
 
 
 def restore_point(platform: Platform, st: S.Store, project: Project, t: Target, pid: str,
@@ -995,12 +1100,16 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     cur = None
     mig = migration(st, t, app)
     migrating = bool(mig and mig["run"])
-    # A migration runs exclusive: no release writes while it runs (DESIGN-v2 §2).
-    concurrent = R.concurrent_safe(app, t) and not migrating
+    concurrent = R.concurrent_safe(app, t)
+    if live:
+        concurrent = concurrent and R.concurrent_safe(json.loads(st.release(live["release_id"])
+                                                                ["app_toml"]), t)
+    online = migrating and online_ok(st, t, app, mig)
+    if migrating and not online:
+        concurrent = False
     if live:
         cur = st.release(live["release_id"])
-        # Overlap needs both releases to allow it (codex code review #4).
-        concurrent = concurrent and R.concurrent_safe(json.loads(cur["app_toml"]), t)
+        # Overlap needs both releases to allow it (codex code review #4); computed above.
         live_slot = live["slot"]
         idle = "b" if live_slot == "a" else "a"
         images = {live_slot: slot_images(st, cur, app), idle: slot_images(st, rel, app)}
@@ -1034,6 +1143,11 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     stopped_old = copied = migrated = False
     failing = "new slot failed before any traffic"
     mig_rec = {"schema_from": mig["from"], "res": res.kind} if migrating else {}
+    if online:
+        out = _migrate_online(platform, st, project, t, app, rel, mig, res, live_slot, idle, log)
+        if out is not None:
+            return out
+        migrating = False         # done: from here this is an ordinary overlapping release
     try:
         if (live and not concurrent) or migrating:
             if jobs_running(t):
