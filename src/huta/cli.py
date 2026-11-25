@@ -208,7 +208,11 @@ def _approve_plan(platform, registry, st, pid: str, via: str, confirmed: bool = 
         plan = json.loads(r["plan"])
         if time.time() - r["created"] > PLAN_TTL:
             st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "approval expired (30 min)")
+            retire_buttons(platform, st, pid)
+            tell(platform, st, pid)
             raise ConfigError("plan expired; make it again")
+        # An interrupted release is finished first: a plan must never overwrite its phase.
+        recipe.reconcile(platform, st, project, t, say)
         if r["kind"] == "restore":
             return _approve_restore(platform, st, project, t, pid, plan, via, confirmed)
         if r["kind"] == "postgres":
@@ -221,6 +225,8 @@ def _approve_plan(platform, registry, st, pid: str, via: str, confirmed: bool = 
         survey = _edge_survey(platform, project, t, cf)
         if survey["inputs"] != plan["inputs"]:
             st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "the edge changed since planning")
+            retire_buttons(platform, st, pid)
+            tell(platform, st, pid)
             raise ConfigError("the edge or its config changed since this plan was made; plan again")
         st.plan_transition(pid, S.PLANNED, S.APPROVED, f"approved {via}")
         retire_buttons(platform, st, pid)
@@ -276,12 +282,21 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
     else:
         images = {next(iter(app["images"])): image_id}
     recipe.check_image_map(images, sha, app, project.name)
-    if SP.several(app):
+    from . import pg as PG
+    if R.data_mount(app) or any(c.get("data") for c in app["components"].values()):
+        if not t.data:
+            raise ConfigError(f"app.toml mounts data, but the host registry gives "
+                              f"{project.name}/{t.name} no data (operator: add data = {{ size = … }})")
+    if PG.wants(app) and not t.postgres:
+        raise ConfigError(f"app.toml asks for postgres, but the host registry gives "
+                          f"{project.name}/{t.name} none (operator: add postgres = {{ … }})")
+    if SP.several(app) or PG.wants(app):
         from . import egress as E
         if not E.intra_ready():
-            raise ConfigError("this release has several components, which talk over their slot's "
-                              "bridge; the host firewall's guard has no huta_intra set yet "
-                              "(operator: load systemd/nftables-huta-egress.nft.example again)")
+            raise ConfigError("this release's containers talk over a bridge (several components, "
+                              "or the target's database); the host firewall's guard has no "
+                              "huta_intra set yet (operator: load "
+                              "systemd/nftables-huta-egress.nft.example again)")
     live = st.live(project.name, t.name)
     live_rel = st.release(live["release_id"]) if live else None
     if R.data_mount(app) and not t.data:
@@ -303,10 +318,12 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
             raise ConfigError(f"app.toml publishes external.{name}, but the host registry has no "
                               f"external.{name} for {project.name}/{t.name} (operator: add it)")
         from . import external as E
-        got = E.extract(platform, t, sha[:12], name, images[e["image"]], e)
-        externals[name] = {**got, "kind": e["kind"]}
+        import secrets as _secrets
+        key = f"{sha[:12]}-{_secrets.token_hex(4)}"      # this plan's own copy
+        got = E.extract(platform, t, key, name, images[e["image"]], e)
+        externals[name] = {**got, "kind": e["kind"], "key": key}
         where = "Pages project" if e["kind"] == "cloudflare-pages" else "Worker"
-        changes.append(f"publishes {name} after the switch: {got['files']} files "
+        changes.append(f"☁️ publishes {name} after the switch: {got['files']} files "
                        f"({got['bytes'] >> 10} KiB, {got['hash'][:12]}) to the Cloudflare {where} "
                        f"{reg['name']}" + (f" on {', '.join(reg['routes'])}" if reg["routes"] else "")
                        + f"; token {reg['token']} is account-wide")
@@ -388,8 +405,8 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
         "class": "code-only" if not changes else "infra", "changes": changes,
         "checks": {"on_main": True, "ci": "green" if t.require_ci else "not required"},
         "planned_against_live": live_rel["id"] if live_rel else None,
-        "migration": mig,             # None, or {"from": S, "to": M, "run": bool}
-        "external": externals,        # name -> {hash, files, bytes, kind}
+        **({"migration": mig} if mig else {}),   # {"from": S, "to": M, "run": bool}
+        **({"external": externals} if externals else {}),   # name -> {hash, files, bytes, kind, key}
         "effective": eff, "built_by": "dev", "note": note, "history": history,
         "staged_secrets": staged,     # {name: fingerprint}: approval applies exactly these
         "secret_versions": R.live_versions(platform, project.name, secret_names(t)),
@@ -595,8 +612,10 @@ def cmd_restore(a):
     to = st.release(a.to)
     if (to["project"], to["target"]) != (project.name, t.name):
         raise ConfigError(f"release {a.to} is not {project.name}/{t.name}'s")
-    runs_on = (json.loads(to["app_toml"]).get("state") or {}).get("runs_on")
-    s = recipe.schema_now(st, t)
+    to_app = json.loads(to["app_toml"])
+    runs_on = (to_app.get("state") or {}).get("runs_on")
+    kind = recipe._res(to_app).kind
+    s = recipe.schema_now(st, t, kind)
     if s is None:
         raise ConfigError("this target's data has no recorded schema: there is no restore point "
                           "a schema points to (huta rollback plans an older image)")
@@ -604,8 +623,8 @@ def cmd_restore(a):
         raise ConfigError(f"release {a.to} runs on the current schema {s}: no restore is needed "
                           "(huta rollback, or submit that commit)")
     points = st.db.execute("SELECT * FROM restore_points WHERE project=? AND target=? AND"
-                           " kind='data' AND state='kept' ORDER BY created DESC",
-                           (project.name, t.name)).fetchall()
+                           " kind=? AND state='kept' ORDER BY created DESC",
+                           (project.name, t.name, kind)).fetchall()
     pt = next((x for x in points if (x["schema"] in runs_on if runs_on else x["schema"] is None)),
               None)
     if pt is None:
@@ -624,7 +643,7 @@ def cmd_restore(a):
              "planned for approval"]
     pid = st.new_plan(project.name, t.name, "restore", {
         "lines": lines, "point": pt["id"], "path": pt["path"], "fingerprint": pt["fingerprint"],
-        "schema": pt["schema"], "release": a.to, "schema_now": s,
+        "schema": pt["schema"], "release": a.to, "schema_now": s, "res": kind,
         "planned_against_live": live["release_id"] if live else None})
     tell(platform, st, pid)
     ask(platform, st, pid)
@@ -644,7 +663,7 @@ def _approve_restore(platform, st, project, t, pid, plan, via, confirmed) -> int
     stale = None
     if (live["release_id"] if live else None) != plan["planned_against_live"]:
         stale = "a release went live since planning"
-    elif recipe.schema_now(st, t) != plan["schema_now"]:
+    elif recipe.schema_now(st, t, plan.get("res", "data")) != plan["schema_now"]:
         stale = "the data's schema changed since planning"
     elif D.fingerprint(Path(plan["path"])) != plan["fingerprint"]:
         stale = "the restore point changed since planning"
@@ -665,8 +684,11 @@ def _approve_restore(platform, st, project, t, pid, plan, via, confirmed) -> int
     tell(platform, st, pid)
     to = st.release(plan["release"])
     try:
-        rid = plan_release(platform, project, st, t, to["sha"], to["image_id"], to["image_tag"],
-                           GitHub(platform), note=f"after restore {pid}")
+        imgs = st.images(to)
+        with st.lock(project.name, R.SECRETS_LOCK, wait=60):
+            rid = plan_release(platform, project, st, t, to["sha"], to["image_id"], to["image_tag"],
+                               GitHub(platform), note=f"after restore {pid}",
+                               images=imgs if len(imgs) > 1 else None)
     except Exception as e:  # noqa: BLE001 — the data is back; the code can be planned again
         say(f"data restored; planning release {plan['release']} failed: {type(e).__name__}: {e}")
         say(f"plan it with: huta submit {project.name} {t.name} {to['sha']} {to['image_id']}")
@@ -1017,7 +1039,7 @@ def handle_request(platform, registry, st, req: dict, transport: str, box: str) 
         st.event(f"{op}-read", f"box {box} ({transport}): {lg} → {res['lines']} lines",
                  None, project.name, None)
         return {"ok": True, "text": res["text"], "truncated": res["truncated"]}
-    t = target_of(project, req["target"])
+    t = target_of(project, req["target"], gateway_ok=op == "traffic")
     if op in ("egress-log", "traffic", "crashes"):
         from . import observe as O
         if op == "egress-log":
@@ -1238,7 +1260,8 @@ def approve_minutes(r) -> int:
     try:
         plan = json.loads(r["plan"])
         eff = plan.get("effective") or {}
-        secs = (int(eff.get("migrate_timeout") or 0) + int(eff.get("health_timeout") or 30)
+        secs = (int((eff.get("migrate") or {}).get("timeout_s") or 0)
+                + int(eff.get("health_timeout") or 30)
                 + int(eff.get("drain") or 0) + 15 * 60)
     except (ValueError, TypeError, KeyError):
         return 20
@@ -1506,8 +1529,8 @@ def _cmd_secret(a, platform, project, st):
 
 
 def _nothing_runs(t) -> None:
-    cons = recipe.slot_containers(t)
-    if any(c["running"] for c in cons.values()) or recipe.jobs_running(t):
+    members = [c for m in recipe.slot_members(t).values() for c in m.values()]
+    if any(c["running"] for c in members) or recipe.jobs_running(t):
         raise ConfigError(f"{t.project}/{t.name} is running; stop it first "
                           f"(huta stop {t.project} {t.name})")
 
@@ -1679,9 +1702,9 @@ def cmd_stop(a):
     t = target_of(project, a.target)
     with st.lock(project.name, t.name, wait=60):
         recipe.stopped_marker(platform, t).write_text("stopped by the operator\n")
-        for slot, c in recipe.slot_containers(t).items():
-            if c["running"]:
-                recipe.stop_container(c["id"])
+        for slot, members in recipe.slot_members(t).items():
+            if any(c["running"] for c in members.values()):
+                recipe._stop_members(t, slot)          # every container of the slot
                 say(f"stopped slot {slot}")
         st.event("stopped", "stopped by the operator", None, project.name, t.name)
     return 0
@@ -1715,8 +1738,12 @@ def cmd_start(a):
         if a.cmd == "restart":
             args.append("--force-recreate")
         recipe.compose(platform, t, *args, *recipe.services(app, live["slot"]))
+        recipe._egress_sync(platform, say)
         recipe.wait_health(t.slots[recipe.SLOTS.index(live["slot"])], SP.health(app),
-                           rel["sha"], timeout=60)
+                           rel["sha"], timeout=max(60, t.health_timeout))
+        if SP.several(app):
+            recipe._check_internal(t, app, live["slot"], rel["sha"], say)
+            recipe._complete_slot(platform, st, project, t, rel, live["slot"], say)   # workers: unless-stopped
         st.event("started", f"slot {live['slot']} {a.cmd}ed by the operator", live["release_id"],
                  project.name, t.name)
         say(f"slot {live['slot']} serving {rel['sha'][:12]}")

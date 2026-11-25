@@ -45,7 +45,7 @@ class Restore(unittest.TestCase):
         return (self.host.platform, self.host.registry[name] if name else self.host.registry,
                 self.host.store())
 
-    def fake_plan_release(self, platform, project, st, t, sha, image_id, tag, gh, note=""):
+    def fake_plan_release(self, platform, project, st, t, sha, image_id, tag, gh, note="", images=None):
         rel = st.release(self.r1)
         recipe.migration(st, t, __import__("json").loads(rel["app_toml"]))  # must not refuse
         rid = st.new_release(project=project.name, target=t.name, sha=sha, image_id=image_id,

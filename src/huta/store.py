@@ -366,6 +366,10 @@ def busy(state_dir) -> list[str]:
             for r in con.execute("SELECT id, project, target, state FROM releases"
                                  " WHERE state IN (?, ?)", (APPROVED, RUNNING)):
                 out.append(f"release {r[0]} of {r[1]}/{r[2]} is {r[3]}")
+            if con.execute("SELECT name FROM sqlite_master WHERE name='plans'").fetchone():
+                for r in con.execute("SELECT id, project, target, kind FROM plans WHERE state=?",
+                                     (APPROVED,)):
+                    out.append(f"{r[3]} plan {r[0]} of {r[1]}/{r[2]} is being applied")
         finally:
             con.close()
     locks = d / "locks"

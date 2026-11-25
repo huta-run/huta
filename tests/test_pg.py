@@ -103,6 +103,8 @@ class Docs(unittest.TestCase):
                 mock.patch.object(PG.subprocess, "run",
                                   lambda *a, **k: type("R", (), {"returncode": 0})()), \
                 mock.patch.object(recipe, "_stop_members", lambda *a, **k: None), \
+                mock.patch.object(recipe, "jobs_running", lambda t: []), \
+                mock.patch.object(recipe, "slot_members", lambda t: {}), \
                 mock.patch.object(recipe, "schema_now", lambda *a: 1):
             st = mock.MagicMock()
             with self.assertRaisesRegex(PG.PgError, "undone"):

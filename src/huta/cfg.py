@@ -450,6 +450,14 @@ def _postgres_cfg(v, where: str) -> dict | None:
     limits = v.get("limits", {})
     if not isinstance(limits, dict) or set(limits) - {"memory", "cpus", "pids", "tmp"}:
         raise ConfigError(f"{where}: postgres.limits accepts memory, cpus, pids, tmp")
+    if "tmp" in limits:
+        size_bytes(limits["tmp"], f"{where} postgres.limits.tmp", 1 << 20, 4 << 30)
+    if "memory" in limits:
+        size_bytes(limits["memory"], f"{where} postgres.limits.memory", 64 << 20, 512 << 30)
+    if "cpus" in limits and not (isinstance(limits["cpus"], (int, float)) and 0 < limits["cpus"] <= 128):
+        raise ConfigError(f"{where}: postgres.limits.cpus must be a number 0..128")
+    if "pids" in limits and not (type(limits["pids"]) is int and 16 <= limits["pids"] <= 65536):
+        raise ConfigError(f"{where}: postgres.limits.pids must be 16..65536")
     return {"version": str(v["version"]), "size": v["size"].lower(), "bytes": nbytes,
             "backup": backup, "concurrent": False, "limits": dict(limits)}
 

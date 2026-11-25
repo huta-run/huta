@@ -56,7 +56,7 @@ def staging(platform: Platform, t: Target, rid: str, name: str) -> Path:
 def _validate_tar(stream, dest: Path, top: str) -> tuple[str, int, int]:
     """Unpack `docker cp`'s tar of <dir> into dest, refusing anything but plain files and
     directories. Returns (content hash, files, bytes)."""
-    files, total, entries = 0, 0, []
+    files, total, entries, dirs = 0, 0, [], 0
     with tarfile.open(fileobj=stream, mode="r|") as tar:
         for m in tar:
             name = m.name
@@ -65,11 +65,18 @@ def _validate_tar(stream, dest: Path, top: str) -> tuple[str, int, int]:
                 raise PublishError(f"unexpected path in the image's files: {name!r}")
             rel = "/".join(parts[1:])
             if not rel:
+                if not m.isdir():
+                    raise PublishError(f"{top} in the image is not a directory (a link?)")
                 continue
+            if m.issparse() if hasattr(m, "issparse") else m.type == tarfile.GNUTYPE_SPARSE:
+                raise PublishError(f"{rel}: sparse files are not published")
             if not re.fullmatch(r"[A-Za-z0-9._@+~=,%-][A-Za-z0-9._@+~=,%/ -]{0,400}", rel) \
                     or "//" in rel:
                 raise PublishError(f"a file name huta won't publish: {rel!r}")
             if m.isdir():
+                dirs += 1
+                if dirs + files > MAX_FILES:
+                    raise PublishError(f"too much to publish: at most {MAX_FILES} entries")
                 (dest / rel).mkdir(mode=0o755, parents=True, exist_ok=True)
                 continue
             if not m.isreg():
@@ -77,7 +84,7 @@ def _validate_tar(stream, dest: Path, top: str) -> tuple[str, int, int]:
                                    "(no links or devices)")
             files += 1
             total += m.size
-            if files > MAX_FILES or m.size > MAX_FILE or total > MAX_TOTAL:
+            if files + dirs > MAX_FILES or m.size > MAX_FILE or total > MAX_TOTAL:
                 raise PublishError(f"too much to publish: at most {MAX_FILES} files, "
                                    f"{MAX_FILE >> 20} MiB each, {MAX_TOTAL >> 20} MiB in all")
             out = dest / rel
@@ -114,8 +121,8 @@ def check_contract(kind: str, d: Path, main: str | None) -> None:
 
 
 def extract(platform: Platform, t: Target, rid: str, name: str, image: str, cfg: dict) -> dict:
-    """Copy one [external.<name>] directory out of the image into staging. Returns
-    {"hash", "files", "bytes"}."""
+    """Copy one [external.<name>] directory out of the image into staging (rid: a key of this
+    plan's own). Returns {"hash", "files", "bytes"}."""
     from .recipe import sh
     dest = staging(platform, t, rid, name)
     if dest.exists():
@@ -203,11 +210,12 @@ def _worker_config(reg: dict, cfg: dict, sha: str, content: str) -> str:
 
 
 def publish(platform: Platform, project: Project, t: Target, rid: str, sha: str, name: str,
-            cfg: dict, reg: dict, content: str, log) -> str:
-    """Run wrangler for one external. Returns the new deployment or version id."""
+            cfg: dict, reg: dict, content: str, log, key: str | None = None) -> str:
+    """Run wrangler for one external. Returns the new deployment or version id. key: the
+    plan's staging key (its files, extracted at planning)."""
     from .recipe import sh
     from . import runtime as R
-    d = staging(platform, t, sha[:12], name)      # extracted at planning, keyed by commit
+    d = staging(platform, t, key or sha[:12], name)
     if content_hash(d) != content:
         raise PublishError(f"{name}: the files changed since planning")
     ensure_network()
@@ -217,7 +225,8 @@ def publish(platform: Platform, project: Project, t: Target, rid: str, sha: str,
     proxy = f"http://{R.EGRESS_HOST}:{platform.egress_port}"
     env = {"CLOUDFLARE_API_TOKEN": platform.secret(reg["token"]),
            "CLOUDFLARE_ACCOUNT_ID": reg["account"], "HTTPS_PROXY": proxy,
-           "https_proxy": proxy, "NO_PROXY": "", "WRANGLER_SEND_METRICS": "false",
+           "https_proxy": proxy, "HTTP_PROXY": proxy, "http_proxy": proxy, "NO_PROXY": "",
+           "no_proxy": "", "NODE_USE_ENV_PROXY": "1", "WRANGLER_SEND_METRICS": "false",
            "CI": "1", "HOME": "/tmp"}
     image = platform.wrangler_image
     args = ["docker", "run", "--rm", "--name", f"huta-publish-{t.project}-{t.name}",
@@ -237,11 +246,11 @@ def publish(platform: Platform, project: Project, t: Target, rid: str, sha: str,
         reg = {**reg, "route_zones": [(r, zone_for(r.split("/", 1)[0].removeprefix("*."), platform))
                                       for r in reg["routes"]]}
         conf = d.parent / f".{name}.wrangler.toml"
-        conf.write_text(_worker_config(reg, cfg, sha, content))
-        os.chmod(conf, 0o644)
+        from .recipe import edge
+        edge._atomic_write(conf, _worker_config(reg, cfg, sha, content), 0o644)
         args += ["--mount", f"type=bind,source={conf},target=/cfg/wrangler.toml,readonly"]
         cmd = ["wrangler", "deploy", "--config", "/cfg/wrangler.toml", "--message", tag]
-    os.chown(d.parent, project.uid, project.uid)
+    sh(["docker", "rm", "-f", f"huta-publish-{t.project}-{t.name}"], check=False)
     r = subprocess.run([*args, image, *cmd], env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", **env},
                        capture_output=True, text=True, timeout=1800, cwd="/")
     from .cfg import redact

@@ -439,7 +439,7 @@ class FakeHost:
         return next((x["id"] for x in self._load("cf")["deploys"]
                      if (x["name"], x["sha"], x["content"]) == (reg["name"], sha, content)), None)
 
-    def cf_publish(self, platform, project, t, rid, sha, name, cfg, reg, content, log):
+    def cf_publish(self, platform, project, t, rid, sha, name, cfg, reg, content, log, key=None):
         if self._faults().get("publish_fail"):
             raise RuntimeError("wrangler failed: test fault")
         cf = self._load("cf")
@@ -554,7 +554,7 @@ class FakeHost:
             patch(L, "slot_state", lambda *a, **k: "")
             patch(jobs, "sync_units", lambda *a, **k: [])
             patch(jobs, "start_after_release", noop)
-            patch(runtime, "secret_value", lambda *a: "test-secret")
+            patch(runtime, "secret_value", lambda *a: "test-secret-0123456789abcdef")
             patch(data, "ensure", lambda *a, **k: "volume ready")
             patch(data, "thaw", noop)
             patch(data, "backup", lambda *a, **k: "copy made")

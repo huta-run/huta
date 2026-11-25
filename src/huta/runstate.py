@@ -109,16 +109,20 @@ def _ago(s: float) -> str:
 
 def egress_open(t: Target) -> int | None:
     """TCP connections from the target's bridge to the egress daemon's ports (4880..4899)."""
-    from .recipe import network_name
-    r = subprocess.run(["docker", "network", "inspect", network_name(t), "--format",
-                        "{{json .IPAM.Config}}"], capture_output=True, text=True, timeout=30,
-                       cwd="/")
-    if r.returncode != 0:
-        return None
-    try:
-        nets = [ipaddress.ip_network(c["Subnet"]) for c in json.loads(r.stdout or "[]") or []
-                if c.get("Subnet")]
-    except (ValueError, KeyError, TypeError):
+    from .recipe import network_names
+    nets = []
+    for name in network_names(t):
+        r = subprocess.run(["docker", "network", "inspect", name, "--format",
+                            "{{json .IPAM.Config}}"], capture_output=True, text=True, timeout=30,
+                           cwd="/")
+        if r.returncode != 0:
+            continue
+        try:
+            nets += [ipaddress.ip_network(c["Subnet"]) for c in json.loads(r.stdout or "[]") or []
+                     if c.get("Subnet")]
+        except (ValueError, KeyError, TypeError):
+            return None
+    if not nets:
         return None
     r = subprocess.run(["ss", "-Htn", "state", "established"], capture_output=True, text=True,
                        timeout=30, cwd="/")

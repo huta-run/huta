@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import re
 import json
 import os
 import secrets
@@ -66,13 +67,23 @@ def wants(app: dict) -> bool:
 
 # ------------------------------------------------------------------ secrets
 
+PASSWORD_RE = re.compile(r"[A-Za-z0-9_.~-]{16,128}")
+
+
 def password(platform: Platform, project: Project, t: Target, role: str, create: bool = False) -> str:
+    """A role's password. huta makes them (hex); one set by hand must stay plain, because it goes
+    into SQL and into a URL (anything else is refused, never quoted around)."""
     name = secret_name(t, role)
     try:
-        return R.secret_value(platform, project.name, name)
+        value = R.secret_value(platform, project.name, name)
     except Exception:  # noqa: BLE001 — missing: make it (root only, like every secret)
         if not create:
             raise
+    else:
+        if not PASSWORD_RE.fullmatch(value):
+            raise PgError(f"secret {name} must be 16..128 letters, digits or _.~- "
+                          "(huta generates one if it is missing)")
+        return value
     value = secrets.token_hex(24)
     R.secret_set(platform, project.name, name, value)
     return value
@@ -80,8 +91,11 @@ def password(platform: Platform, project: Project, t: Target, role: str, create:
 
 def database_url(platform: Platform, project: Project, t: Target, role: str,
                  with_secrets: bool = True) -> str:
+    import urllib.parse
     pw = password(platform, project, t, role) if with_secrets else R.SECRET_PLACEHOLDER
     user = OWNER if role == "owner" else role
+    if with_secrets:
+        pw = urllib.parse.quote(pw, safe="")
     return f"postgresql://{user}:{pw}@postgres:5432/{DB}"
 
 
@@ -282,6 +296,9 @@ def backup(platform: Platform, t: Target, st, log, do_ship: bool = True) -> str:
         if do_ship:
             rec["shipped"] = D.ship(platform, vt, log)
             rec["shipped_ts"] = time.time() if rec["shipped"] == "ok" else None
+    except D.DataError as e:
+        rec["shipped"] = "failed"
+        raise PgError(f"dumped locally, but {e}") from None
     finally:
         old = D.last_backup(platform, vt) or {}
         if rec.get("shipped_ts") is None and old.get("shipped_ts"):
@@ -292,17 +309,20 @@ def backup(platform: Platform, t: Target, st, log, do_ship: bool = True) -> str:
     return f"database dump ok, ship {rec['shipped']}"
 
 
-def _restore_file(t: Target, dump: Path, log) -> None:
-    """Put a dump back: drop what is there and restore, in one transaction (nothing may be
-    connected but huta)."""
+def _restore_file(platform: Platform, project: Project, t: Target, dump: Path, log) -> None:
+    """Put a dump back exactly: the schema is emptied first (so objects a failed migration
+    added go too; pg_restore --clean only drops what the dump has), the roles' grants put back,
+    then the dump restored in one transaction. Nothing may be connected but huta."""
     cid = container(t)
     if not cid or not dump.is_file() or dump.is_symlink():
         raise PgError("postgres is not there, or the dump is missing")
     _psql(t, f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-             f"WHERE datname = {_q(DB)} AND pid <> pg_backend_pid();")
+             f"WHERE datname = {_q(DB)} AND pid <> pg_backend_pid();\n"
+             "DROP SCHEMA public CASCADE;\nCREATE SCHEMA public;")
+    _roles(platform, project, t)
     with open(dump, "rb") as f:
         r = subprocess.run(["docker", "exec", "-i", cid, "pg_restore", "-U", OWNER, "-d", DB,
-                            "--clean", "--if-exists", "--exit-on-error", "--single-transaction"],
+                            "--exit-on-error", "--single-transaction"],
                            stdin=f, capture_output=True, timeout=6 * 3600, cwd="/")
     if r.returncode != 0:
         raise PgError(f"pg_restore: {r.stderr.decode(errors='replace').strip()[-300:]}")
@@ -313,7 +333,7 @@ def restore_copy(platform: Platform, project: Project, t: Target, log) -> None:
     from . import data as D
     base = D.backup_dir(platform, volume_target(t))
     D.recover_publish(base)
-    _restore_file(t, base / "current" / DUMP, log)
+    _restore_file(platform, project, t, base / "current" / DUMP, log)
 
 
 def pin_copy(platform: Platform, t: Target, rid: str) -> tuple[Path, str]:
@@ -328,7 +348,7 @@ def restore_pin(platform: Platform, project: Project, t: Target, path: Path, fp:
         raise PgError(f"{path} is not one of this database's restore points")
     if D.fingerprint(path) != fp:
         raise PgError(f"restore point {path.name} changed since it was pinned; refusing it")
-    _restore_file(t, path / DUMP, log)
+    _restore_file(platform, project, t, path / DUMP, log)
 
 
 # ------------------------------------------------------------------ upgrades (infra plans)
@@ -344,7 +364,13 @@ def pending(platform: Platform, project: Project, t: Target) -> dict | None:
         return None
     pgdata = lambda s: next((v for k, v in s["environment"].items() if k == "PGDATA"), "")  # noqa: E731
     return {"from_image": old["image"], "to_image": new["image"],
-            "new_cluster": pgdata(old) != pgdata(new)}
+            "new_cluster": pgdata(old) != pgdata(new),
+            "from_limits": [old.get(k) for k in ("mem_limit", "cpus", "pids_limit")],
+            "to_limits": [new.get(k) for k in ("mem_limit", "cpus", "pids_limit")]}
+
+
+def _pgdata(doc: dict) -> str:
+    return doc["services"]["postgres"]["environment"].get("PGDATA", "")
 
 
 def upgrade(platform: Platform, st, project: Project, t: Target, pid: str, log) -> None:
@@ -359,10 +385,20 @@ def upgrade(platform: Platform, st, project: Project, t: Target, pid: str, log) 
     change = pending(platform, project, t)
     if change is None:
         raise PgError("nothing to upgrade")
+    if RC.jobs_running(t):
+        raise PgError("a job of this target is running; upgrade when it has finished")
+    new_pgdata = _pgdata(compose_doc(platform, project, t)).rsplit("/", 1)[-1] \
+        if change["new_cluster"] else None
+    from . import data as D
+    _img, where = D.data_paths(platform, volume_target(t))
+    if new_pgdata and (where / new_pgdata).exists():
+        raise PgError(f"{where / new_pgdata} already exists (an earlier attempt?): remove it first")
     RC._phase_set(platform, t, v=RC.PHASE_VERSION, stage="pg-upgrade", rid=pid, idle=None,
-                  old_doc=old_doc, step="stopping")
+                  old_doc=old_doc, step="stopping", new_pgdata=new_pgdata)
     for slot in RC.SLOTS:
         RC._stop_members(t, slot)
+        if any(c["running"] for c in RC.slot_members(t).get(slot, {}).values()):
+            raise PgError(f"slot {slot} would not stop: not upgrading")
     dump_dir = copy(platform, t, log, quiet=True)
     path, fp = D.pin_copy(platform, volume_target(t), pid)
     st.db.execute("INSERT INTO restore_points (id, project, target, kind, release_id, path,"
@@ -370,7 +406,8 @@ def upgrade(platform: Platform, st, project: Project, t: Target, pid: str, log) 
                   (pid, project.name, t.name, "postgres", pid, str(path), fp,
                    RC.schema_now(st, t, "postgres"), time.time(), "kept"))
     RC._phase_set(platform, t, v=RC.PHASE_VERSION, stage="pg-upgrade", rid=pid, idle=None,
-                  old_doc=old_doc, step="switching", dump=str(dump_dir / DUMP))
+                  old_doc=old_doc, step="switching", dump=str(dump_dir / DUMP),
+                  new_pgdata=new_pgdata)
     try:
         new_doc = json.dumps(compose_doc(platform, project, t), indent=2) + "\n"
         from .recipe import edge
@@ -384,10 +421,10 @@ def upgrade(platform: Platform, st, project: Project, t: Target, pid: str, log) 
         _wait_ready(t, 300)
         _roles(platform, project, t)
         if change["new_cluster"]:
-            _restore_file(t, dump_dir / DUMP, log)
+            _restore_file(platform, project, t, dump_dir / DUMP, log)
     except Exception as e:
         log(f"upgrade failed ({type(e).__name__}: {e}); putting the old server back")
-        revert_upgrade(platform, project, t, old_doc, log)
+        revert_upgrade(platform, project, t, old_doc, log, new_pgdata)
         RC._phase_clear(platform, t)
         raise PgError(f"upgrade failed and was undone: {e}") from None
     RC._phase_clear(platform, t)
@@ -396,12 +433,22 @@ def upgrade(platform: Platform, st, project: Project, t: Target, pid: str, log) 
     log("postgres upgraded; the app starts again")
 
 
-def revert_upgrade(platform: Platform, project: Project, t: Target, old_doc: str, log) -> None:
-    """Back to the definition before the upgrade: its image, its data directory (untouched)."""
+def revert_upgrade(platform: Platform, project: Project, t: Target, old_doc: str, log,
+                   new_pgdata: str | None = None) -> None:
+    """Back to the definition before the upgrade: its image, its data directory (untouched).
+    A new cluster's directory the attempt made goes, so a later attempt starts clean."""
     from .recipe import edge
+    from . import data as D
     f = _compose_file(platform, t)
     edge._atomic_write(f, old_doc, 0o600)
     _sh(["docker", "compose", "-p", compose_name(t), "-f", str(f), "up", "-d", "--pull", "never",
          "--force-recreate"], timeout=600)
     _wait_ready(t, 300)
+    if new_pgdata and re.fullmatch(r"pgdata-[a-z0-9][a-z0-9.-]{0,30}", new_pgdata) \
+            and new_pgdata != _pgdata(json.loads(old_doc)).rsplit("/", 1)[-1]:
+        _img, where = D.data_paths(platform, volume_target(t))
+        p = where / new_pgdata
+        if p.is_dir() and not p.is_symlink():
+            subprocess.run(["rm", "-rf", "--one-file-system", "--", str(p)], capture_output=True,
+                           timeout=3600, cwd="/")
     log("the old postgres is back")

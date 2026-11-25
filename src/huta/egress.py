@@ -154,18 +154,23 @@ def intra_ready() -> bool:
 
 
 def intra_bridges(registry) -> list[str]:
-    """Bridges of slot networks that exist now (targets with several components)."""
+    """Bridges whose containers talk to each other and that exist now: slot networks of targets
+    with several components, and each target's database networks (DESIGN-v2 §3, §4)."""
+    from . import pg as PG
     from .recipe import slot_bridge_name, slot_network_name
     out = []
     for project in registry.values():
         for t in project.targets.values():
             if t.kind == "gateway":
                 continue
-            for slot in ("a", "b"):
-                r = subprocess.run(["docker", "network", "inspect", slot_network_name(t, slot)],
+            nets = [(slot_network_name(t, s), slot_bridge_name(t, s)) for s in ("a", "b")]
+            if t.postgres:
+                nets += [(PG.network(t, w), PG.bridge(t, w)) for w in ("a", "b", "m")]
+            for net, br in nets:
+                r = subprocess.run(["docker", "network", "inspect", net],
                                    capture_output=True, timeout=30, cwd="/")
                 if r.returncode == 0:
-                    out.append(slot_bridge_name(t, slot))
+                    out.append(br)
     return out
 
 

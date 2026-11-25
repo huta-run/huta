@@ -160,7 +160,13 @@ def run_job(platform: Platform, project: Project, t: Target, name: str, st, log)
             from .data import mounted
             if not mounted(R.data_paths(platform, t)[1]):
                 raise ConfigError("the data volume is not mounted")
-        env = R.environment(platform, project, t, rel["sha"], "job", with_secrets=True, app=app)
+        if SP.several(app):
+            # The component's own grants (DESIGN-v2 §3): the target's secrets only for the
+            # public component, the registry's per-component env and secrets for its own.
+            env = R.component_environment(platform, project, t, rel["sha"], "job", comp_name,
+                                          comp_name == SP.public_name(app), True, app)
+        else:
+            env = R.environment(platform, project, t, rel["sha"], "job", with_secrets=True, app=app)
         env["HUTA_JOB"] = name
         for k in t.job_secrets.get(name, []):      # this job's own secrets, never the slots'
             env[k] = R.secret_value(platform, project.name, k)

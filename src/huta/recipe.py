@@ -527,7 +527,8 @@ KNOWN_STAGES = {None, "switching", "checks",
                 "migrating", "migrated",      # DESIGN-v2 §2: exclusive migrations
                 "restoring",                  # DESIGN-v2 §2: restore plans
                 "pg-upgrade",                 # DESIGN-v2 §4: postgres upgrade plans
-                "external"}                   # DESIGN-v2 §5: publishing to Cloudflare
+                "external",                   # DESIGN-v2 §5: publishing to Cloudflare
+                "workers"}                    # DESIGN-v2 §3: worker handoff after the switch
 
 
 def _phase_get(platform: Platform, t: Target) -> dict | None:
@@ -581,6 +582,18 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     nothing routes to; thaws the data volume (a backup interrupted while it was frozen)."""
     if t.kind == "gateway":
         return       # nothing runs; its edge changes are journaled like every vhost change
+    try:
+        _ph_pg = _phase_get(platform, t)
+    except RecipeError:
+        _ph_pg = None
+    if _ph_pg and _ph_pg.get("stage") == "pg-upgrade":
+        # An approved postgres upgrade was interrupted: the old definition comes back (its data
+        # directory was never touched), before anything starts the server.
+        log("reconcile: undoing an interrupted postgres upgrade")
+        if _ph_pg.get("step") == "switching":
+            PG.revert_upgrade(platform, project, t, _ph_pg["old_doc"], log,
+                              _ph_pg.get("new_pgdata"))
+        _phase_clear(platform, t)
     if t.postgres:
         cid = PG.container(t)
         if cid and not PG.running(t):
@@ -614,14 +627,6 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         st.event("needs-human", f"reconcile stopped: {why_not}", None, project.name, t.name)
         raise RecipeError(f"{why_not}; the phase file is kept: needs a human")
     ph0 = _phase_get(platform, t)
-    if ph0 and ph0.get("stage") == "pg-upgrade":
-        # An approved postgres upgrade was interrupted: the old definition comes back (its data
-        # directory was never touched); the plan is recorded as failed below; the slots start
-        # again further down.
-        log("reconcile: undoing an interrupted postgres upgrade")
-        if ph0.get("step") == "switching":
-            PG.revert_upgrade(platform, project, t, ph0["old_doc"], log)
-        _phase_clear(platform, t)
     if ph0 and ph0.get("stage") == "restoring":
         # An approved restore was interrupted: do it again (it is idempotent), then the target
         # stays stopped as the plan said. The plan is recorded as applied.
@@ -649,9 +654,8 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         if live and edge.adopt_pending(platform, t) is not None:
             # An adopted site's revert put the old file back but died before recording it.
             # Stop first, record, then clear the phase: a crash in between repeats this branch.
-            for slot, c in cons.items():
-                if c["running"]:
-                    stop_container(c["id"])
+            for slot in slot_members(t):
+                _stop_members(t, slot)
             st.revert_live(live["release_id"], None, None,
                            "reverted to the site's old config (finished by reconcile)")
             _phase_clear(platform, t)
@@ -664,9 +668,9 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
                      live["release_id"], project.name, t.name)
             raise RecipeError("a release is live but the vhost routes nowhere: needs a human "
                               "(huta edge --apply, approved, re-routes it)")
-        for slot, c in cons.items():
-            if c["running"] and not live:
-                stop_container(c["id"])
+        for slot, members in slot_members(t).items():
+            if not live and any(c["running"] for c in members.values()):
+                _stop_members(t, slot)
                 log(f"reconcile: stopped unrouted slot {slot}")
         phase = _phase_get(platform, t)
         if phase and phase.get("copied"):
@@ -735,6 +739,24 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         c = cons.get(routed)
     elif phase and phase.get("stage") == "external":
         _finish_external(platform, st, project, t, phase, log)
+    elif phase and phase.get("stage") == "workers":
+        # Died during the worker handoff: the new slot serves. Stop the other slot entirely,
+        # then hand over again with the liveness window; a failure now is needs-human.
+        rel_w = st.release(phase["rid"])
+        prev = st.release(phase["prev"]) if phase.get("prev") else None
+        for slot in slot_members(t):
+            if slot != routed:
+                _stop_members(t, slot)
+        try:
+            _hand_over_workers(platform, st, t, json.loads(rel_w["app_toml"]), prev, routed,
+                               None, log)
+        except RecipeError as e:
+            st.event("workers-fail", str(e), phase["rid"], project.name, t.name)
+            st.set_state(phase["rid"], S.NEEDS_HUMAN,
+                         msg=f"live, but its workers failed (finished by reconcile): {e}")
+        _phase_clear(platform, t)
+        cons = slot_containers(t)
+        c = cons.get(routed)
     elif phase and phase.get("stage") is None:
         _phase_clear(platform, t)            # it switched; the new slot is the routed one
     stopped = stopped_marker(platform, t).exists()   # `huta stop`: leave the slot stopped
@@ -788,8 +810,15 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         if slot != routed:
             _idle_policy(t, slot)
     if not stopped:
-        _complete_slot(platform, st, t, serving, routed, log)
+        _complete_slot(platform, st, project, t, serving, routed, log)
     _complete_external(platform, st, project, t, serving["id"], log)
+    serving_app = json.loads(serving["app_toml"])
+    m = (serving_app.get("state") or {}).get("schema")
+    if m is not None and schema_now(st, t, _res(serving_app).kind) is None \
+            and st.release(serving["id"])["state"] in (S.LIVE, S.NEEDS_HUMAN):
+        # It went live (it started versioning) but huta died before recording that.
+        st.set_resource_schema(project.name, t.name, _res(serving_app).kind, m, serving["id"])
+        log(f"reconcile: recorded schema {m} of the live release")
     # The timers follow the live release (a crash after the switch could leave them stale).
     try:
         from . import jobs as J
@@ -862,8 +891,11 @@ def run_check(platform: Platform, st: S.Store, project: Project, t: Target, app:
                           check=True)
     except RecipeError:
         return None
-    last = (out or "").strip().splitlines()[-1:] or [""]
-    return int(last[0]) if re.fullmatch(r"\d{1,7}", last[0].strip()) else None
+    # The last line that is only a number (stderr warnings may follow it); it counts only if it
+    # is one of the two schemas this migration moves between.
+    nums = [ln.strip() for ln in (out or "").splitlines() if re.fullmatch(r"\s*\d{1,7}\s*", ln)]
+    got = int(nums[-1]) if nums else None
+    return got if got in (mig.get("from"), mig.get("to")) else None
 
 
 def run_migrate(platform: Platform, st: S.Store, project: Project, t: Target, app: dict,
@@ -969,12 +1001,16 @@ def _finish_online(platform, st, project, t, phase: dict, log) -> None:
     while time.monotonic() < deadline and sh(
             ["docker", "ps", "-q", "--filter", f"name=^{migrate_name(t)}$"], check=False).strip():
         time.sleep(5)
+    still = bool(sh(["docker", "ps", "-q", "--filter", f"name=^{migrate_name(t)}$"],
+                    check=False).strip())
+    if still:
+        sh(["docker", "rm", "-f", migrate_name(t)], check=False)   # past its own timeout
     for slot, members in slot_members(t).items():
         if slot == phase.get("idle") and any(m["running"] for m in members.values()):
             _stop_members(t, slot)
     outcome, msg = S.NOTHING_ACTIVATED, "interrupted during its online migration"
     if phase.get("stage") == "migrating":
-        got = run_check(platform, st, project, t, app, rel, mig, log)
+        got = None if still else run_check(platform, st, project, t, app, rel, mig, log)
         if got is None:
             outcome = S.NEEDS_HUMAN
             msg = ("interrupted during its online migration; whether it committed is unknown "
@@ -1008,11 +1044,12 @@ def _finish_restore(platform, st, project, t, phase: dict, log) -> None:
     from . import data as D
     stopped_marker(platform, t).write_text(f"stopped for restore {phase['rid']}\n")
     sh(["docker", "rm", "-f", migrate_name(t)], check=False)
-    for slot, c in slot_containers(t).items():
-        if c["running"]:
-            stop_container(c["id"])
-        if slot_containers(t).get(slot, {}).get("running"):
+    for slot in slot_members(t):
+        _stop_members(t, slot)
+        if any(c["running"] for c in slot_members(t).get(slot, {}).values()):
             raise RecipeError(f"slot {slot} would not stop: not restoring")
+    if jobs_running(t):
+        raise RecipeError("a job of this target is running: not restoring")
     _res_of(phase.get("res")).restore_pin(platform, project, t, _P(phase["path"]),
                                          phase["fingerprint"], log)
     st.set_resource_schema(t.project, t.name, phase.get("res") or "data", phase["schema"],
@@ -1029,9 +1066,11 @@ def prune_restore_points(platform: Platform, st: S.Store, t: Target, log) -> Non
     keep = max(2, t.keep_releases)
     rows = st.db.execute("SELECT id FROM restore_points WHERE project=? AND target=? AND"
                          " state='kept' ORDER BY created DESC", (t.project, t.name)).fetchall()
+    rows = st.db.execute("SELECT id, kind FROM restore_points WHERE project=? AND target=? AND"
+                         " state='kept' ORDER BY created DESC", (t.project, t.name)).fetchall()
     for r in rows[keep:]:
         try:
-            D.drop_pin(platform, t, r["id"])
+            D.drop_pin(platform, PG.volume_target(t) if r["kind"] == "postgres" else t, r["id"])
             st.db.execute("UPDATE restore_points SET state='dropped' WHERE id=?", (r["id"],))
             log(f"restore point {r['id']} dropped (keeping the newest {keep})")
         except Exception as e:  # noqa: BLE001
@@ -1068,7 +1107,8 @@ def _bring_back(platform, t, slot: str, port: int, health: str, sha: str, log) -
             if not c["running"]:
                 start_container(c["id"])
     else:
-        compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", service(slot))
+        names = [f"slot-{slot}-{c}" for c in members if c] or [service(slot)]
+        compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", *names)
     wait_health(port, health, sha, timeout=60)
     log(f"old slot {slot} is serving again")
 
@@ -1134,6 +1174,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     if PG.wants(app):
         try:
             log(f"postgres: {PG.ensure(platform, st, project, t, log)}")
+            _egress_sync(platform, log)        # its bridges into huta_intra before anything connects
         except (PG.PgError, D.DataError, RecipeError) as e:
             st.set_state(rid, S.NOTHING_ACTIVATED, msg=f"postgres not ready, nothing changed: {e}")
             return S.NOTHING_ACTIVATED
@@ -1144,7 +1185,13 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     failing = "new slot failed before any traffic"
     mig_rec = {"schema_from": mig["from"], "res": res.kind} if migrating else {}
     if online:
-        out = _migrate_online(platform, st, project, t, app, rel, mig, res, live_slot, idle, log)
+        try:
+            out = _migrate_online(platform, st, project, t, app, rel, mig, res, live_slot, idle, log)
+        except (RecipeError, D.DataError, PG.PgError) as e:
+            # The reference copy failed before anything ran: nothing changed, old still serves.
+            _phase_clear(platform, t)
+            st.set_state(rid, S.NOTHING_ACTIVATED, msg=f"online migration not started: {e}")
+            return S.NOTHING_ACTIVATED
         if out is not None:
             return out
         migrating = False         # done: from here this is an ordinary overlapping release
@@ -1195,7 +1242,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
             raise RecipeError("smoke on the new slot failed: " + "; ".join(bad[:5]))
         if checks:
             log(f"smoke on the new slot: {len(checks)} checks passed")
-    except (RecipeError, D.DataError) as e:
+    except (RecipeError, D.DataError, PG.PgError) as e:
         return _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot,
                                     stopped_old, cur, health, port_of, f"{failing}: {e}", log,
                                     copied, mig_rec if migrated else None, was_stopped)
@@ -1255,11 +1302,16 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
 
     # 3b. Workers: the old ones stop, then the new ones start and must stay up (DESIGN-v2 §3).
     if SP.workers(app) or (cur and SP.workers(json.loads(cur["app_toml"]))):
+        _phase_set(platform, t, v=PHASE_VERSION, stage="workers", rid=rid, idle=idle,
+                   old=live_slot, prev=live["release_id"] if live else None)
         try:
             _hand_over_workers(platform, st, t, app, cur, idle, live_slot, log)
         except RecipeError as e:
-            return _workers_failed(platform, st, project, t, rid, live, cur, idle, live_slot,
-                                   concurrent and not stopped_old, undo_pre, port_of, str(e), log)
+            out = _workers_failed(platform, st, project, t, rid, live, cur, idle, live_slot,
+                                  concurrent and not stopped_old, undo_pre, port_of, str(e), log)
+            _phase_clear(platform, t)
+            return out
+        _phase_clear(platform, t)
 
     # 4. Drain and stop the old slot.
     if live_slot and not stopped_old:
@@ -1296,7 +1348,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     return S.LIVE
 
 
-def _complete_slot(platform, st, t, rel, slot: str, log) -> None:
+def _complete_slot(platform, st, project, t, rel, slot: str, log) -> None:
     """Every component of the release serving on the routed slot runs: a crash can leave a
     worker not yet created (its handoff comes after the switch) or one stopped. Unrouted slots
     are stopped first, so this never makes two workers."""
@@ -1306,6 +1358,10 @@ def _complete_slot(platform, st, t, rel, slot: str, log) -> None:
     members = slot_members(t).get(slot, {})
     missing = [f"slot-{slot}-{n}" for n in app["order"] if n not in members]
     if missing:
+        # From the serving release's own definition (a failed newer release may have written
+        # the compose file last).
+        write_compose(platform, t, compose_doc(platform, project, t, app,
+                                               {s: slot_images(st, rel, app) for s in SLOTS}))
         compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", *missing)
         log(f"reconcile: started {', '.join(missing)}")
     for n, m in slot_members(t).get(slot, {}).items():
@@ -1316,27 +1372,42 @@ def _complete_slot(platform, st, t, rel, slot: str, log) -> None:
             sh(["docker", "update", "--restart=unless-stopped", m["id"]], check=False)
 
 
-def publish_external(platform, st, project, t, rid: str, name: str, log) -> str:
+def publish_external(platform, st, project, t, rid: str, name: str, log,
+                     recovering: dict | None = None) -> str:
     """One [external.<name>] of a live release. The intent is recorded first (phase "external":
-    name, content, the deployment before), so a crash is finished by asking Cloudflare."""
+    name, content, the deployment before), so a crash is finished by asking Cloudflare.
+    recovering: that phase record, after a crash: a deployment of these files counts only if
+    it is the one serving now (an older deployment of the same commit is not)."""
     from . import external as E
     rel = st.release(rid)
     app = json.loads(rel["app_toml"])
     cfg, reg = app["external"][name], t.external.get(name)
     if not reg:
         raise RecipeError(f"the registry has no external.{name} for this target")
-    content = (json.loads(rel["plan"]).get("external") or {}).get(name, {}).get("hash")
-    before = E.current(platform, cfg["kind"], reg)
+    planned = (json.loads(rel["plan"]).get("external") or {}).get(name, {})
+    content = planned.get("hash")
+    if recovering and recovering.get("name") == name:
+        before = recovering.get("before")
+        found = E.find(platform, cfg["kind"], reg, rel["sha"], content or "")
+        dep = found if found and found == E.current(platform, cfg["kind"], reg) else None
+    else:
+        before = E.current(platform, cfg["kind"], reg)
+        dep = None
     _phase_set(platform, t, v=PHASE_VERSION, stage="external", rid=rid, idle=rel["slot"],
                name=name, content=content, before=before)
-    dep = E.find(platform, cfg["kind"], reg, rel["sha"], content or "") or \
-        E.publish(platform, project, t, rid, rel["sha"], name, cfg, reg, content, log)
+    if not dep:
+        dep = E.publish(platform, project, t, rid, rel["sha"], name, cfg, reg, content, log,
+                        planned.get("key"))
     _record_external(st, t, rid, name, cfg["kind"], dep, before, content)
     _phase_clear(platform, t)
     return dep
 
 
 def _record_external(st, t, rid, name, kind, dep, before, content) -> None:
+    if content is not None and st.db.execute(
+            "SELECT 1 FROM external_deploys WHERE release_id=? AND name=? AND deployment=?",
+            (rid, name, dep)).fetchone():
+        return          # recorded before a crash: once is enough
     st.db.execute("INSERT INTO external_deploys (project, target, name, kind, release_id,"
                   " deployment, previous, content, created) VALUES (?,?,?,?,?,?,?,?,?)",
                   (t.project, t.name, name, kind, rid, dep, before, content, time.time()))
@@ -1373,12 +1444,13 @@ def _finish_external(platform, st, project, t, phase: dict, log) -> None:
     rel = st.release(rid)
     app = json.loads(rel["app_toml"])
     names = list(app.get("external") or {})
+    name = phase["name"]
     try:
         for name in names[names.index(phase["name"]):]:
-            publish_external(platform, st, project, t, rid, name, log)
+            publish_external(platform, st, project, t, rid, name, log, recovering=phase)
     except Exception as e:  # noqa: BLE001 — the outcome is recorded
         _phase_clear(platform, t)
-        st.set_state(rid, S.NEEDS_HUMAN, msg=f"live; publishing {phase['name']} failed after "
+        st.set_state(rid, S.NEEDS_HUMAN, msg=f"live; publishing {name} failed after "
                                              f"a crash: {type(e).__name__}: {e}")
         return
     log("reconcile: finished publishing")

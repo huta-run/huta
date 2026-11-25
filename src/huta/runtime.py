@@ -369,6 +369,10 @@ def component_environment(platform: Platform, project: Project, t: Target, sha: 
     for n in c.get("secrets", []):
         env[n] = secret_value(platform, project.name, n) if with_secrets else SECRET_PLACEHOLDER
     env["HUTA_COMPONENT"] = cname
+    if app is not None and "NO_PROXY" in env:
+        # The slot's other components are reached directly, never through the egress proxy.
+        direct = ",".join([env["NO_PROXY"], *app["order"], *(["postgres"] if "DATABASE_URL" in env else [])])
+        env["NO_PROXY"] = env["no_proxy"] = direct
     return env
 
 
