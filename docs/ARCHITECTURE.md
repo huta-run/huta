@@ -135,6 +135,8 @@ caddy_secrets = "/etc/caddy/huta-secrets"  # v2 gateways' header files (the defa
 caddy_group = "caddy"                       # the group Caddy runs as (the default)
 [postgres.images]              # v2: the only Postgres images targets may run, pinned by digest
 "17" = "postgres@sha256:<64 hex>"
+[external]                     # v2: the image huta publishes to Cloudflare with (pinned)
+wrangler = "<repo>@sha256:<64 hex>"
 [cloudflare]
 zones = ["example.org"]        # huta refuses any Cloudflare call outside this list
 [transport.pull]               # optional
@@ -371,6 +373,16 @@ definition is refused: `huta postgres upgrade` plans it), slots join their netwo
 `pg_dump -Fc` / `pg_restore --single-transaction` under `<backup>/<p>/<t>-pg/`. Jobs join the
 live slot's database network as a second `--network` (Docker 25+). reconcile starts a stopped
 server first; an interrupted upgrade puts the old definition back.
+External publishing (DESIGN-v2 §5, `external.py`): at planning, each `[external.<name>]` dir is
+copied out of its image (`docker create` + `docker cp`, tar through a validator) into
+`/var/lib/huta/external/<p>/<t>/<sha12>/<name>/`, hashed, and the plan says where it goes.
+After the switch, checks, workers and drain, each one runs: phase `external` (name, content
+hash, the deployment before) → `E.find` (already there after a crash?) or wrangler in the
+`[external] wrangler` image on network `huta_external` (bridge `dp-…`, policy target
+`huta/external`, egress to api.cloudflare.com:443 only), the registry's token only, files
+read-only, a generated config → `external_deploys` row. A failure leaves the site live,
+`needs-human`; reconcile finishes an interrupted publish and publishes what a live release
+never recorded. `huta external rollback` plans going back by deployment or version id.
 Restore plans (`huta restore`) put a kept restore point back for code that can't run on the
 current schema: stop marker, stop every slot, rsync the pin (its fingerprint checked again), the
 point's schema recorded, phase `restoring` so reconcile redoes it after a crash. The target stays

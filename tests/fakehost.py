@@ -65,6 +65,7 @@ class FakeHost:
         self._save("data", {})
         self._save("ops", [])
         self._save("faults", {})
+        self._save("cf", {"deploys": []})
 
     def close(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -94,6 +95,7 @@ class FakeHost:
         old_phase=True       phase files lack the previous vhost (as an older huta wrote them)
         migrate_fail=True    the [migrate] command exits non-zero (after writing)
         worker_dies=True     a new worker exits during its liveness window
+        publish_fail=True    publishing to Cloudflare fails
         """
         f = self._load("faults")
         f.update(kw)
@@ -422,6 +424,25 @@ class FakeHost:
         self._save("data", v)
         self._op("data restored from pin")
 
+    # Cloudflare: deployments by (name, sha, content)
+    def cf_current(self, platform, kind, reg):
+        d = [x for x in self._load("cf")["deploys"] if x["name"] == reg["name"]]
+        return d[-1]["id"] if d else None
+
+    def cf_find(self, platform, kind, reg, sha, content):
+        return next((x["id"] for x in self._load("cf")["deploys"]
+                     if (x["name"], x["sha"], x["content"]) == (reg["name"], sha, content)), None)
+
+    def cf_publish(self, platform, project, t, rid, sha, name, cfg, reg, content, log):
+        if self._faults().get("publish_fail"):
+            raise RuntimeError("wrangler failed: test fault")
+        cf = self._load("cf")
+        dep = f"dep{len(cf['deploys']) + 1}"
+        cf["deploys"].append({"name": reg["name"], "sha": sha, "content": content, "id": dep})
+        self._save("cf", cf)
+        self._op(f"published {name}")
+        return dep
+
     def schema(self, t):
         st = self.store()
         try:
@@ -545,6 +566,10 @@ class FakeHost:
             patch(PG, "restore_pin", self.restore_pin)
             patch(PG, "container", lambda t: "pg-" + t.name)
             patch(PG, "running", lambda t: True)
+            from huta import external as E
+            patch(E, "current", self.cf_current)
+            patch(E, "find", self.cf_find)
+            patch(E, "publish", self.cf_publish)
             patch(recipe, "_docker_run", self.docker_run)
             patch(Cloudflare, "ip_ranges", staticmethod(self.ip_ranges))
             patch(Cloudflare, "ensure_host_strict", lambda _self, h: f"{h}: strict")
@@ -573,9 +598,11 @@ class FakeHost:
             imgs = {next(iter(app["images"])): iid}
         st = self.store()
         try:
+            plan = {"external": {n: {"hash": f"content-{sha[:6]}-{n}", "kind": e["kind"]}
+                                 for n, e in (app.get("external") or {}).items()}}
             rid = st.new_release(project=project.name, target=t.name, sha=sha, image_id=iid,
                                  image_tag=f"huta-build/{project.name}:{sha[:12]}",
-                                 app_toml=json.dumps(app), plan={}, plan_hash="0" * 64,
+                                 app_toml=json.dumps(app), plan=plan, plan_hash="0" * 64,
                                  built_by="test", images=imgs)
             st.transition(rid, S.PLANNED, S.APPROVED)
         finally:

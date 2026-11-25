@@ -391,6 +391,15 @@ digest (get one with `docker pull postgres:17` and `docker image inspect --forma
 "17" = "postgres@sha256:<64 hex>"
 ```
 
+Targets that publish to Cloudflare (`external` in the registry) need the publisher image,
+built from `systemd/wrangler.Dockerfile.example` and pinned by digest, and its token as a
+platform secret (`/etc/huta/secrets/_platform/<NAME>`, root 0600):
+
+```toml
+[external]
+wrangler = "<repo>@sha256:<64 hex>"
+```
+
 Targets with several components need the firewall fragment's `huta_intra` set (in
 `systemd/nftables-huta-egress.nft.example`; load it again if yours predates it, then
 `sudo huta egress sync`).

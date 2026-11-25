@@ -1,0 +1,22 @@
+# Test fixture: a target that publishes to Cloudflare (DESIGN-v2 §5). Made-up account.
+schema = 1
+project = "site"
+repo = "example/site"
+app_toml = "deploy/app.toml"
+uid = 29005
+
+[targets.prod]
+hosts = ["app.example.org"]
+slots = [19150, 19151]
+
+[targets.prod.external.pages]
+name = "example-site"
+account = "0123456789abcdef0123456789abcdef"
+token = "CF_PAGES_TOKEN"
+
+[targets.prod.external.edge]
+name = "example-edge"
+account = "0123456789abcdef0123456789abcdef"
+token = "CF_PAGES_TOKEN"
+routes = ["example.org/api/*"]
+compatibility_date = "2026-11-01"

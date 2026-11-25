@@ -207,6 +207,7 @@ class Platform:
     caddy_secrets: Path = Path("/etc/caddy/huta-secrets")
     caddy_group: str = "caddy"
     postgres_images: dict = field(default_factory=dict)   # [postgres.images] version -> ref@digest
+    wrangler_image: str = ""                      # [external] wrangler: the publisher, by digest
 
     def secret(self, name: str) -> str:
         return read_secret(self.secrets_dir / "_platform" / name)
@@ -246,6 +247,9 @@ class Target:
     worker_liveness: int = 10
     # Postgres of the target (DESIGN-v2 §4): {"version", "size", "bytes", "backup", "limits"}.
     postgres: dict | None = None
+    # Cloudflare destinations of [external.<name>] (DESIGN-v2 §5): name -> {name, account,
+    # token, routes, compatibility_date}.
+    external: dict = field(default_factory=dict)
     migrate_secrets: list = field(default_factory=list)   # the only secrets [migrate] gets
 
     @property
@@ -374,7 +378,46 @@ def load_platform(etc: Path = ETC) -> Platform:
         caddy_secrets=Path(p.get("caddy_secrets", "/etc/caddy/huta-secrets")),
         caddy_group=_caddy_group(p.get("caddy_group", "caddy")),
         postgres_images=_postgres_images(d.get("postgres", {})),
+        wrangler_image=_wrangler(d.get("external", {})),
     )
+
+
+def _wrangler(v) -> str:
+    if not isinstance(v, dict) or set(v) - {"wrangler"}:
+        raise ConfigError("[external] accepts only wrangler")
+    w = v.get("wrangler", "")
+    if w and not re.fullmatch(r"[a-z0-9][a-z0-9./_:-]{0,200}@sha256:[0-9a-f]{64}", w):
+        raise ConfigError("[external] wrangler must be an image pinned by digest (…@sha256:…)")
+    return w
+
+
+def _external_cfg(v, where: str) -> dict:
+    """[targets.<t>.external.<name>]: where an [external.<name>] of the repo goes. The token is a
+    platform secret name; Cloudflare tokens are account-wide."""
+    if not isinstance(v, dict) or len(v) > 8:
+        raise ConfigError(f"{where}: external = {{ <name> = {{ name, account, token, … }} }}")
+    out = {}
+    for key, e in v.items():
+        w = f"{where} external.{key}"
+        if not NAME_RE.match(key) or not isinstance(e, dict) or \
+                set(e) - {"name", "account", "token", "routes", "compatibility_date"}:
+            raise ConfigError(f"{w}: accepts name, account, token, routes, compatibility_date")
+        if not isinstance(e.get("name"), str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,57}", e["name"]):
+            raise ConfigError(f"{w}: name is the Pages project or Worker name")
+        if not isinstance(e.get("account"), str) or not re.fullmatch(r"[0-9a-f]{32}", e["account"]):
+            raise ConfigError(f"{w}: account is the 32-hex Cloudflare account id")
+        _env_name(e.get("token"), f"{w} token")
+        routes = e.get("routes", [])
+        if not isinstance(routes, list) or len(routes) > 20 or not all(
+                isinstance(r, str) and re.fullmatch(r"(\*\.)?[a-z0-9.-]+\.[a-z]{2,63}/[A-Za-z0-9/._*-]*", r)
+                for r in routes):
+            raise ConfigError(f"{w}: routes are like \"example.org/api/*\"")
+        date = e.get("compatibility_date", "")
+        if date and not re.fullmatch(r"20\d\d-\d\d-\d\d", date):
+            raise ConfigError(f"{w}: compatibility_date is YYYY-MM-DD")
+        out[key] = {"name": e["name"], "account": e["account"], "token": e["token"],
+                    "routes": list(routes), "compatibility_date": date}
+    return out
 
 
 def _postgres_images(v) -> dict:
@@ -809,7 +852,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
                             "require_ci", "keep_releases", "drain", "env", "secrets",
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
                             "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
-                            "components", "worker_liveness", "postgres"}
+                            "components", "worker_liveness", "postgres", "external"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -886,6 +929,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             components=_components_cfg(t.get("components", {}), env, tw),
             worker_liveness=_worker_liveness(t.get("worker_liveness", 10), tw),
             postgres=_postgres_cfg(t.get("postgres"), tw),
+            external=_external_cfg(t.get("external", {}), tw),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -924,6 +968,13 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                     if not platform.backup:
                         raise ConfigError(f"{p.name}/{t.name}: postgres needs [backup] in "
                                           "huta.toml (its dumps live there)")
+                for key, e in t.external.items():
+                    for r in e["routes"]:
+                        host = r.split("/", 1)[0].removeprefix("*.")
+                        zone_for(host, platform)          # refuses a zone outside the list
+                    if not platform.wrangler_image:
+                        raise ConfigError(f"{p.name}/{t.name}: external needs [external] "
+                                          "wrangler in huta.toml")
                 if t.data and not platform.backup:
                     # Even with backup = "off" (no schedule, no shipping): a one-writer release
                     # copies the data before the new code runs, to restore it if that fails
@@ -936,6 +987,20 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
             if t.postgres and f"{t.name}-pg" in p.targets:
                 raise ConfigError(f"{p.name}: target {t.name}-pg would share its database's "
                                   "volume name; rename it")
+    # A Worker route may not take a hostname another target serves.
+    served = {h: f"{p.name}/{t.name}" for p in projects.values() for t in p.targets.values()
+              for h in t.hosts}
+    for p in projects.values():
+        for t in p.targets.values():
+            for e in t.external.values():
+                for r in e["routes"]:
+                    host = r.split("/", 1)[0]
+                    owner = served.get(host.removeprefix("*."))
+                    if owner and owner != f"{p.name}/{t.name}" or host.startswith("*.") and any(
+                            h.endswith(host[1:]) and o != f"{p.name}/{t.name}"
+                            for h, o in served.items()):
+                        raise ConfigError(f"{p.name}/{t.name}: route {r} covers a host another "
+                                          "target serves")
     ports, hosts, uids = {}, {}, {}
     for p in projects.values():
         if p.uid and p.uid in uids:
@@ -999,10 +1064,9 @@ def parse_app_toml(text: str, project: str) -> dict:
     # Implemented exactly this much; anything more is refused, not ignored (codex #13).
     if len(comps) > MAX_COMPONENTS:
         raise ConfigError(f"app.toml: at most {MAX_COMPONENTS} components")
-    for key in ("preflight", "external"):
-        if d.get(key):
-            raise ConfigError(f"app.toml: '{key}' is not supported by huta yet")
-    st_kind = (d.get("state") or {}).get("kind", "none") if isinstance(d.get("state"), dict) else None
+    if d.get("preflight"):
+        raise ConfigError("app.toml: 'preflight' is not supported by huta yet")
+    st_kind = d.get("state", {}).get("kind", "none") if isinstance(d.get("state", {}), dict) else None
     if st_kind not in ("none", "data", "postgres"):
         raise ConfigError("app.toml: state.kind must be \"none\", \"data\" or \"postgres\"")
     for cname, c in comps.items():
@@ -1066,6 +1130,8 @@ def parse_app_toml(text: str, project: str) -> dict:
         if c.get("image") not in imgs:
             raise ConfigError(f"app.toml: components.{cname}.image must name one of [images]: "
                               f"{sorted(imgs)}")
+    if "external" in d:
+        d["external"] = _external_app(d["external"], imgs)
     st = d.get("state", {})
     if not isinstance(st, dict) or set(st) - {"kind", "schema", "runs_on"}:
         raise ConfigError(f"app.toml: [state] accepts kind, schema and runs_on, got {sorted(st)}")
@@ -1085,6 +1151,38 @@ def parse_app_toml(text: str, project: str) -> dict:
         if not isinstance(health, str) or not re.match(r"^/[A-Za-z0-9/_.-]*$", health):
             raise ConfigError(f"app.toml: {cname}.health invalid")
     return d
+
+
+def _external_app(v, imgs: dict) -> dict:
+    """[external.<name>]: files built into one of the release's images, published to Cloudflare
+    after the switch (DESIGN-v2 §5)."""
+    if not isinstance(v, dict) or len(v) > 8:
+        raise ConfigError("app.toml: [external.<name>] tables, at most 8")
+    out = {}
+    for name, e in v.items():
+        w = f"app.toml: external.{name}"
+        if not NAME_RE.match(name) or not isinstance(e, dict) or \
+                set(e) - {"kind", "image", "dir", "main"}:
+            raise ConfigError(f"{w}: accepts kind, image, dir, main")
+        kind = e.get("kind")
+        if kind not in ("cloudflare-pages", "cloudflare-worker"):
+            raise ConfigError(f"{w}: kind is \"cloudflare-pages\" or \"cloudflare-worker\"")
+        if e.get("image") not in imgs:
+            raise ConfigError(f"{w}: image must name one of [images]: {sorted(imgs)}")
+        d = e.get("dir")
+        if not isinstance(d, str) or not re.fullmatch(r"/[A-Za-z0-9._/-]{1,200}", d) or ".." in d \
+                or d.rstrip("/") in RESERVED_MOUNTS:
+            raise ConfigError(f"{w}: dir is the absolute path of the built files in the image")
+        main = e.get("main")
+        if kind == "cloudflare-worker":
+            if not isinstance(main, str) or not re.fullmatch(r"[A-Za-z0-9._-][A-Za-z0-9._/-]{0,200}", main) \
+                    or ".." in main:
+                raise ConfigError(f"{w}: a worker needs main, its bundle's path inside dir")
+        elif main is not None:
+            raise ConfigError(f"{w}: main is for workers only")
+        out[name] = {"kind": kind, "image": e["image"], "dir": d.rstrip("/") or "/",
+                     **({"main": main} if main else {})}
+    return out
 
 
 def _schema_cfg(st: dict) -> None:

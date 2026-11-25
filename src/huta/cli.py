@@ -213,6 +213,8 @@ def _approve_plan(platform, registry, st, pid: str, via: str, confirmed: bool = 
             return _approve_restore(platform, st, project, t, pid, plan, via, confirmed)
         if r["kind"] == "postgres":
             return _approve_pg_upgrade(platform, st, project, t, pid, plan, via)
+        if r["kind"] == "external":
+            return _approve_external_rollback(platform, st, project, t, pid, plan, via)
         if r["kind"] != "edge":
             raise ConfigError(f"plan {pid}: kind {r['kind']!r} is not handled by this huta")
         cf = Cloudflare(platform)
@@ -294,6 +296,20 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
     eff = recipe.effective(platform, project, t, app)
     changes = []
     mig = recipe.migration(st, t, app)            # refuses what this data can't take
+    externals = {}
+    for name, e in (app.get("external") or {}).items():
+        reg = t.external.get(name)
+        if not reg:
+            raise ConfigError(f"app.toml publishes external.{name}, but the host registry has no "
+                              f"external.{name} for {project.name}/{t.name} (operator: add it)")
+        from . import external as E
+        got = E.extract(platform, t, sha[:12], name, images[e["image"]], e)
+        externals[name] = {**got, "kind": e["kind"]}
+        where = "Pages project" if e["kind"] == "cloudflare-pages" else "Worker"
+        changes.append(f"publishes {name} after the switch: {got['files']} files "
+                       f"({got['bytes'] >> 10} KiB, {got['hash'][:12]}) to the Cloudflare {where} "
+                       f"{reg['name']}" + (f" on {', '.join(reg['routes'])}" if reg["routes"] else "")
+                       + f"; token {reg['token']} is account-wide")
     if mig and mig["run"]:
         m = app["migrate"]
         changes.append(f"⚠️ migrates the data from schema {mig['from'] if mig['from'] is not None else 'unversioned'} "
@@ -365,6 +381,7 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
         "checks": {"on_main": True, "ci": "green" if t.require_ci else "not required"},
         "planned_against_live": live_rel["id"] if live_rel else None,
         "migration": mig,             # None, or {"from": S, "to": M, "run": bool}
+        "external": externals,        # name -> {hash, files, bytes, kind}
         "effective": eff, "built_by": "dev", "note": note, "history": history,
         "staged_secrets": staged,     # {name: fingerprint}: approval applies exactly these
         "secret_versions": R.live_versions(platform, project.name, secret_names(t)),
@@ -709,6 +726,65 @@ def _approve_pg_upgrade(platform, st, project, t, pid, plan, via) -> int:
     st.plan_transition(pid, S.APPROVED, "applied", "postgres upgraded")
     tell(platform, st, pid)
     recipe.reconcile(platform, st, project, t, say)         # the app starts again
+    say("outcome: applied")
+    return 0
+
+
+def cmd_external(a):
+    """huta external <p> <t> [status | rollback <name>] (DESIGN-v2 §5)."""
+    platform, project, st = ctx(a.project)
+    t = target_of(project, a.target)
+    rows = st.db.execute("SELECT * FROM external_deploys WHERE project=? AND target=?"
+                         " ORDER BY id DESC", (project.name, t.name)).fetchall()
+    if a.cmd == "status":
+        if not rows:
+            say("nothing published from this target yet")
+        for r in rows[:20]:
+            say(f"{time.strftime('%m-%d %H:%M', time.localtime(r['created']))}  {r['name']}  "
+                f"{r['kind']}  {r['deployment']}  (was {r['previous'] or '-'})  release {r['release_id']}")
+        return 0
+    name = a.name
+    if not name or name not in t.external:
+        raise ConfigError(f"rollback which external? ({', '.join(t.external) or 'none'})")
+    last = next((r for r in rows if r["name"] == name), None)
+    if not last or not last["previous"]:
+        raise ConfigError(f"{name}: no earlier deployment recorded to go back to")
+    reg = t.external[name]
+    lines = [f"⚠️ {name}: Cloudflare goes back to deployment {last['previous']} (from "
+             f"{last['deployment']}, published by release {last['release_id']})",
+             f"the host target is not changed; token {reg['token']} is account-wide"]
+    pid = st.new_plan(project.name, t.name, "external", {
+        "lines": lines, "name": name, "kind": last["kind"], "to": last["previous"],
+        "from": last["deployment"], "release": last["release_id"]})
+    tell(platform, st, pid)
+    ask(platform, st, pid)
+    for line in lines:
+        say(line)
+    say(f"\nrollback plan {pid}; approve with: huta approve {pid}")
+    return 0
+
+
+def _approve_external_rollback(platform, st, project, t, pid, plan, via) -> int:
+    from . import external as E
+    reg = t.external.get(plan["name"])
+    if not reg:
+        raise ConfigError(f"the registry no longer has external.{plan['name']}")
+    if E.current(platform, plan["kind"], reg) not in (plan["from"], None):
+        st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "Cloudflare changed since planning")
+        raise ConfigError("Cloudflare serves another deployment since planning; plan again")
+    st.plan_transition(pid, S.PLANNED, S.APPROVED, f"approved {via}")
+    retire_buttons(platform, st, pid)
+    tell(platform, st, pid)
+    try:
+        E.rollback(platform, plan["kind"], reg, plan["to"])
+    except Exception as e:  # noqa: BLE001
+        st.plan_transition(pid, S.APPROVED, "failed", f"{type(e).__name__}: {e}")
+        tell(platform, st, pid)
+        raise
+    recipe._record_external(st, t, plan["release"], plan["name"], plan["kind"], plan["to"],
+                            plan["from"], None)
+    st.plan_transition(pid, S.APPROVED, "applied", f"{plan['name']} back on {plan['to']}")
+    tell(platform, st, pid)
     say("outcome: applied")
     return 0
 
@@ -1677,6 +1753,10 @@ def main(argv=None) -> int:
     s.add_argument("--confirm-data-loss", action="store_true",
                    help="required to approve a restore plan on the CLI")
     s.set_defaults(f=cmd_approve)
+    s = sub.add_parser("external"); s.add_argument("project"); s.add_argument("target")
+    s.add_argument("cmd", choices=["status", "rollback"], nargs="?", default="status")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(f=cmd_external)
     s = sub.add_parser("postgres"); s.add_argument("project"); s.add_argument("target")
     s.add_argument("cmd", choices=["status", "upgrade"], nargs="?", default="status")
     s.set_defaults(f=cmd_postgres)

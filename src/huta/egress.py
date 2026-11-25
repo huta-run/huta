@@ -61,6 +61,15 @@ def build_policy(platform, registry, network_name) -> dict:
             targets.append({"target": f"{project.name}/{t.name}", "subnets": subnets,
                             "allow": t.egress_allow,
                             "upstreams": {u: platform.upstreams[u]["port"] for u in t.upstreams}})
+    # The publisher's own network (DESIGN-v2 §5): only Cloudflare's API.
+    from .external import EGRESS, NETWORK
+    r = subprocess.run(["docker", "network", "inspect", NETWORK, "--format",
+                        "{{json .IPAM.Config}}"], capture_output=True, text=True, timeout=30, cwd="/")
+    if r.returncode == 0:
+        subnets = [c["Subnet"] for c in json.loads(r.stdout or "[]") or [] if c.get("Subnet")]
+        if subnets:
+            targets.append({"target": "huta/external", "subnets": subnets, "allow": list(EGRESS),
+                            "upstreams": {}})
     return {"v": 1, "ts": int(time.time()), "targets": targets,
             "upstreams": {n: u for n, u in platform.upstreams.items()},
             "deny": sorted(set(_host_networks()) | ({platform.public_ipv4} if platform.public_ipv4 else set()))}

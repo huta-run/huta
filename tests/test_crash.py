@@ -126,6 +126,19 @@ class Scenario:
                                 f"{where}: the adopted site's own file is gone")
         self.assertEqual(host._load("docker").get("worker_overlaps", []), [],
                          f"{where}: two copies of a worker ran at once")
+        deploys = host._load("cf")["deploys"]
+        keys = [(x["name"], x["sha"], x["content"]) for x in deploys]
+        self.assertEqual(len(keys), len(set(keys)), f"{where}: the same files published twice")
+        if live and live["release_id"] == r2 and rows[r2]["state"] == LIVE:
+            app2 = json.loads(rows[r2]["app_toml"])
+            for name in app2.get("external") or {}:
+                st = host.store()
+                try:
+                    rec = st.db.execute("SELECT 1 FROM external_deploys WHERE release_id=? AND"
+                                        " name=?", (r2, name)).fetchone()
+                finally:
+                    st.db.close()
+                self.assertTrue(rec, f"{where}: r2 is live but {name} was never published")
         if self.one_writer:
             ds = host.data_state(t)
             self.assertEqual(ds["overlaps"], [], f"{where}: two writers ran at once")
@@ -453,6 +466,22 @@ class PgRelease(Scenario, unittest.TestCase):
     """No migration: both slots use the database at once (Postgres handles concurrent clients)."""
     project_name, target_name = "ledger", "prod"
     schema_r1, schema_r2 = 1, 1
+
+
+class Publish(Scenario, unittest.TestCase):
+    """A release that publishes a Pages site and a Worker after its switch."""
+    project_name, target_name = "site", "prod"
+
+
+class PublishFails(Scenario, unittest.TestCase):
+    """Publishing fails: the host target stays live, the release is needs-human."""
+    project_name, target_name = "site", "prod"
+    faults = {"publish_fail": True}
+
+    def setup_host(self):
+        # r1 publishes fine; the fault applies to r2 only (the base class sets faults after r1).
+        return super().setup_host()
+    clean, allowed = NH, {NA, NH}
 
 
 class PhaseRecords(unittest.TestCase):

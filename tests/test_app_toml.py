@@ -33,6 +33,10 @@ class Examples(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_app_toml(HELLO, "other")
 
+    def test_state_is_optional(self):
+        app = parse_app_toml(HELLO.replace('[state]\nkind = "none"\n', ""), "hello")
+        self.assertNotIn("state", app)
+
     def test_unknown_key_is_an_error(self):
         with self.assertRaisesRegex(ConfigError, "unknown"):
             parse_app_toml(with_lines(HELLO, before_tables="colour = \"blue\"\n"), "hello")
@@ -167,6 +171,34 @@ class Postgres(unittest.TestCase):
             parse_app_toml(text, "notes")
 
 
+class External(unittest.TestCase):
+    """[external.<name>] (DESIGN-v2 §5)."""
+
+    def parse(self, extra):
+        return parse_app_toml(with_lines(HELLO, after=extra), "hello")
+
+    def test_pages(self):
+        app = self.parse('[external.site]\nkind = "cloudflare-pages"\nimage = "web"\ndir = "/out/"\n')
+        self.assertEqual(app["external"]["site"], {"kind": "cloudflare-pages", "image": "web",
+                                                   "dir": "/out"})
+
+    def test_worker_needs_main(self):
+        with self.assertRaisesRegex(ConfigError, "needs main"):
+            self.parse('[external.edge]\nkind = "cloudflare-worker"\nimage = "web"\ndir = "/w"\n')
+        app = self.parse('[external.edge]\nkind = "cloudflare-worker"\nimage = "web"\n'
+                         'dir = "/w"\nmain = "index.js"\n')
+        self.assertEqual(app["external"]["edge"]["main"], "index.js")
+
+    def test_refused(self):
+        for extra in ('[external.site]\nkind = "netlify"\nimage = "web"\ndir = "/out"\n',
+                      '[external.site]\nkind = "cloudflare-pages"\nimage = "nope"\ndir = "/out"\n',
+                      '[external.site]\nkind = "cloudflare-pages"\nimage = "web"\ndir = "out"\n',
+                      '[external.site]\nkind = "cloudflare-pages"\nimage = "web"\ndir = "/etc"\n',
+                      '[external.site]\nkind = "cloudflare-pages"\nimage = "web"\ndir = "/o"\nmain = "x.js"\n'):
+            with self.subTest(extra=extra), self.assertRaises(ConfigError):
+                self.parse(extra)
+
+
 class PlannedFeaturesRefused(unittest.TestCase):
     """Today's refusals. A v2 step that builds a feature replaces its test here."""
 
@@ -176,10 +208,6 @@ class PlannedFeaturesRefused(unittest.TestCase):
 
     def test_schema_2(self):
         self.refused(HELLO.replace("schema = 1", "schema = 2"), "schema must be 1")
-
-    def test_external(self):
-        self.refused(with_lines(HELLO, after='[external.site]\nkind = "cloudflare-pages"\n'),
-                     "not supported by huta yet")
 
     def test_online_migration(self):
         with self.assertRaisesRegex(ConfigError, "not supported by huta yet"):

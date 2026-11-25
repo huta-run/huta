@@ -233,7 +233,7 @@ runs_on = [1]
 - `reconcile` starts a target's Postgres if it is stopped, before anything else of the target.
 - Bring-your-own stays possible: a `DATABASE_URL` secret plus egress to the database host.
 
-## 5. External publishing (Cloudflare Pages and Workers)
+## 5. External publishing (Cloudflare Pages and Workers) (built)
 
 ```toml
 # app.toml

@@ -115,12 +115,12 @@ timeout = "10m"
 | `components` | table of tables | required; 1..8 components, exactly one of them the public HTTP one (below) |
 | `state` | table | optional; `kind` (`"none"` default, or `"data"`), and with data `schema` and `runs_on` (below) |
 | `migrate` | table | optional; a migration this release runs before its code starts (below) |
+| `external` | table of tables | optional; files to publish to Cloudflare Pages or Workers after the switch (below) |
 | `build` | table | optional; only `test` (accepted; `huta pack` does not run it yet) |
 | `smoke` | array of tables | optional; at most 20 checks (below) |
 | `jobs` | array of tables | optional; at most 20 jobs (below) |
 | `diag` | array of tables | optional; at most 20 diagnostics (below) |
 | `preflight` | array of tables | must be absent or empty (*planned*) |
-| `external` | table | must be absent or empty (*planned*) |
 
 Any other top-level key: `app.toml: unknown top-level keys ['<key>']`.
 
@@ -259,6 +259,38 @@ restore point pinned before the migration (huta keeps the newest `keep_releases`
 loses every write since, and needs `--confirm-data-loss` or the Telegram button; huta checks the
 point's fingerprint at approval. The target then stays stopped until the release of that code,
 which is planned for you, is approved.
+
+### `[external.<name>]`
+
+Files your build put in one of the release's images, published to Cloudflare after the switch
+and the public checks, as a step of the same release (one plan, one approval):
+
+```toml
+[external.site]
+kind = "cloudflare-pages"          # static files
+image = "web"
+dir = "/out/site"                  # where they are inside the image
+
+[external.edge]
+kind = "cloudflare-worker"         # one prebuilt bundle (huta does not bundle)
+image = "web"
+dir = "/out/worker"
+main = "index.js"                  # the bundle, inside dir
+```
+
+- The host copies `dir` out of the image **without running it** and refuses anything but
+  regular files and directories (no links or devices), more than 20000 files, files over
+  25 MiB or 512 MiB in all. The plan shows the file count and a content hash; publishing
+  checks the hash again.
+- Pages files are static: `_worker.js`, `functions/`, `wrangler.*` and `package.json` are code
+  and refused (publish code as a worker).
+- The operator decides where it goes (`[targets.<t>.external.<name>]`: the Pages project or
+  Worker name, the account, the token, a Worker's routes and compatibility date). Your repo's
+  `wrangler.toml` is never used.
+- A failed publish leaves the site live and ends the release `needs-human`, naming the step.
+  After a crash huta asks Cloudflare whether this commit's files are already there before
+  sending them again. `huta external <p> <t> rollback <name>` plans going back to the previous
+  deployment.
 
 ### `[[smoke]]`
 
@@ -461,6 +493,7 @@ see each other: the box is the unit huta can tell apart.
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
 | `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
+| `external.<name>` | table | | where an `[external.<name>]` goes: `name` (Pages project or Worker), `account` (32 hex), `token` (a platform secret name; Cloudflare tokens are account-wide), Workers also `routes` (like `example.org/api/*`, in an allowed zone, not another target's host) and `compatibility_date`. Needs `[external] wrangler` in `huta.toml` |
 | `postgres` | table | | `version` (a name in `huta.toml` `[postgres.images]`), `size` (256m..2t), `backup` (`hourly`/`daily`/`off`/an OnCalendar, default `daily`), `limits` (default 1g memory, 2 cpus). Needs `[backup]` in `huta.toml`. A target named `<this>-pg` can't exist next to it |
 | `worker_liveness` | int | `10` | 1..300 seconds a new worker must stay up after the switch |
 | `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |

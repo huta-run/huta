@@ -1,0 +1,21 @@
+# Test fixture: a web app that also publishes a static site and an edge worker (DESIGN-v2 §5).
+schema = 1
+project = "site"
+order = ["web"]
+
+[images.web]
+dockerfile = "Dockerfile"
+
+[components.web]
+image = "web"
+
+[external.pages]
+kind = "cloudflare-pages"
+image = "web"
+dir = "/out/site"
+
+[external.edge]
+kind = "cloudflare-worker"
+image = "web"
+dir = "/out/worker"
+main = "index.js"

@@ -29,7 +29,7 @@ Rules for every milestone:
 | 2 | Migrations, exclusive mode; `health_timeout`; restore plans | built |
 | 3 | Several containers per target; images map | built |
 | 4 | Postgres per target | built |
-| 5 | External publishing (Pages, Workers) | planned |
+| 5 | External publishing (Pages, Workers) | built |
 | 6 | Migrations, online mode | planned |
 
 ## T: test harness (built)

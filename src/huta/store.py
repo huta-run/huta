@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS live (
 # The database's own version (PRAGMA user_version). Migrations run forward only, each in one
 # transaction; a database newer than this code is refused, never misread (DESIGN-v2 §0).
 # 0 = a database from before versioning, which is version 1's tables.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIGRATIONS: dict[int, str] = {1: SCHEMA, 2: """
 ALTER TABLE releases ADD COLUMN images TEXT;
 ALTER TABLE releases ADD COLUMN schema INTEGER;
@@ -66,10 +66,17 @@ CREATE TABLE plans (
   plan TEXT NOT NULL, plan_hash TEXT NOT NULL, state TEXT NOT NULL,
   created REAL NOT NULL, updated REAL NOT NULL
 )
+""", 3: """
+CREATE TABLE external_deploys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, target TEXT NOT NULL,
+  name TEXT NOT NULL, kind TEXT NOT NULL, release_id TEXT NOT NULL, deployment TEXT NOT NULL,
+  previous TEXT, content TEXT, created REAL NOT NULL
+)
 """}
 # What each version added: 1, the v1 tables; 2, release image maps and schemas, resources
 # (a target's data volume or database, with its schema), restore points pinned per release,
-# and plans that are not releases (infra: edge, gateways, Postgres; restore).
+# and plans that are not releases (infra: edge, gateways, Postgres; restore); 3, deployments
+# published to Cloudflare by releases (DESIGN-v2 §5).
 
 
 class StoreError(Exception):

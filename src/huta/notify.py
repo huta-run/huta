@@ -39,7 +39,7 @@ STATE_LINE = {
     "failed": "🆘 failed, needs a human",
 }
 PLAN_TITLE = {"edge": "🌐 edge change", "restore": "♻️ DATA RESTORE",
-              "postgres": "🐘 postgres upgrade"}
+              "postgres": "🐘 postgres upgrade", "external": "☁️ Cloudflare rollback"}
 
 
 def created(st: S.Store, rid: str) -> float:

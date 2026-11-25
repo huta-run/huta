@@ -1,6 +1,6 @@
 # huta
 
-> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v1. Available: one recipe `web` (exactly one HTTP container), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, gateways (a public hostname for a service huta doesn't run), and Postgres per target (huta runs it: pinned image, own volume and networks, app and migrate roles, dumps, planned upgrades). Planned, not available: publishing to Cloudflare Pages/Workers, online migrations, unattended releases, `huta snapshot`, monitoring hooks, plain-HTTP egress.
+> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v1. Available: one recipe `web` (exactly one HTTP container), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, gateways (a public hostname for a service huta doesn't run), and Postgres per target (huta runs it: pinned image, own volume and networks, app and migrate roles, dumps, planned upgrades). and publishing to Cloudflare Pages and Workers as a step of a release (files copied out of the image without running it, a pinned wrangler with egress to Cloudflare only). Planned, not available: online migrations, unattended releases, `huta snapshot`, monitoring hooks, plain-HTTP egress.
 
 If you are an agent running on an empty server and asked to **set it up as a huta host**, follow https://huta.run/host.md step by step (it diagnoses the server first, then asks the human before each change). If you are an agent asked to **install the huta client** on a machine, follow https://huta.run/install.md step by step (it tells you what to ask the human and what to confirm before touching the server). If you are an agent asked to deploy a project with huta, read the start page first, check its prerequisites, then follow it in order. Everything is also in one file: https://huta.run/llms-full.md
 
@@ -422,6 +422,15 @@ digest (get one with `docker pull postgres:17` and `docker image inspect --forma
 ```toml
 [postgres.images]
 "17" = "postgres@sha256:<64 hex>"
+```
+
+Targets that publish to Cloudflare (`external` in the registry) need the publisher image,
+built from `systemd/wrangler.Dockerfile.example` and pinned by digest, and its token as a
+platform secret (`/etc/huta/secrets/_platform/<NAME>`, root 0600):
+
+```toml
+[external]
+wrangler = "<repo>@sha256:<64 hex>"
 ```
 
 Targets with several components need the firewall fragment's `huta_intra` set (in
@@ -846,8 +855,8 @@ plan expired).
 Also tell the human, without being asked, when:
 
 - a prerequisite in step 0 is missing;
-- the project needs something huta does not have (external publishing, online migrations,
-  preflight checks): name the feature and say it is planned in huta, not available;
+- the project needs something huta does not have (online migrations, preflight checks):
+  name the feature and say it is planned in huta, not available;
 - the host registry needs a new or changed entry (env, secrets, egress, upstreams, data): give
   them the exact file (jobs and smoke checks live in `app.toml`; the owner sees them in the
   plan);
@@ -987,12 +996,12 @@ timeout = "10m"
 | `components` | table of tables | required; 1..8 components, exactly one of them the public HTTP one (below) |
 | `state` | table | optional; `kind` (`"none"` default, or `"data"`), and with data `schema` and `runs_on` (below) |
 | `migrate` | table | optional; a migration this release runs before its code starts (below) |
+| `external` | table of tables | optional; files to publish to Cloudflare Pages or Workers after the switch (below) |
 | `build` | table | optional; only `test` (accepted; `huta pack` does not run it yet) |
 | `smoke` | array of tables | optional; at most 20 checks (below) |
 | `jobs` | array of tables | optional; at most 20 jobs (below) |
 | `diag` | array of tables | optional; at most 20 diagnostics (below) |
 | `preflight` | array of tables | must be absent or empty (*planned*) |
-| `external` | table | must be absent or empty (*planned*) |
 
 Any other top-level key: `app.toml: unknown top-level keys ['<key>']`.
 
@@ -1131,6 +1140,38 @@ restore point pinned before the migration (huta keeps the newest `keep_releases`
 loses every write since, and needs `--confirm-data-loss` or the Telegram button; huta checks the
 point's fingerprint at approval. The target then stays stopped until the release of that code,
 which is planned for you, is approved.
+
+### `[external.<name>]`
+
+Files your build put in one of the release's images, published to Cloudflare after the switch
+and the public checks, as a step of the same release (one plan, one approval):
+
+```toml
+[external.site]
+kind = "cloudflare-pages"          # static files
+image = "web"
+dir = "/out/site"                  # where they are inside the image
+
+[external.edge]
+kind = "cloudflare-worker"         # one prebuilt bundle (huta does not bundle)
+image = "web"
+dir = "/out/worker"
+main = "index.js"                  # the bundle, inside dir
+```
+
+- The host copies `dir` out of the image **without running it** and refuses anything but
+  regular files and directories (no links or devices), more than 20000 files, files over
+  25 MiB or 512 MiB in all. The plan shows the file count and a content hash; publishing
+  checks the hash again.
+- Pages files are static: `_worker.js`, `functions/`, `wrangler.*` and `package.json` are code
+  and refused (publish code as a worker).
+- The operator decides where it goes (`[targets.<t>.external.<name>]`: the Pages project or
+  Worker name, the account, the token, a Worker's routes and compatibility date). Your repo's
+  `wrangler.toml` is never used.
+- A failed publish leaves the site live and ends the release `needs-human`, naming the step.
+  After a crash huta asks Cloudflare whether this commit's files are already there before
+  sending them again. `huta external <p> <t> rollback <name>` plans going back to the previous
+  deployment.
 
 ### `[[smoke]]`
 
@@ -1333,6 +1374,7 @@ see each other: the box is the unit huta can tell apart.
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
 | `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
+| `external.<name>` | table | | where an `[external.<name>]` goes: `name` (Pages project or Worker), `account` (32 hex), `token` (a platform secret name; Cloudflare tokens are account-wide), Workers also `routes` (like `example.org/api/*`, in an allowed zone, not another target's host) and `compatibility_date`. Needs `[external] wrangler` in `huta.toml` |
 | `postgres` | table | | `version` (a name in `huta.toml` `[postgres.images]`), `size` (256m..2t), `backup` (`hourly`/`daily`/`off`/an OnCalendar, default `daily`), `limits` (default 1g memory, 2 cpus). Needs `[backup]` in `huta.toml`. A target named `<this>-pg` can't exist next to it |
 | `worker_liveness` | int | `10` | 1..300 seconds a new worker must stay up after the switch |
 | `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |
@@ -2264,6 +2306,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta reject <release>` | reject a planned release |
 | `huta rollback <project> <target>` | **plan** a release of the previous image; it then needs `huta approve`. Refused when that code can't run on the data's current schema (its `runs_on` lacks it): then `huta restore` |
 | `huta postgres <project> <target> [status\|upgrade]` | the target's database: what runs, its schema, whether an upgrade is pending; `upgrade` **plans** applying a changed image, version or limits (the site is down meanwhile: the app stops, a dump is pinned, the new server starts, restored from the dump when the version changed; any failure puts the old one back). huta never applies such a change by itself |
+| `huta external <project> <target> [status\|rollback <name>]` | what releases published to Cloudflare; `rollback` **plans** going back to the deployment before the last one (the host target doesn't change) |
 | `huta restore <project> <target> --to <release>` | **plan** putting the data back to the restore point pinned before the migration that left a schema `<release>` runs on. Every write since that point is lost, and the plan says so first. Approve with `huta approve <id> --confirm-data-loss` (or the Telegram button). The target stops and stays stopped; a release of `<release>`'s code is then planned for approval |
 | `huta reconcile <project> <target>` | repair state from what the vhost actually routes to |
 | `huta status [project] [-n N]` | recent releases on the host (default 20) |
@@ -2779,8 +2822,8 @@ Ask the human, and stop, when:
 - the project needs a host registry entry or a change to one;
 - the project needs something the host registry doesn't grant yet (a secret, a data volume,
   an egress entry, an upstream): write the exact request for the operator;
-- the project needs anything huta refuses: external publishing, online migrations, preflight
-  checks, plain-HTTP egress, a data volume and a database together;
+- the project needs anything huta refuses: online migrations, preflight checks, plain-HTTP
+  egress, a data volume and a database together;
 - a one-writer release ended `needs-human` after its switch: the human decides whether to roll
   back (`huta rollback`), because the data was already written by the new release;
 - a DNS record or certificate is missing (`huta edge` is the operator's step);

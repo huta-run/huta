@@ -1,0 +1,16 @@
+# The image huta runs wrangler from to publish [external.*] to Cloudflare (DESIGN-v2 §5).
+# Build it on the host, pin a wrangler version you have tested, then put the resulting
+# digest in /etc/huta/huta.toml:
+#
+#   docker build -t huta-wrangler -f wrangler.Dockerfile.example .
+#   docker image inspect --format '{{.Id}}' huta-wrangler
+#   # tag and reference it by digest, e.g. push it to the host's registry, or use
+#   # [external] wrangler = "<repo>@sha256:<digest>" from `docker image inspect` RepoDigests
+#
+# huta runs it read-only, without capabilities, as the project's uid, with only the
+# registry's token, the files mounted read-only, and egress to api.cloudflare.com only.
+FROM node:22-slim
+ARG WRANGLER_VERSION=<the version you tested>
+RUN npm install -g "wrangler@${WRANGLER_VERSION}" && npm cache clean --force
+ENV WRANGLER_SEND_METRICS=false
+USER node

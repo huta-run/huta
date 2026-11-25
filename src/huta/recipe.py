@@ -162,7 +162,9 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
                                         if SP.several(app) else "<image>", "<sha>")
                                     for s in SLOTS}, with_secrets=False),
             **({"components": {n: t.components.get(n, {}) for n in app["order"]},
-                "worker_liveness": t.worker_liveness} if SP.several(app) else {})}
+                "worker_liveness": t.worker_liveness} if SP.several(app) else {}),
+            **({"external": {n: {**t.external.get(n, {}), "kind": e["kind"]}
+                             for n, e in app["external"].items()}} if app.get("external") else {})}
 
 
 def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
@@ -523,7 +525,8 @@ PHASE_VERSION = 2
 KNOWN_STAGES = {None, "switching", "checks",
                 "migrating", "migrated",      # DESIGN-v2 §2: exclusive migrations
                 "restoring",                  # DESIGN-v2 §2: restore plans
-                "pg-upgrade"}                 # DESIGN-v2 §4: postgres upgrade plans
+                "pg-upgrade",                 # DESIGN-v2 §4: postgres upgrade plans
+                "external"}                   # DESIGN-v2 §5: publishing to Cloudflare
 
 
 def _phase_get(platform: Platform, t: Target) -> dict | None:
@@ -724,6 +727,8 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             return reconcile(platform, st, project, t, log)
         cons = slot_containers(t)
         c = cons.get(routed)
+    elif phase and phase.get("stage") == "external":
+        _finish_external(platform, st, project, t, phase, log)
     elif phase and phase.get("stage") is None:
         _phase_clear(platform, t)            # it switched; the new slot is the routed one
     stopped = stopped_marker(platform, t).exists()   # `huta stop`: leave the slot stopped
@@ -778,6 +783,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             _idle_policy(t, slot)
     if not stopped:
         _complete_slot(platform, st, t, serving, routed, log)
+    _complete_external(platform, st, project, t, serving["id"], log)
     # The timers follow the live release (a crash after the switch could leave them stale).
     try:
         from . import jobs as J
@@ -1147,6 +1153,17 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
         _stop_quietly(platform, t, live_slot)
     log(f"live on slot {idle}; old slot {live_slot or '-'} stopped")
 
+    # 4b. Publish to Cloudflare (DESIGN-v2 §5). The release is live whatever happens here; a
+    #     failure is needs-human naming the step, and the host target is not switched back.
+    external_failed = None
+    for name in (app.get("external") or {}):
+        try:
+            publish_external(platform, st, project, t, rid, name, log)
+        except Exception as e:  # noqa: BLE001
+            external_failed = f"publishing {name} failed: {type(e).__name__}: {e}"
+            log(f"WARNING {external_failed}")
+            break
+
     # 5. Jobs and the backup timer follow the live release.
     try:
         for m in J.sync_units(t, app.get("jobs", [])):
@@ -1159,6 +1176,9 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
             J.start_after_release(t, app.get("jobs", []), st, rid, log)
         except Exception as e:  # noqa: BLE001 — belt and braces: the release stays live
             log(f"WARNING after-release jobs not started: {e}")
+    if external_failed:
+        st.set_state(rid, S.NEEDS_HUMAN, msg=f"live; {external_failed}")
+        return S.NEEDS_HUMAN
     return S.LIVE
 
 
@@ -1180,6 +1200,74 @@ def _complete_slot(platform, st, t, rel, slot: str, log) -> None:
             log(f"reconcile: started {n} of slot {slot}")
         elif n in app["components"]:
             sh(["docker", "update", "--restart=unless-stopped", m["id"]], check=False)
+
+
+def publish_external(platform, st, project, t, rid: str, name: str, log) -> str:
+    """One [external.<name>] of a live release. The intent is recorded first (phase "external":
+    name, content, the deployment before), so a crash is finished by asking Cloudflare."""
+    from . import external as E
+    rel = st.release(rid)
+    app = json.loads(rel["app_toml"])
+    cfg, reg = app["external"][name], t.external.get(name)
+    if not reg:
+        raise RecipeError(f"the registry has no external.{name} for this target")
+    content = (json.loads(rel["plan"]).get("external") or {}).get(name, {}).get("hash")
+    before = E.current(platform, cfg["kind"], reg)
+    _phase_set(platform, t, v=PHASE_VERSION, stage="external", rid=rid, idle=rel["slot"],
+               name=name, content=content, before=before)
+    dep = E.find(platform, cfg["kind"], reg, rel["sha"], content or "") or \
+        E.publish(platform, project, t, rid, rel["sha"], name, cfg, reg, content, log)
+    _record_external(st, t, rid, name, cfg["kind"], dep, before, content)
+    _phase_clear(platform, t)
+    return dep
+
+
+def _record_external(st, t, rid, name, kind, dep, before, content) -> None:
+    st.db.execute("INSERT INTO external_deploys (project, target, name, kind, release_id,"
+                  " deployment, previous, content, created) VALUES (?,?,?,?,?,?,?,?,?)",
+                  (t.project, t.name, name, kind, rid, dep, before, content, time.time()))
+    st.event("external", f"{name}: {kind} deployment {dep} (was {before or 'none'})", rid,
+             t.project, t.name)
+
+
+def _complete_external(platform, st, project, t, rid: str, log) -> None:
+    """A live release whose externals were never recorded (huta died before publishing, and
+    reconcile finished its checks) publishes them now; a failure is needs-human."""
+    rel = st.release(rid)
+    if rel["state"] != S.LIVE:
+        return
+    names = list(json.loads(rel["app_toml"]).get("external") or {})
+    done = {r["name"] for r in st.db.execute("SELECT name FROM external_deploys WHERE"
+                                              " release_id=?", (rid,))}
+    for name in names:
+        if name in done:
+            continue
+        try:
+            publish_external(platform, st, project, t, rid, name, log)
+            log(f"reconcile: published {name}")
+        except Exception as e:  # noqa: BLE001 — the outcome is recorded
+            _phase_clear(platform, t)
+            st.set_state(rid, S.NEEDS_HUMAN, msg=f"live; publishing {name} failed (finished by "
+                                                 f"reconcile): {type(e).__name__}: {e}")
+            return
+
+
+def _finish_external(platform, st, project, t, phase: dict, log) -> None:
+    """After a crash in the publishing step: if Cloudflare has this commit's deployment, record
+    it; otherwise publish once more; if that fails, needs-human. Then the remaining externals."""
+    rid = phase["rid"]
+    rel = st.release(rid)
+    app = json.loads(rel["app_toml"])
+    names = list(app.get("external") or {})
+    try:
+        for name in names[names.index(phase["name"]):]:
+            publish_external(platform, st, project, t, rid, name, log)
+    except Exception as e:  # noqa: BLE001 — the outcome is recorded
+        _phase_clear(platform, t)
+        st.set_state(rid, S.NEEDS_HUMAN, msg=f"live; publishing {phase['name']} failed after "
+                                             f"a crash: {type(e).__name__}: {e}")
+        return
+    log("reconcile: finished publishing")
 
 
 def slot_images(st: S.Store, r, app: dict):
