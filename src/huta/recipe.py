@@ -730,6 +730,9 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             stopped_marker(platform, t).unlink(missing_ok=True)   # as run(): a release starts it
             _phase_set(platform, t, **{**phase, "stage": "checks", "copied": False})
         out = after_switch(platform, st, project, t, log)
+        ph_w = _phase_get(platform, t)
+        if out is None and ph_w and ph_w.get("stage") == "workers":
+            _finish_workers(platform, st, project, t, ph_w, routed, log)
         if out is not None:
             log(f"reconcile: {phase['rid']} ended {out}")
             # The phase is gone: one more pass puts slots, policies and timers in line with
@@ -740,21 +743,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     elif phase and phase.get("stage") == "external":
         _finish_external(platform, st, project, t, phase, log)
     elif phase and phase.get("stage") == "workers":
-        # Died during the worker handoff: the new slot serves. Stop the other slot entirely,
-        # then hand over again with the liveness window; a failure now is needs-human.
-        rel_w = st.release(phase["rid"])
-        prev = st.release(phase["prev"]) if phase.get("prev") else None
-        for slot in slot_members(t):
-            if slot != routed:
-                _stop_members(t, slot)
-        try:
-            _hand_over_workers(platform, st, t, json.loads(rel_w["app_toml"]), prev, routed,
-                               None, log)
-        except RecipeError as e:
-            st.event("workers-fail", str(e), phase["rid"], project.name, t.name)
-            st.set_state(phase["rid"], S.NEEDS_HUMAN,
-                         msg=f"live, but its workers failed (finished by reconcile): {e}")
-        _phase_clear(platform, t)
+        _finish_workers(platform, st, project, t, phase, routed, log)
         cons = slot_containers(t)
         c = cons.get(routed)
     elif phase and phase.get("stage") is None:
@@ -772,6 +761,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         st.event("needs-human", f"vhost routes to slot {routed} but its container is not running",
                  None, project.name, t.name)
         raise RecipeError(f"slot {routed} is routed but not running: needs a human")
+    live = st.live(project.name, t.name)    # the branches above may have moved it
     # Which release is that container? Match by image id and sha, in ANY state: a release that
     # failed after the switch (needs-human) is still the one serving, and must be adoptable
     # (grok #1). Prefer the live pointer, then the most recent attempt.
@@ -1348,6 +1338,24 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     return S.LIVE
 
 
+def _finish_workers(platform, st, project, t, phase: dict, routed: str, log) -> None:
+    """A worker handoff huta didn't finish (it died after the checks, or during the handoff):
+    the new slot serves. Stop the other slot entirely, then hand over again with the liveness
+    window; a failure now is needs-human."""
+    rel_w = st.release(phase["rid"])
+    prev = st.release(phase["prev"]) if phase.get("prev") else None
+    for slot in slot_members(t):
+        if slot != routed:
+            _stop_members(t, slot)
+    try:
+        _hand_over_workers(platform, st, t, json.loads(rel_w["app_toml"]), prev, routed, None, log)
+    except RecipeError as e:
+        st.event("workers-fail", str(e), phase["rid"], project.name, t.name)
+        st.set_state(phase["rid"], S.NEEDS_HUMAN,
+                     msg=f"live, but its workers failed (finished by reconcile): {e}")
+    _phase_clear(platform, t)
+
+
 def _complete_slot(platform, st, project, t, rel, slot: str, log) -> None:
     """Every component of the release serving on the routed slot runs: a crash can leave a
     worker not yet created (its handoff comes after the switch) or one stopped. Unrouted slots
@@ -1572,7 +1580,15 @@ def after_switch(platform, st, project, t, log) -> str | None:
     if not problems:
         st.event("public-ok", f"public checks passed for {', '.join(t.hosts)}", rid,
                  project.name, t.name)
-        _phase_clear(platform, t)
+        prev = ph.get("prev")
+        prev_app = json.loads(st.release(prev)["app_toml"]) if prev else {}
+        if SP.workers(app) or (prev_app and SP.workers(prev_app)):
+            # Straight from the checks to the worker handoff, with no moment without a phase: a
+            # crash anywhere until the workers have held goes through the handoff again.
+            _phase_set(platform, t, v=PHASE_VERSION, stage="workers", rid=rid, idle=ph["idle"],
+                       old=ph.get("old"), prev=prev)
+        else:
+            _phase_clear(platform, t)
         return None
     why = "; ".join(problems[:5])
     st.event("public-fail", why, rid, project.name, t.name)

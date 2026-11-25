@@ -442,7 +442,8 @@ class SeveralWorkerDies(Scenario, unittest.TestCase):
     """The new worker exits in its liveness window: back to the old slot and its worker."""
     project_name, target_name = "shop", "live"
     faults = {"worker_dies": True}
-    clean, allowed = RB, {NA, RB, NH, LIVE}
+    # A dying worker must never leave the release recorded live (codex, v2 code review).
+    clean, allowed = RB, {NA, RB, NH}
 
     def app(self):
         return stateless(app_toml("shop"))

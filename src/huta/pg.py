@@ -169,11 +169,11 @@ def running(t: Target) -> bool:
                check=False).strip() == "true"
 
 
-def _psql(t: Target, sql: str, timeout: float = 120) -> str:
+def _psql(t: Target, sql: str, timeout: float = 120, db: str = DB) -> str:
     """SQL on stdin (passwords never on a command line), as the owner over the socket."""
     cid = container(t)
     return _sh(["docker", "exec", "-i", cid, "psql", "-v", "ON_ERROR_STOP=1", "-q", "-U", OWNER,
-                "-d", DB], input_=sql, timeout=timeout)
+                "-d", db], input_=sql, timeout=timeout)
 
 
 def _wait_ready(t: Target, timeout: float = 120) -> None:
@@ -241,6 +241,11 @@ DO $$ BEGIN
   ELSE ALTER ROLE app LOGIN PASSWORD {_q(a)}; END IF;
 END $$;
 GRANT CONNECT ON DATABASE {DB} TO migrate, app;
+""")
+    _psql(t, _SCHEMA_GRANTS)
+
+
+_SCHEMA_GRANTS = """
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ALTER SCHEMA public OWNER TO migrate;
 GRANT USAGE ON SCHEMA public TO app;
@@ -248,7 +253,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE migrate IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app;
 ALTER DEFAULT PRIVILEGES FOR ROLE migrate IN SCHEMA public
   GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO app;
-""")
+"""
 
 
 # ------------------------------------------------------------------ dumps (backups, restore points)
@@ -310,22 +315,38 @@ def backup(platform: Platform, t: Target, st, log, do_ship: bool = True) -> str:
 
 
 def _restore_file(platform: Platform, project: Project, t: Target, dump: Path, log) -> None:
-    """Put a dump back exactly: the schema is emptied first (so objects a failed migration
-    added go too; pg_restore --clean only drops what the dump has), the roles' grants put back,
-    then the dump restored in one transaction. Nothing may be connected but huta."""
+    """Put a dump back exactly, and atomically: the dump is restored into a new database; only
+    when that has fully worked is it swapped in for the old one, both renames in one
+    transaction. So objects a failed migration added are gone (pg_restore --clean only drops
+    what the dump has), and a restore that fails leaves the database as it was. Nothing may be
+    connected but huta."""
     cid = container(t)
     if not cid or not dump.is_file() or dump.is_symlink():
         raise PgError("postgres is not there, or the dump is missing")
-    _psql(t, f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-             f"WHERE datname = {_q(DB)} AND pid <> pg_backend_pid();\n"
-             "DROP SCHEMA public CASCADE;\nCREATE SCHEMA public;")
+    new, old = f"{DB}_restore", f"{DB}_old"
+    _psql(t, f"DROP DATABASE IF EXISTS {new};", db="postgres")
+    _psql(t, f"DROP DATABASE IF EXISTS {old};", db="postgres")
+    _psql(t, f"CREATE DATABASE {new} OWNER {OWNER};", db="postgres")
+    try:
+        _psql(t, _SCHEMA_GRANTS, db=new)
+        with open(dump, "rb") as f:
+            r = subprocess.run(["docker", "exec", "-i", cid, "pg_restore", "-U", OWNER, "-d", new,
+                                "--exit-on-error", "--single-transaction"],
+                               stdin=f, capture_output=True, timeout=6 * 3600, cwd="/")
+        if r.returncode != 0:
+            raise PgError(f"pg_restore: {r.stderr.decode(errors='replace').strip()[-300:]}")
+    except Exception:
+        _psql(t, f"DROP DATABASE IF EXISTS {new};", db="postgres")
+        raise
+    _psql(t, f"""
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {_q(DB)};
+BEGIN;
+ALTER DATABASE {DB} RENAME TO {old};
+ALTER DATABASE {new} RENAME TO {DB};
+COMMIT;
+""", db="postgres")
+    _psql(t, f"DROP DATABASE IF EXISTS {old};", db="postgres")
     _roles(platform, project, t)
-    with open(dump, "rb") as f:
-        r = subprocess.run(["docker", "exec", "-i", cid, "pg_restore", "-U", OWNER, "-d", DB,
-                            "--exit-on-error", "--single-transaction"],
-                           stdin=f, capture_output=True, timeout=6 * 3600, cwd="/")
-    if r.returncode != 0:
-        raise PgError(f"pg_restore: {r.stderr.decode(errors='replace').strip()[-300:]}")
     log(f"database restored from {dump.parent.name}/{dump.name}")
 
 
