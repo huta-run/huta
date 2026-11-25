@@ -216,6 +216,11 @@ class PlannedFeaturesRefused(unittest.TestCase):
     def test_schema_2(self):
         self.refused(HELLO.replace("schema = 1", "schema = 2"), "schema must be 1")
 
+    def test_monitor(self):
+        # docs/PLAN-monitoring.md, milestone 2 builds it.
+        self.refused(with_lines(HELLO, after='[monitor]\nenv = ["sentry"]\n'),
+                     r"\[monitor\] is planned")
+
 
 if __name__ == "__main__":
     unittest.main()

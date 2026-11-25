@@ -33,6 +33,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests._util import CF_RANGES, etc_copy, load
+from tests.fakemon import FakeMonitoring
 
 from huta import cfg, data, edge, jobs, recipe, runtime, store
 from huta import logs as L
@@ -66,6 +67,8 @@ class FakeHost:
         self._save("ops", [])
         self._save("faults", {})
         self._save("cf", {"deploys": []})
+        # healthchecks, Bugsink and Matomo, answering at the HTTP level (tests/fakemon.py).
+        self.mon = FakeMonitoring(self.root / "monitoring.json")
 
     def close(self):
         shutil.rmtree(self.root, ignore_errors=True)

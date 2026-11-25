@@ -1,0 +1,17 @@
+{
+  "_about": "Field names (no values) of real answers, read from healthchecks v4.2, Bugsink 2.2.1 and Matomo 5.14.2 (docs/PLAN-monitoring.md, API survey). The fake services must answer with the same fields.",
+  "hc_check": ["badge_url", "channels", "desc", "filter_body", "filter_default_fail", "filter_http_body", "filter_subject", "failure_kw", "grace", "last_ping", "manual_resume", "methods", "n_pings", "name", "next_ping", "pause_url", "ping_url", "resume_url", "slug", "start_kw", "started", "status", "subject", "subject_fail", "success_kw", "tags", "update_url", "uuid"],
+  "hc_check_simple": ["timeout"],
+  "hc_check_schedule": ["schedule", "tz"],
+  "hc_flips": ["flips"],
+  "hc_flip": ["timestamp", "up"],
+  "bugsink_page": ["next", "previous", "results"],
+  "bugsink_project": ["alert_on_new_issue", "alert_on_regression", "alert_on_unmute", "digested_event_count", "dsn", "id", "name", "retention_max_event_count", "slug", "stored_event_count", "team", "visibility"],
+  "bugsink_project_created": ["alert_on_new_issue", "alert_on_regression", "alert_on_unmute", "id", "name", "retention_max_event_count", "team", "visibility"],
+  "bugsink_team": ["id", "name", "visibility"],
+  "bugsink_issue": ["calculated_type", "calculated_value", "digest_order", "digested_event_count", "first_seen", "friendly_id", "id", "is_muted", "is_resolved", "is_resolved_by_next_release", "last_seen", "project", "stored_event_count", "transaction"],
+  "bugsink_event": ["digest_order", "digested_at", "event_id", "grouping", "id", "ingested_at", "issue", "project", "timestamp"],
+  "matomo_error": ["message", "result"],
+  "matomo_site_ids": ["idsite"],
+  "matomo_added": ["value"]
+}

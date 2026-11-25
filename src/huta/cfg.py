@@ -352,6 +352,9 @@ def load_platform(etc: Path = ETC) -> Platform:
     if d.get("schema") != 1:
         raise ConfigError("huta.toml: schema must be 1")
     p = _need(d, "platform", dict, "huta.toml")
+    if "monitoring" in d:
+        raise ConfigError("huta.toml: [monitoring] is planned (docs/PLAN-monitoring.md), "
+                          "not built yet")
     cf = d.get("cloudflare", {})
     zones = [z.lower() for z in cf.get("zones", [])]
     for z in zones:
@@ -470,6 +473,8 @@ def _components_cfg(v, target_env: dict, where: str) -> dict:
     out = {}
     for name, c in v.items():
         w = f"{where} components.{name}"
+        if isinstance(c, dict) and "monitor_env" in c:
+            raise ConfigError(f"{w}: monitor_env is planned (docs/PLAN-monitoring.md), not built yet")
         if not NAME_RE.match(name) or not isinstance(c, dict) or set(c) - {"limits", "env", "secrets"}:
             raise ConfigError(f"{w}: accepts limits, env and secrets")
         limits = c.get("limits", {})
@@ -851,6 +856,9 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             if not isinstance(egress, list) or not egress or len(egress) > 64:
                 raise ConfigError(f"{tw}: egress is \"none\" or a list of host:port entries")
             egress = sorted({egress_entry(e, f"{tw} egress") for e in egress})
+        for k in ("monitor", "watch", "matomo"):
+            if k in t:
+                raise ConfigError(f"{tw}: {k} is planned (docs/PLAN-monitoring.md), not built yet")
         approve = t.get("approve", "always")
         if approve != "always":
             # Unattended prod needs CI-attested images (planned); until then every release asks.
@@ -1064,6 +1072,8 @@ def parse_app_toml(text: str, project: str) -> dict:
         raise ConfigError("app.toml: schema must be 1")
     if d.get("project") != project:
         raise ConfigError(f"app.toml: project must be {project!r}")
+    if "monitor" in d:
+        raise ConfigError("app.toml: [monitor] is planned (docs/PLAN-monitoring.md), not built yet")
     unknown = set(d) - APP_KEYS
     if unknown:
         raise ConfigError(f"app.toml: unknown top-level keys {sorted(unknown)}")
