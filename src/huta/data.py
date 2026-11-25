@@ -9,6 +9,7 @@ Paths (root-only, under the state dir):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -293,6 +294,78 @@ def restore_copy(platform: Platform, project: Project, t: Target, log) -> None:
     os.chown(where, project.uid, project.uid)
     os.chmod(where, 0o700)
     log(f"data restored from the copy taken before the release")
+
+
+# ------------------------------------------------------------------ restore points (DESIGN-v2 §2)
+# A copy taken for one release and kept apart from the current/previous rotation, so a later
+# restore plan can still reach it. Hard links to current/: no extra space until files change
+# (rsync replaces files, never edits them in place, so a pin never changes under it).
+
+PIN_RE = re.compile(r"[0-9a-f]{8}")
+
+
+def pins_dir(platform: Platform, t: Target) -> Path:
+    return backup_dir(platform, t) / "pins"
+
+
+def fingerprint(d: Path) -> str:
+    """What a pin holds, as one hash: every entry's path, type, size, mode and mtime."""
+    h = hashlib.sha256()
+    for root, dirs, files in os.walk(d, followlinks=False):
+        dirs.sort()
+        for name in sorted(files + [x for x in dirs if os.path.islink(os.path.join(root, x))]):
+            f = os.path.join(root, name)
+            st = os.lstat(f)
+            h.update(f"{os.path.relpath(f, d)}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n"
+                     .encode())
+    return h.hexdigest()
+
+
+def pin_copy(platform: Platform, t: Target, rid: str) -> tuple[Path, str]:
+    """Pin current/ (just taken, nothing running) for release rid. Returns (path, fingerprint)."""
+    if not PIN_RE.fullmatch(rid):
+        raise DataError(f"bad release id {rid!r}")
+    base = backup_dir(platform, t)
+    cur, pins = base / "current", pins_dir(platform, t)
+    if not cur.is_dir() or cur.is_symlink():
+        raise DataError("no copy to pin")
+    pins.mkdir(mode=0o700, exist_ok=True)
+    dst, tmp = pins / rid, pins / f".{rid}.tmp"
+    for x in (dst, tmp):
+        if x.exists():
+            _rm_pin(x)
+    _run(["cp", "-a", "-l", "--", str(cur), str(tmp)], timeout=3600)
+    os.rename(tmp, dst)
+    return dst, fingerprint(dst)
+
+
+def restore_pin(platform: Platform, project: Project, t: Target, path: Path, fp: str, log) -> None:
+    """Put a pinned copy back onto the volume (nothing may run), if it is still what was
+    pinned."""
+    if path.parent != pins_dir(platform, t) or not PIN_RE.fullmatch(path.name) \
+            or not path.is_dir() or path.is_symlink():
+        raise DataError(f"{path} is not one of this target's restore points")
+    if fingerprint(path) != fp:
+        raise DataError(f"restore point {path.name} changed since it was pinned; refusing it")
+    _img, where = data_paths(platform, t)
+    if not mounted(where):
+        raise DataError(f"{where} is not mounted")
+    _run([*RSYNC, f"{path}/", f"{where}/"], timeout=6 * 3600)
+    os.chown(where, project.uid, project.uid)
+    os.chmod(where, 0o700)
+    log(f"data restored from restore point {path.name}")
+
+
+def drop_pin(platform: Platform, t: Target, rid: str) -> None:
+    p = pins_dir(platform, t) / rid
+    if PIN_RE.fullmatch(rid) and p.exists():
+        _rm_pin(p)
+
+
+def _rm_pin(p: Path) -> None:
+    if p.is_symlink() or p.parent.name != "pins" or not re.fullmatch(r"\.?[0-9a-f]{8}(\.tmp)?", p.name):
+        raise DataError(f"refusing to remove {p}")
+    _run(["rm", "-rf", "--one-file-system", "--", str(p)], timeout=3600)
 
 
 def _rmtree(p: Path) -> None:

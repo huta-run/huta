@@ -263,6 +263,14 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
     unknown = sorted(set(t.job_secrets) - {j["name"] for j in app.get("jobs", [])})
     eff = recipe.effective(platform, project, t, app)
     changes = []
+    mig = recipe.migration(st, t, app)            # refuses what this data can't take
+    if mig and mig["run"]:
+        m = app["migrate"]
+        changes.append(f"⚠️ migrates the data from schema {mig['from'] if mig['from'] is not None else 'unversioned'} "
+                       f"to {mig['to']} with {' '.join(m['cmd'])} (image {m['image']}, "
+                       f"at most {m['timeout']}). Every writer stops first and the site answers "
+                       "502 until the switch; a copy is taken and pinned, and any failure before "
+                       "the switch puts it back")
     if not live_rel:
         changes.append("first release of this target")
         if edge.adopt_pending(platform, t):
@@ -272,7 +280,9 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
         # A key a plan made by an older huta doesn't have counts as its default, so an upgrade
         # alone doesn't list every new key as changed.
         dflt = {"env": {}, "secrets": [], "upstreams": {}, "data": None, "jobs": [], "smoke": [],
-                "adopt": "", "access_log": True, "job_secrets": {}, "diag": [], "edge": {}}
+                "adopt": "", "access_log": True, "job_secrets": {}, "diag": [], "edge": {},
+                "health_timeout": 30, "migrate": None, "migrate_secrets": [], "schema": None,
+                "runs_on": None}
         diff = sorted(k for k in set(old) | set(eff) if k != "compose"
                       and old.get(k, dflt.get(k)) != eff.get(k, dflt.get(k)))
         if diff or old.get("compose") != eff.get("compose"):
@@ -324,6 +334,7 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
         "class": "code-only" if not changes else "infra", "changes": changes,
         "checks": {"on_main": True, "ci": "green" if t.require_ci else "not required"},
         "planned_against_live": live_rel["id"] if live_rel else None,
+        "migration": mig,             # None, or {"from": S, "to": M, "run": bool}
         "effective": eff, "built_by": "dev", "note": note, "history": history,
         "staged_secrets": staged,     # {name: fingerprint}: approval applies exactly these
         "secret_versions": R.live_versions(platform, project.name, secret_names(t)),
@@ -342,7 +353,8 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
 def secret_names(t) -> list[str]:
     """Every secret name a target uses: its own, its jobs' and a gateway's header."""
     gw = [t.gateway["secret"]] if t.gateway and t.gateway.get("secret") else []
-    return t.secrets + [n for names in t.job_secrets.values() for n in names] + gw
+    mig = [n for n in t.migrate_secrets if n not in t.secrets]
+    return t.secrets + [n for names in t.job_secrets.values() for n in names] + gw + mig
 
 
 def _gates(gh, project, t, sha):
@@ -543,6 +555,13 @@ def cmd_approve(a):
         if recipe.effective(platform, project, t, app) != plan["effective"]:
             supersede("host config changed since planning",
                       "host config changed since this plan was made; submit again")
+        try:
+            mig_now = recipe.migration(st, t, app)
+        except recipe.RecipeError as e:
+            supersede(f"the data changed since planning: {e}", f"plan is stale: {e}")
+        if mig_now != plan.get("migration"):
+            supersede("the data's schema changed since planning",
+                      "the data's schema changed since this plan was made; submit again")
         _gates(GitHub(platform), project, t, r["sha"])   # still on main, CI still green
         staged = plan.get("staged_secrets") or {}
         if "secret_versions" in plan and R.live_versions(

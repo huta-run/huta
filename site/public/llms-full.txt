@@ -971,7 +971,8 @@ timeout = "10m"
 | `order` | array of strings | required; every component exactly once, no duplicates |
 | `images` | table of tables | required; exactly one `[images.<name>]` |
 | `components` | table of tables | required; exactly one component |
-| `state` | table | optional; only `kind`: `"none"` (default) or `"data"` |
+| `state` | table | optional; `kind` (`"none"` default, or `"data"`), and with data `schema` and `runs_on` (below) |
+| `migrate` | table | optional; a migration this release runs before its code starts (below) |
 | `build` | table | optional; only `test` (accepted; `huta pack` does not run it yet) |
 | `smoke` | array of tables | optional; at most 20 checks (below) |
 | `jobs` | array of tables | optional; at most 20 jobs (below) |
@@ -1006,12 +1007,50 @@ Name: `^[a-z][a-z0-9-]{0,30}$`. Only these keys:
 
 ### `[state]`
 
-Only `kind`: `"none"` (default) or `"data"`. With `"data"` the host gives the target its own
+`kind`: `"none"` (default) or `"data"`. With `"data"` the host gives the target its own
 filesystem (a fixed size, set by the operator), mounted at `components.<c>.data`, backed up on a
 schedule. A plan whose app.toml asks for data while the host registry gives the target none is
 refused: `app.toml mounts data at /data, but the host registry gives myapp/prod no data`.
-`sqlite` and `postgres` as recipes with migrations are *planned*; an SQLite file on the data
-volume works today.
+Postgres is *planned*; an SQLite file on the data volume works today.
+
+With data, two optional keys version it:
+
+```toml
+[state]
+kind = "data"
+schema = 4            # the schema this release leaves the data at (1..1000000)
+runs_on = [3, 4]      # schemas this code runs on; must include schema (default: [schema])
+```
+
+The host records the schema the data is at. At plan time: the same schema runs as usual; a
+higher one needs `[migrate]`; a lower one is refused (going back is a restore, never a migration
+down); a target whose data has a schema refuses a release that declares none. The first release
+that declares a schema without `[migrate]` just starts the record.
+
+### `[migrate]`
+
+```toml
+[migrate]
+image = "web"                                 # one of [images]
+cmd = ["python", "manage.py", "migrate"]      # argv, no shell; the image's entrypoint applies
+timeout = "10m"                               # default 10m, at most 6h
+```
+
+When a release raises the schema, huta runs it **exclusive**: every writer stops (the site
+answers 502 until the switch), the data is copied and the copy is pinned as a restore point for
+this release, then `cmd` runs once in its own container from that image: the target's limits and
+data volume, **no network**, and only the secrets the operator lists in `migrate_secrets`. Its
+environment also has `HUTA_SCHEMA_FROM` and `HUTA_SCHEMA_TO`. Exit 0 within `timeout` records the
+new schema; then the new code starts and is checked as usual.
+
+- The migration fails, or the new code fails its checks before the switch: the copy goes back,
+  the schema is unchanged, the old release runs again: `nothing-activated`. Nothing is lost,
+  because nothing but the migration wrote since the copy.
+- huta dies mid-way: `huta reconcile` does the same (whether the migration committed doesn't
+  matter: the copy goes back).
+- The public checks fail after the switch: the new code keeps serving (`needs-human`), as for
+  any one-writer release; going back means a restore.
+- `online = true` (migrating while the old release serves) and a result `check` are *planned*.
 
 ### `[[smoke]]`
 
@@ -1211,6 +1250,8 @@ see each other: the box is the unit huta can tell apart.
 | `legacy.<name>` | table | | project level: `unit` (`*.service`), `env_file` (absolute; required), `crashes` (optional); the name may not also be a target |
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
+| `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
+| `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
 | `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |
 | `kind` | string | `"app"` | `"gateway"`: a hostname huta proxies to a service it doesn't run (below) |
 

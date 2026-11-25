@@ -125,6 +125,11 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
             "adopt": t.adopt, "access_log": t.access_log,
             # v2 keys appear only when set, so a v1 target's dict is unchanged (tests/golden).
             **({"edge": t.edge} if t.edge else {}),
+            **({"health_timeout": t.health_timeout} if t.health_timeout != 30 else {}),
+            **({"migrate": app["migrate"], "migrate_secrets": list(t.migrate_secrets)}
+               if app.get("migrate") else {}),
+            **({"schema": app["state"]["schema"], "runs_on": app["state"]["runs_on"]}
+               if (app.get("state") or {}).get("schema") else {}),
             "compose": compose_doc(platform, project, t, app,
                                    {s: ("<image>", "<sha>") for s in SLOTS}, with_secrets=False)}
 
@@ -371,7 +376,8 @@ def _phase_set(platform: Platform, t: Target, **rec) -> None:
 # "switching" or "checks". A record this huta can't resolve is never cleared: a human looks
 # (DESIGN-v2 §0). Later milestones add their stages here together with what reconcile does.
 PHASE_VERSION = 2
-KNOWN_STAGES = {None, "switching", "checks"}
+KNOWN_STAGES = {None, "switching", "checks",
+                "migrating", "migrated"}      # DESIGN-v2 §2: exclusive migrations
 
 
 def _phase_get(platform: Platform, t: Target) -> dict | None:
@@ -474,6 +480,16 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             if c["running"] and not live:
                 stop_container(c["id"])
                 log(f"reconcile: stopped unrouted slot {slot}")
+        phase = _phase_get(platform, t)
+        if phase and phase.get("copied"):
+            # A first release that copied the data (to migrate it) died before its switch:
+            # nothing else ran since the copy, so putting it back loses nothing.
+            sh(["docker", "rm", "-f", migrate_name(t)], check=False)
+            from .data import restore_copy
+            restore_copy(platform, project, t, log)
+            _reset_schema(st, t, phase)
+            _phase_set(platform, t, **{**phase, "copied": False, "restored": True,
+                                       "migrated": False})
         for r in st.in_state(project.name, t.name, S.RUNNING, S.APPROVED):
             st.set_state(r["id"], S.NOTHING_ACTIVATED, msg="interrupted before any traffic")
         # A first release (or an adoption) that died before its switch: nothing ran with data
@@ -487,7 +503,9 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     if phase and phase.get("idle") != routed:
         # A one-writer release died before its switch. Stop the new slot (proven) before the
         # old one may run, put the pre-release copy back if the new slot could have written,
-        # then the routed slot starts below.
+        # then the routed slot starts below. A migration that may still run goes first.
+        if phase.get("migrated") or phase.get("stage") in ("migrating", "migrated"):
+            sh(["docker", "rm", "-f", migrate_name(t)], check=False)
         for slot, oc in cons.items():
             if slot != routed and oc["running"]:
                 stop_container(oc["id"])
@@ -497,8 +515,10 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         if phase.get("copied"):
             from .data import restore_copy
             restore_copy(platform, project, t, log)
+            _reset_schema(st, t, phase)
             # Restored: never again, even if starting the old slot fails (codex final #1).
-            _phase_set(platform, t, **{**phase, "copied": False, "restored": True})
+            _phase_set(platform, t, **{**phase, "copied": False, "restored": True,
+                                       "migrated": False})
         _phase_clear(platform, t)
         cons = slot_containers(t)
         c = cons.get(routed)
@@ -584,6 +604,93 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         log(f"WARNING reconcile: timers not updated: {e}")
 
 
+# ------------------------------------------------------------------ migrations (DESIGN-v2 §2)
+
+def schema_now(st: S.Store, t: Target):
+    """The schema the target's data is at, or None (never versioned)."""
+    r = st.resource(t.project, t.name, "data")
+    return r["schema"] if r else None
+
+
+def migration(st: S.Store, t: Target, app: dict) -> dict | None:
+    """What this release does to the data schema: None (nothing to record), or
+    {"from": S, "to": M, "run": bool}. Raises RecipeError for a release that can't run on the
+    target's data: a lower schema (that is a restore plan), no schema on versioned data, or a
+    schema change without [migrate]."""
+    st_cfg = app.get("state") or {}
+    m = st_cfg.get("schema")
+    s = schema_now(st, t)
+    if m is None:
+        if s is not None:
+            raise RecipeError(f"the target's data is at schema {s}, and this release declares "
+                              "none ([state] schema): it can't tell whether its code runs on it")
+        return None
+    if s is not None and m < s:
+        raise RecipeError(f"this release is for schema {m}, and the data is at {s}: going back "
+                          f"needs a restore (huta restore {t.project} {t.name} --to <release>), "
+                          "never a migration down")
+    if s == m:
+        return {"from": s, "to": m, "run": False}
+    if not app.get("migrate"):
+        if s is None:
+            return {"from": None, "to": m, "run": False}     # starts versioning: nothing to run
+        raise RecipeError(f"this release moves the data from schema {s} to {m} but has no "
+                          "[migrate] to do it")
+    return {"from": s, "to": m, "run": True}
+
+
+def migrate_name(t: Target) -> str:
+    return f"huta-migrate-{t.project}-{t.name}"
+
+
+def _docker_run(argv: list[str], env: dict, timeout: float) -> tuple[int, str]:
+    """Run a one-off container; values reach it by name from this call's environment, never on
+    the command line."""
+    r = subprocess.run(argv, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", **env},
+                       capture_output=True, text=True, timeout=timeout, cwd="/")
+    return r.returncode, (r.stdout + r.stderr)
+
+
+def run_migrate(platform: Platform, st: S.Store, project: Project, t: Target, app: dict,
+                rel, mig: dict, log) -> None:
+    """The release's [migrate] command, once, in its own container: the release's named image,
+    the target's limits and data volume, no network, only the registry's migrate_secrets
+    (DESIGN-v2 §2). Raises RecipeError on failure or timeout."""
+    from .cfg import redact
+    m = app["migrate"]
+    image = st.images(rel).get(m["image"], rel["image_id"])
+    name = migrate_name(t)
+    env = {"HUTA_PROJECT": project.name, "HUTA_TARGET": t.name, "RELEASE_SHA": rel["sha"],
+           "HUTA_SCHEMA_FROM": str(mig["from"] or 0), "HUTA_SCHEMA_TO": str(mig["to"])}
+    for n in t.migrate_secrets:
+        env[n] = R.secret_value(platform, project.name, n)
+    labels = {"run.huta.project": project.name, "run.huta.target": t.name,
+              "run.huta.migrate": rel["id"], "run.huta.sha": rel["sha"]}
+    sh(["docker", "rm", "-f", name], check=False)
+    argv = ["docker", "run", "--rm", *R.docker_run_args(platform, project, t, app, "none", env,
+                                                       name, labels), image, *m["cmd"]]
+    log(f"migrating the data: schema {mig['from'] if mig['from'] is not None else 'unversioned'} "
+        f"→ {mig['to']} ({' '.join(m['cmd'])}, at most {m['timeout']})")
+    try:
+        rc, out = _docker_run(argv, env, m["timeout_s"])
+    except subprocess.TimeoutExpired:
+        sh(["docker", "rm", "-f", name], check=False)
+        raise RecipeError(f"the migration did not finish within {m['timeout']}") from None
+    tail = redact(out)[-1500:]
+    st.event("migrate", f"exit {rc}: {tail}" if tail else f"exit {rc}", rel["id"],
+             project.name, t.name)
+    if rc != 0:
+        raise RecipeError(f"the migration failed (exit {rc}): {tail[-300:]}")
+    log(f"migration done: the data is at schema {mig['to']}")
+
+
+def _reset_schema(st: S.Store, t: Target, phase: dict) -> None:
+    """A migration that may have run is undone by a restore: the recorded schema goes back."""
+    if phase.get("migrated") or phase.get("stage") in ("migrating", "migrated"):
+        st.set_resource_schema(t.project, t.name, "data", phase.get("schema_from"),
+                               phase.get("rid"))
+
+
 # ------------------------------------------------------------------ run
 
 def _egress_sync(platform: Platform, log) -> None:
@@ -632,7 +739,10 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     live = st.live(project.name, t.name)
     port_of = dict(zip(SLOTS, t.slots))
     cur = None
-    concurrent = R.concurrent_safe(app, t)
+    mig = migration(st, t, app)
+    migrating = bool(mig and mig["run"])
+    # A migration runs exclusive: no release writes while it runs (DESIGN-v2 §2).
+    concurrent = R.concurrent_safe(app, t) and not migrating
     if live:
         cur = st.release(live["release_id"])
         # Overlap needs both releases to allow it (codex code review #4).
@@ -658,28 +768,48 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     write_compose(platform, t, compose_doc(platform, project, t, app, images))
 
     # 1. Start and verify the new slot. The vhost does not route to it, so no traffic yet.
-    stopped_old = copied = False
+    stopped_old = copied = migrated = False
+    failing = "new slot failed before any traffic"
+    mig_rec = {"schema_from": mig["from"]} if migrating else {}
     try:
-        if live and not concurrent:
+        if (live and not concurrent) or migrating:
             if jobs_running(t):
                 raise RecipeError("a job of this target is running (one writer at a time); "
                                   "submit again when it has finished")
-            log(f"one writer at a time: stopping slot {live_slot} first (the site answers 502 "
-                "until the switch)")
-            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=False)
-            stopped_old = True        # from here, any failure brings the old slot back (grok #11)
-            _stop_strict(platform, t, live_slot)
-            st.event("stopped-old", f"slot {live_slot} stopped before starting {idle}", rid,
-                     project.name, t.name)
+            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=False, **mig_rec)
+            if live:
+                log(f"one writer at a time: stopping slot {live_slot} first (the site answers "
+                    "502 until the switch)")
+                stopped_old = True    # from here, any failure brings the old slot back (grok #11)
+                _stop_strict(platform, t, live_slot)
+                st.event("stopped-old", f"slot {live_slot} stopped before starting {idle}", rid,
+                         project.name, t.name)
             # Taken after the stop, so restoring it after a failed start loses nothing.
             D.copy_consistent(platform, t, log, quiet=True)
             copied = True
-            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=True)
+            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=True, **mig_rec)
+        if migrating:
+            path, fp = D.pin_copy(platform, t, rid)
+            st.db.execute(
+                "INSERT INTO restore_points (id, project, target, kind, release_id, path,"
+                " fingerprint, schema, created, state) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (rid, project.name, t.name, "data", rid, str(path), fp, mig["from"],
+                 time.time(), "kept"))
+            st.event("restore-point", f"pinned before migrating (schema {mig['from']}): {rid}",
+                     rid, project.name, t.name)
+            _phase_set(platform, t, v=PHASE_VERSION, stage="migrating", rid=rid, old=live_slot,
+                       idle=idle, copied=True, migrated=True, **mig_rec)
+            migrated, failing = True, "the migration failed"
+            run_migrate(platform, st, project, t, app, rel, mig, log)
+            failing = "new slot failed before any traffic"
+            st.set_resource_schema(project.name, t.name, "data", mig["to"], rid)
+            _phase_set(platform, t, v=PHASE_VERSION, stage="migrated", rid=rid, old=live_slot,
+                       idle=idle, copied=True, migrated=True, **mig_rec)
         compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", "--force-recreate",
                 service(idle))
         _egress_sync(platform, log)
         log(f"slot {idle} started, verifying {health} reports {rel['sha'][:12]} (no traffic yet)")
-        wait_health(port_of[idle], health, rel["sha"])
+        wait_health(port_of[idle], health, rel["sha"], timeout=t.health_timeout)
         bad = smoke(f"http://127.0.0.1:{port_of[idle]}", checks, t.hosts[0])
         if bad:
             raise RecipeError("smoke on the new slot failed: " + "; ".join(bad[:5]))
@@ -687,8 +817,8 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
             log(f"smoke on the new slot: {len(checks)} checks passed")
     except (RecipeError, D.DataError) as e:
         return _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot,
-                                    stopped_old, cur, health, port_of,
-                                    f"new slot failed before any traffic: {e}", log, copied)
+                                    stopped_old, cur, health, port_of, f"{failing}: {e}", log,
+                                    copied, mig_rec if migrated else None)
 
     # 2. Switch traffic: one validated, graceful caddy reload (an adopted site's old file goes
     #    in the same transaction). The intent is recorded first, with what puts the previous
@@ -706,7 +836,8 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
             undo_pre.insert(0, [str(vp), vp.read_text() if vp.exists() else None])
     phase_rec = dict(rid=rid, stage="switching", idle=idle, old=live_slot,
                      prev=live["release_id"] if live else None, concurrent=concurrent,
-                     stopped_old=stopped_old, copied=copied, adopting=adopting, undo=undo_pre)
+                     stopped_old=stopped_old, copied=copied, adopting=adopting, undo=undo_pre,
+                     **({"migrated": True, **mig_rec} if migrated else {}))
     _phase_set(platform, t, **phase_rec)
     try:
         with edge.edge_lock(platform):
@@ -717,9 +848,12 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     except edge.EdgeError as e:
         return _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot,
                                     stopped_old, cur, health, port_of,
-                                    f"switch refused, old config still serving: {e}", log, copied)
+                                    f"switch refused, old config still serving: {e}", log, copied,
+                                    mig_rec if migrated else None)
     st.make_live(rid, idle, live["release_id"] if live else None, f"live on slot {idle}")
     stopped_marker(platform, t).unlink(missing_ok=True)     # a release starts it again
+    if mig and not mig["run"] and mig["from"] != mig["to"]:
+        st.set_resource_schema(project.name, t.name, "data", mig["to"], rid)   # starts versioning
     # Until its public checks have passed, the release is not finished (grok #2).
     _phase_set(platform, t, **{**phase_rec, "stage": "checks", "copied": False})
     if adopting:
@@ -813,12 +947,14 @@ def after_switch(platform, st, project, t, log) -> str | None:
 
 
 def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot, stopped_old,
-                         cur, health, port_of, why, log, copied=False) -> str:
+                         cur, health, port_of, why, log, copied=False, mig_rec=None) -> str:
     try:
         st.event("slot-state", L.slot_state(t, idle), rid, project.name, t.name)
     except Exception:  # noqa: BLE001 — a note for the human, never the outcome
         pass
-    if stopped_old:
+    if mig_rec is not None:
+        sh(["docker", "rm", "-f", migrate_name(t)], check=False)   # a migration still running
+    if stopped_old or copied:
         try:
             _stop_strict(platform, t, idle)     # never two writers on non-concurrent data
         except RecipeError as e2:
@@ -834,18 +970,22 @@ def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_
         health = SP.health(old_app)
         write_compose(platform, t, compose_doc(platform, project, t, old_app,
                                                {s: images[live_slot] for s in SLOTS}))
-    if stopped_old:
+    if stopped_old or copied:
         try:
             if copied:
                 from . import data as D
                 D.restore_copy(platform, project, t, log)
                 ph = _phase_get(platform, t) or {}
-                _phase_set(platform, t, **{**ph, "copied": False, "restored": True})
-            _bring_back(platform, t, live_slot, port_of[live_slot], health, cur["sha"], log)
+                if mig_rec is not None:
+                    _reset_schema(st, t, {**ph, "migrated": True, **mig_rec, "rid": rid})
+                _phase_set(platform, t, **{**ph, "copied": False, "restored": True,
+                                           "migrated": False})
+            if stopped_old:
+                _bring_back(platform, t, live_slot, port_of[live_slot], health, cur["sha"], log)
             _phase_clear(platform, t)
         except Exception as e2:  # noqa: BLE001 — any failure here needs a human
             st.set_state(rid, S.NEEDS_HUMAN,
-                         msg=f"{why}; and the old slot {live_slot} did not come back: {e2}")
+                         msg=f"{why}; and the old state did not come back: {e2}")
             return S.NEEDS_HUMAN
     _phase_clear(platform, t)
     st.set_state(rid, S.NOTHING_ACTIVATED, msg=why)

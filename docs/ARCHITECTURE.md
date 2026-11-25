@@ -341,6 +341,13 @@ host and repo both allowing concurrency) stop the old slot, copy the data, start
 (failure before the switch: restore the copy, start the old slot, `nothing-activated`; after:
 `needs-human`). `reconcile` additionally thaws a frozen volume, starts the routed slot of the
 live release if a crash left it stopped, and finishes an interrupted revert as `rolled-back`.
+Migrations (DESIGN-v2 §2): a release whose `[state] schema` is higher than the target's
+recorded one runs exclusive: stop every writer → copy (quiet) → pin the copy as a restore point
+(`<backup dir>/<p>/<t>/pins/<release>/`, hard links, a fingerprint in `restore_points`) → phase
+`migrating` → the `[migrate]` container (release image, no network, `migrate_secrets` only) →
+schema recorded, phase `migrated` → start, check, switch. Any failure before the switch, or a
+crash, restores the copy and the schema: nothing but the migration wrote since the copy.
+`health_timeout` (registry) sets how long a new slot has to get healthy.
 A switch back replays the vhost files Caddy served before the switch (kept in the phase record
 when the switch starts), so it needs no certificate check and no call to Cloudflare; if it
 can't be done, the release ends `needs-human` with the reason. `tests/test_crash.py` kills a

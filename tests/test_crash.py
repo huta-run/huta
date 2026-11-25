@@ -39,6 +39,8 @@ class Scenario:
     adopt_file = ""                # a hand-written vhost r2 replaces (first release only)
     one_writer = False
     faults: dict = {}
+    schema_r1 = schema_r2 = None   # migration scenarios: the schema each release declares
+    migrate_r2 = False
     clean: str = LIVE              # r2's outcome without a crash
     allowed: set = {LIVE, NA}      # r2's outcomes after a crash and reconcile
 
@@ -55,11 +57,12 @@ class Scenario:
                 f"{t.hosts[0]} {{\n\treverse_proxy 127.0.0.1:9999\n}}\n")
             host._reload_caddy()
         if not self.first_release:
-            r1 = host.plan(project, t, app, SHA1)
+            r1 = host.plan(project, t, versioned(app, self.schema_r1), SHA1)
             self.assertEqual(host.release(project, t, r1), LIVE, "setup: r1 did not go live")
         if self.faults:
             host.fault(**self.faults)
-        r2 = host.plan(project, t, app, SHA2)
+        r2 = host.plan(project, t, versioned(app, self.schema_r2, self.migrate_r2), SHA2)
+        self.schema_before = host.schema(t)
         before = list(host.data_state(t)["writes"])
         return host, project, t, r1, r2, before
 
@@ -110,9 +113,13 @@ class Scenario:
             if live and live["release_id"] == r2:
                 self.assertIn(SHA2, ds["writes"], f"{where}: r2 is live but its writes are gone")
             else:
-                self.assertNotIn(SHA2, ds["writes"], f"{where}: r2's writes survived")
+                self.assertFalse([w for w in ds["writes"] if SHA2 in w],
+                                 f"{where}: r2's writes (or its migration's) survived")
                 self.assertEqual(ds["writes"][:len(before)], before,
                                  f"{where}: writes from before r2 were lost")
+        if self.schema_r2 is not None:
+            want = self.schema_r2 if live and live["release_id"] == r2 else self.schema_before
+            self.assertEqual(host.schema(t), want, f"{where}: recorded schema")
         return live
 
     def snapshot(self, host):
@@ -184,6 +191,18 @@ class Scenario:
                 finally:
                     host.close()
                 j += 1
+
+
+def versioned(app, schema, migrate=False):
+    """The manifest with [state] schema (and a [migrate]) as a release declares them."""
+    if schema is None:
+        return app
+    app = json.loads(json.dumps(app))
+    app["state"] = {**app["state"], "schema": schema, "runs_on": [schema]}
+    if migrate:
+        app["migrate"] = {"image": "web", "cmd": ["python", "/app/app.py", "migrate"],
+                          "timeout": "5m", "timeout_s": 300}
+    return app
 
 
 # ------------------------------------------------------------ scenarios
@@ -288,6 +307,55 @@ class ConcurrentData(Scenario, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MigrateRelease(Scenario, unittest.TestCase):
+    """Exclusive migration on a one-writer target: stop → copy → pin → migrate → start → switch."""
+    project_name, target_name = "notes", "staging"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+
+
+class MigrateOnConcurrentData(Scenario, unittest.TestCase):
+    """A target whose releases may overlap still migrates exclusive: the old slot stops first."""
+    project_name, target_name = "notes", "prod"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+
+
+class MigrateFails(Scenario, unittest.TestCase):
+    """The migration exits non-zero: the copy goes back, the schema stays, the old slot runs."""
+    project_name, target_name = "notes", "staging"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+    faults = {"migrate_fail": True}
+    clean, allowed = NA, {NA}
+
+
+class MigrateUnhealthy(Scenario, unittest.TestCase):
+    """The migration works, the new code never gets healthy: undone, nothing lost."""
+    project_name, target_name = "notes", "staging"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+    faults = {"unhealthy": SHA2}
+    clean, allowed = NA, {NA}
+
+
+class MigratePublicFail(Scenario, unittest.TestCase):
+    """Migrated and switched, public checks fail: the new code keeps serving; a human decides."""
+    project_name, target_name = "notes", "staging"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+    faults = {"public_fail": True}
+    clean, allowed = NH, {NA, NH}
+
+
+class MigrateFirstRelease(Scenario, unittest.TestCase):
+    """A first release that migrates fresh data: copied first, undone the same way."""
+    project_name, target_name = "notes", "staging"
+    first_release = True
+    one_writer = True
+    schema_r2, migrate_r2 = 1, True
 
 
 class PhaseRecords(unittest.TestCase):

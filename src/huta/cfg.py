@@ -238,6 +238,8 @@ class Target:
     kind: str = "app"                                # "app" or "gateway" (DESIGN-v2 §1)
     gateway: dict | None = None                      # {"to": "ip:port", "secret": NAME, "header": H}
     edge: dict = field(default_factory=dict)         # {"body": bytes, "timeout": "10m"}
+    health_timeout: int = 30                         # seconds a new slot has to report healthy
+    migrate_secrets: list = field(default_factory=list)   # the only secrets [migrate] gets
 
     @property
     def egress_allow(self) -> list[str]:
@@ -365,6 +367,22 @@ def load_platform(etc: Path = ETC) -> Platform:
         caddy_secrets=Path(p.get("caddy_secrets", "/etc/caddy/huta-secrets")),
         caddy_group=_caddy_group(p.get("caddy_group", "caddy")),
     )
+
+
+def _health_timeout(v, where: str) -> int:
+    if type(v) is not int or not 5 <= v <= 900:
+        raise ConfigError(f"{where}: health_timeout must be 5..900 seconds")
+    return v
+
+
+def _migrate_secrets(v, secrets: list, where: str) -> list:
+    """Secrets the migration step gets. It gets no others: a migration is the repo's code
+    running with the data and nothing else (DESIGN-v2 §2)."""
+    if not isinstance(v, list) or len(set(v)) != len(v) or len(v) > 20:
+        raise ConfigError(f"{where}: migrate_secrets must be a list of secret names")
+    for n in v:
+        _env_name(n, f"{where} migrate_secrets")
+    return list(v)
 
 
 def _caddy_group(v) -> str:
@@ -710,7 +728,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
         unknown = set(t) - {"hosts", "slots", "egress", "approve", "cloudflare", "limits",
                             "require_ci", "keep_releases", "drain", "env", "secrets",
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
-                            "crashes", "kind", "edge"}
+                            "crashes", "kind", "edge", "health_timeout", "migrate_secrets"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -782,6 +800,8 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             job_secrets={k: list(v) for k, v in sorted(job_secrets.items())},
             logs=_logs_cfg(t.get("logs", {}), tw),
             crashes=_crash_id(t.get("crashes"), tw), edge=edge_cfg,
+            health_timeout=_health_timeout(t.get("health_timeout", 30), tw),
+            migrate_secrets=_migrate_secrets(t.get("migrate_secrets", []), secrets, tw),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -849,7 +869,7 @@ def zone_for(host: str, platform: Platform) -> str:
 
 
 APP_KEYS = {"schema", "project", "order", "build", "images", "components", "state",
-            "preflight", "smoke", "jobs", "external", "diag"}
+            "preflight", "smoke", "jobs", "external", "diag", "migrate"}
 COMPONENT_KEYS = {"image", "kind", "port", "health", "data", "concurrent_safe", "upstream_api"}
 
 
@@ -922,8 +942,11 @@ def parse_app_toml(text: str, project: str) -> dict:
             raise ConfigError(f"app.toml: components.{cname}.image must name one of [images]: "
                               f"{sorted(imgs)}")
     st = d.get("state", {})
-    if not isinstance(st, dict) or set(st) - {"kind"}:
-        raise ConfigError(f"app.toml: [state] accepts only 'kind', got {sorted(st)}")
+    if not isinstance(st, dict) or set(st) - {"kind", "schema", "runs_on"}:
+        raise ConfigError(f"app.toml: [state] accepts kind, schema and runs_on, got {sorted(st)}")
+    _schema_cfg(st)
+    if "migrate" in d:
+        d["migrate"] = _migrate_cfg(d["migrate"], imgs, st)
     b = d.get("build", {})
     if not isinstance(b, dict) or set(b) - {"test"}:
         raise ConfigError(f"app.toml: [build] accepts only 'test', got {sorted(b)}")
@@ -937,6 +960,51 @@ def parse_app_toml(text: str, project: str) -> dict:
         if not isinstance(health, str) or not re.match(r"^/[A-Za-z0-9/_.-]*$", health):
             raise ConfigError(f"app.toml: {cname}.health invalid")
     return d
+
+
+def _schema_cfg(st: dict) -> None:
+    """[state] schema = M, runs_on = [...] (DESIGN-v2 §2): the data schema this release leaves,
+    and the schemas its code runs on."""
+    if "schema" not in st:
+        if "runs_on" in st:
+            raise ConfigError("app.toml: [state] runs_on needs schema")
+        return
+    if st.get("kind", "none") != "data":
+        raise ConfigError("app.toml: [state] schema needs kind = \"data\" (the data it describes)")
+    m = st["schema"]
+    if type(m) is not int or not 1 <= m <= 1_000_000:
+        raise ConfigError("app.toml: [state] schema must be an integer 1..1000000")
+    runs_on = st.setdefault("runs_on", [m])
+    if not isinstance(runs_on, list) or not 1 <= len(runs_on) <= 32 or \
+            not all(type(x) is int and 1 <= x <= 1_000_000 for x in runs_on) or m not in runs_on:
+        raise ConfigError("app.toml: [state] runs_on must be a list of schema numbers that "
+                          "includes schema")
+    st["runs_on"] = sorted(set(runs_on))
+
+
+def _migrate_cfg(m, imgs: dict, st: dict) -> dict:
+    """[migrate]: one run of the release's own image before the new code starts (DESIGN-v2 §2).
+    Argv only (no shell); online mode and a result check are not built yet."""
+    if not isinstance(m, dict):
+        raise ConfigError("app.toml: [migrate] must be a table")
+    for key in ("online", "check"):
+        if key in m:
+            raise ConfigError(f"app.toml: [migrate] {key} is not supported by huta yet "
+                              "(online migrations are planned)")
+    bad = set(m) - {"image", "cmd", "timeout"}
+    if bad:
+        raise ConfigError(f"app.toml: [migrate] has unknown keys {sorted(bad)}")
+    if "schema" not in st:
+        raise ConfigError("app.toml: [migrate] needs [state] schema (what it migrates to)")
+    if m.get("image") not in imgs:
+        raise ConfigError(f"app.toml: [migrate] image must name one of [images]: {sorted(imgs)}")
+    cmd = m.get("cmd")
+    if not isinstance(cmd, list) or not 1 <= len(cmd) <= 64 or not all(
+            isinstance(a, str) and 0 < len(a) <= 1000 and "\0" not in a for a in cmd):
+        raise ConfigError("app.toml: [migrate] cmd must be an argv list of strings (no shell)")
+    timeout = m.get("timeout", "10m")
+    secs = duration_s(timeout, "app.toml: [migrate] timeout", 6 * 3600)
+    return {"image": m["image"], "cmd": list(cmd), "timeout": timeout, "timeout_s": secs}
 
 
 RESERVED_MOUNTS = {"", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys",

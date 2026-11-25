@@ -92,6 +92,7 @@ class FakeHost:
         no_cert=True         the certificate check finds no usable pair (edge.cert_ok)
         no_cf=True           Cloudflare's IP-range list can't be fetched
         old_phase=True       phase files lack the previous vhost (as an older huta wrote them)
+        migrate_fail=True    the [migrate] command exits non-zero (after writing)
         """
         f = self._load("faults")
         f.update(kw)
@@ -174,6 +175,8 @@ class FakeHost:
             return ""
         if args[0] == "compose":
             return self._compose(d, args)
+        if args[:2] == ["rm", "-f"] or args[0] == "kill":
+            return ""          # the migrate container: it runs to completion in _docker_run
         raise AssertionError(f"fake host: unexpected docker command {cmd}")
 
     def _compose(self, d, args):
@@ -338,6 +341,45 @@ class FakeHost:
             raise OSError("Cloudflare IP ranges: test fault (network down)")
         return list(CF_RANGES)
 
+    # ------------------------------------------------------------ migrate, restore points
+
+    def docker_run(self, argv, env, timeout):
+        """The [migrate] container: it writes to the data (as a migration does), then exits."""
+        assert argv[:3] == ["docker", "run", "--rm"] and "none" in argv, argv
+        t_key = f"{env['HUTA_PROJECT']}/{env['HUTA_TARGET']}"
+        v = self._load("data")
+        v.setdefault(t_key, {"writes": [], "copy": None, "overlaps": []})["writes"].append(
+            f"migrate:{env['RELEASE_SHA']}")
+        self._save("data", v)
+        running = [c for c in self._load("docker")["containers"].values() if c["running"]
+                   and c.get("data") and f"{c['labels']['run.huta.project']}/"
+                   f"{c['labels']['run.huta.target']}" == t_key]
+        if running:
+            v = self._load("data")
+            v[t_key]["overlaps"].append([f"migrate:{env['RELEASE_SHA']}",
+                                         *[c["labels"]["run.huta.sha"] for c in running]])
+            self._save("data", v)
+        self._op("migrate ran")
+        if self._faults().get("migrate_fail"):
+            return 1, "migration error: test fault"
+        return 0, "migrated"
+
+    def pin_copy(self, platform, t, rid):
+        v = self._load("data")
+        e = v[f"{t.project}/{t.name}"]
+        e.setdefault("pins", {})[rid] = list(e["copy"])
+        self._save("data", v)
+        self._op("restore point pinned")
+        return self.root / "pins" / rid, "fp-" + rid
+
+    def schema(self, t):
+        st = self.store()
+        try:
+            r = st.resource(t.project, t.name, "data")
+            return r["schema"] if r else None
+        finally:
+            st.db.close()
+
     # ------------------------------------------------------------ data volume
 
     def copy_consistent(self, platform, t, log, quiet=False):
@@ -365,6 +407,7 @@ class FakeHost:
         real_phase_set, real_phase_clear = recipe._phase_set, recipe._phase_clear
         real_make_live, real_revert_live = S.Store.make_live, S.Store.revert_live
         real_set_state = S.Store.set_state
+        real_set_schema = S.Store.set_resource_schema
         real_atomic, real_transact = edge._atomic_write, edge.transact
 
         def phase_set(platform, t, **rec):
@@ -390,6 +433,10 @@ class FakeHost:
         def set_state(st, rid, state, *a, **k):
             real_set_state(st, rid, state, *a, **k)
             self._op(f"state {state}")
+
+        def set_schema(st, *a, **k):
+            real_set_schema(st, *a, **k)
+            self._op(f"schema recorded {a[3]}")
 
         def atomic_write(path, text, mode):
             real_atomic(path, text, mode)
@@ -432,6 +479,8 @@ class FakeHost:
             patch(data, "backup", lambda *a, **k: "copy made")
             patch(data, "copy_consistent", self.copy_consistent)
             patch(data, "restore_copy", self.restore_copy)
+            patch(data, "pin_copy", self.pin_copy)
+            patch(recipe, "_docker_run", self.docker_run)
             patch(Cloudflare, "ip_ranges", staticmethod(self.ip_ranges))
             patch(Cloudflare, "ensure_host_strict", lambda _self, h: f"{h}: strict")
             patch(recipe, "_phase_set", phase_set)
@@ -439,6 +488,7 @@ class FakeHost:
             patch(S.Store, "make_live", make_live)
             patch(S.Store, "revert_live", revert_live)
             patch(S.Store, "set_state", set_state)
+            patch(S.Store, "set_resource_schema", set_schema)
             yield
 
     # ------------------------------------------------------------ releases

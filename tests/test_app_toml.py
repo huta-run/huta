@@ -38,6 +38,51 @@ class Examples(unittest.TestCase):
             parse_app_toml(with_lines(HELLO, before_tables="colour = \"blue\"\n"), "hello")
 
 
+NOTES = (ROOT / "examples/notes/deploy/app.toml").read_text()
+MIGRATING = NOTES.replace('[state]\nkind = "data"', '[state]\nkind = "data"\nschema = 4\nruns_on = [3, 4]') \
+    + '\n[migrate]\nimage = "web"\ncmd = ["python", "/app/app.py", "migrate"]\ntimeout = "5m"\n'
+
+
+class Migrations(unittest.TestCase):
+    """[migrate] and [state] schema (DESIGN-v2 §2)."""
+
+    def parse(self, text):
+        return parse_app_toml(text, "notes")
+
+    def test_accepted(self):
+        app = self.parse(MIGRATING)
+        self.assertEqual(app["state"]["schema"], 4)
+        self.assertEqual(app["state"]["runs_on"], [3, 4])
+        self.assertEqual(app["migrate"]["cmd"], ["python", "/app/app.py", "migrate"])
+        self.assertEqual(app["migrate"]["timeout_s"], 300)
+
+    def test_runs_on_defaults_to_schema(self):
+        app = self.parse(NOTES.replace('[state]\nkind = "data"', '[state]\nkind = "data"\nschema = 2'))
+        self.assertEqual(app["state"]["runs_on"], [2])
+
+    def refused(self, text, pattern):
+        with self.assertRaisesRegex(ConfigError, pattern):
+            self.parse(text)
+
+    def test_runs_on_must_include_schema(self):
+        self.refused(MIGRATING.replace("runs_on = [3, 4]", "runs_on = [3]"), "includes schema")
+
+    def test_schema_needs_data(self):
+        with self.assertRaisesRegex(ConfigError, "needs kind"):
+            parse_app_toml(HELLO.replace('kind = "none"', 'kind = "none"\nschema = 3'), "hello")
+
+    def test_migrate_needs_schema(self):
+        self.refused(NOTES + '\n[migrate]\nimage = "web"\ncmd = ["x"]\n', "needs \\[state\\] schema")
+
+    def test_migrate_is_argv(self):
+        self.refused(MIGRATING.replace('cmd = ["python", "/app/app.py", "migrate"]',
+                                       'cmd = "python /app/app.py migrate"'), "argv")
+
+    def test_migrate_image_must_exist(self):
+        self.refused(MIGRATING.replace('[migrate]\nimage = "web"', '[migrate]\nimage = "api"'),
+                     "must name one of")
+
+
 class PlannedFeaturesRefused(unittest.TestCase):
     """Today's refusals. A v2 step that builds a feature replaces its test here."""
 
@@ -64,12 +109,9 @@ class PlannedFeaturesRefused(unittest.TestCase):
         self.refused(with_lines(HELLO, after='[external.site]\nkind = "cloudflare-pages"\n'),
                      "not supported by huta yet")
 
-    def test_state_schema(self):
-        self.refused(HELLO.replace('kind = "none"', 'kind = "none"\nschema = 3'),
-                     r"\[state\] accepts only 'kind'")
-
-    def test_migrate(self):
-        self.refused(with_lines(HELLO, after='[migrate]\nimage = "web"\n'), "unknown top-level")
+    def test_online_migration(self):
+        with self.assertRaisesRegex(ConfigError, "not supported by huta yet"):
+            parse_app_toml(MIGRATING.replace('"migrate"]', '"migrate"]\nonline = true'), "notes")
 
     def test_postgres_state(self):
         self.refused(HELLO.replace('kind = "none"', 'kind = "postgres"'), "state.kind")

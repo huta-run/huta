@@ -26,7 +26,7 @@ Rules for every milestone:
 | 0b | One release description for every manifest; `order[0]` sites read it | built |
 | 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | built |
 | 1 | Gateways, `edge` knobs on every vhost | built |
-| 2 | Migrations, exclusive mode; `health_timeout`; restore plans | planned |
+| 2 | Migrations, exclusive mode; `health_timeout`; restore plans | in progress: migrations built; rollback guard, restore plans, plan buttons next |
 | 3 | Several containers per target; images map | planned |
 | 4 | Postgres per target | planned |
 | 5 | External publishing (Pages, Workers) | planned |
