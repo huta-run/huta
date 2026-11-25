@@ -10,6 +10,12 @@ It lives at https://github.com/huta-run/huta, and every commit and commit messag
   ports, uids, chat ids, account names, tokens, incident notes or owner quotes. Examples use
   `example.org` and made-up values. The operator's own records (decisions, notes, reviews, host
   config) live in a separate private repo.
+- **The operator's settings stay local, never in this repo.** Real `huta.toml`,
+  `projects.d/*.toml`, `client.toml`, enroll JSON, secrets, tokens, host firewall or sshd files,
+  notes about a particular host: they live on that host (`/etc/huta`, `~/.config/huta`) or in the
+  operator's private records. Anything here is a generic example with made-up values. Before every
+  commit, check the staged diff and the message for real names, addresses or ids.
+- Commits carry the author's GitHub noreply address, not a personal email.
 - Secrets never go in the repo, commit messages, logs or output. Refer to them by name.
 - Code assumptions about one particular host (the dev container's name, the `caddy` user, the
   Telegram adapter) belong in host config with sensible defaults, not hard-coded.

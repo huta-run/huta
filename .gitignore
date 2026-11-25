@@ -8,3 +8,10 @@ node_modules/
 *.key
 *.pem
 /tmp/
+# Operator settings stay local (see CLAUDE.md): never commit a real host's config.
+huta.toml
+client.toml
+*enroll*.json
+/etc/
+/secrets/
+*.local.*
