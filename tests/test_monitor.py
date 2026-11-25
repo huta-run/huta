@@ -727,28 +727,59 @@ class LookupEdges(StrictLookups):
 
 
 class ReleaseWithMonitoringDown(unittest.TestCase):
-    """The milestone 1 gate in tests: a monitored target with every service down plans (above)
-    and its release goes live, since nothing after planning calls a monitoring service."""
+    """The milestone 1 gate in tests: a target with every kind monitored and every service
+    down is planned by the real cli.plan_release (its ensure fails), and that plan, approved,
+    goes live."""
 
     def test_goes_live(self):
         from tests.fakehost import FakeHost
-        from tests._util import app_toml
-        from huta import monitor as M, store as S
+        from tests._util import SHA
+        from huta import cli, monitor as M, recipe, runtime as R, store as S
 
         def down(*a, **k):
             raise FM.Down("connection refused")
         host = FakeHost()
         try:
             host.platform = dataclasses.replace(host.platform, monitoring={
-                "prefix": "huta", "healthchecks": {"url": "http://127.0.0.1:1",
-                                                   "ping": "https://hc.example.org/ping",
-                                                   "host": "", "channels": "*", "self": False},
-                "bugsink": None, "matomo": None})
+                "prefix": "huta",
+                "healthchecks": {"url": "http://127.0.0.1:1", "ping": "https://hc.example.org/ping",
+                                 "host": "", "channels": "*", "self": False},
+                "bugsink": {"dsn_host": "bugs.example.org", "team": FM.BUGSINK_TEAM},
+                "matomo": {"url": "http://127.0.0.1:2", "host": ""}},
+                crashes={"url": "http://127.0.0.1:3", "host": ""})
             project = host.registry["hello"]
-            t = dataclasses.replace(project.targets["prod"], monitor={"uptime": True})
+            t = dataclasses.replace(project.targets["prod"], monitor={
+                "uptime": True, "errors": True, "analytics": True})
             project.targets["prod"] = t
+            pdir = host.platform.secrets_dir / "_platform"
+            pdir.mkdir(parents=True, exist_ok=True)
+            for n in ("HEALTHCHECKS_API_KEY", "BUGSINK_TOKEN", "MATOMO_TOKEN"):
+                (pdir / n).write_text("token-0123456789")
+            image = host.add_image("hello", SHA)
+            gh = mock.Mock()
+            gh.read_file.return_value = (ROOT / "examples/hello/deploy/app.toml").read_text()
+            st = host.store()
+            try:
+                with mock.patch.object(M, "transport", down), \
+                        mock.patch.object(M, "read_secret", _plain_read_secret), \
+                        mock.patch("huta.cfg.read_secret", _plain_read_secret), \
+                        mock.patch.object(recipe, "check_image_map", lambda *a, **k: None), \
+                        mock.patch.object(R, "secret_value", lambda *a: "x" * 16), \
+                        mock.patch.object(R, "staged", lambda *a: {}), \
+                        mock.patch.object(R, "staged_list", lambda *a: []), \
+                        mock.patch.object(R, "live_versions", lambda *a: {}), \
+                        mock.patch.object(cli.S, "assert_root_dir", lambda _p: None, create=True):
+                    rid = cli.plan_release(host.platform, project, st, t, SHA, image,
+                                           "huta-build/hello:x", gh)
+                fails = sorted(e["msg"].split(":")[0] for e in st.events(limit=20)
+                               if e["kind"] == "monitor-fail")
+                self.assertEqual(fails, ["analytics", "errors"])
+                self.assertTrue(all("no answer" in e["msg"] for e in st.events(limit=20)
+                                    if e["kind"] == "monitor-fail"))
+                st.transition(rid, S.PLANNED, S.APPROVED)
+            finally:
+                st.db.close()
             with mock.patch.object(M, "transport", down):
-                rid = host.plan(project, t, app_toml("hello"), "1" * 40)
                 self.assertEqual(host.release(project, t, rid), S.LIVE)
         finally:
             host.close()
