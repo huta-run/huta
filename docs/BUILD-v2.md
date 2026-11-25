@@ -25,7 +25,7 @@ Rules for every milestone:
 | 0a | Database version, refuse a newer one; install guard | built |
 | 0b | One release description for every manifest; `order[0]` sites read it | built |
 | 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | built |
-| 1 | Gateways, `edge` knobs on every vhost | planned |
+| 1 | Gateways, `edge` knobs on every vhost | built |
 | 2 | Migrations, exclusive mode; `health_timeout`; restore plans | planned |
 | 3 | Several containers per target; images map | planned |
 | 4 | Postgres per target | planned |

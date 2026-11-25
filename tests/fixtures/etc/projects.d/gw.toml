@@ -1,0 +1,14 @@
+# Test fixture: gateways only (no repo, no uid): hostnames for services huta doesn't run.
+schema = 1
+project = "gw"
+
+[targets.media]
+kind = "gateway"
+hosts = ["media.example.org"]
+gateway = { to = "100.64.0.5:8080", secret = "GATEWAY_KEY", header = "X-Gateway-Key" }
+edge = { body = "1g", timeout = "10m" }
+
+[targets.local]
+kind = "gateway"
+hosts = ["local.example.org"]
+gateway = { to = "127.0.0.1:9000" }

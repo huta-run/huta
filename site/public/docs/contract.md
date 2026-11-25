@@ -353,6 +353,8 @@ see each other: the box is the unit huta can tell apart.
 | `legacy.<name>` | table | | project level: `unit` (`*.service`), `env_file` (absolute; required), `crashes` (optional); the name may not also be a target |
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
+| `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |
+| `kind` | string | `"app"` | `"gateway"`: a hostname huta proxies to a service it doesn't run (below) |
 
 Before the first release the operator runs `huta edge <project> <target> --apply` (and approves the plan)
 (certificate, vhost answering 503 `not released yet`, Cloudflare per-host SSL rule; with
@@ -360,3 +362,30 @@ Before the first release the operator runs `huta edge <project> <target> --apply
 AAAA or CNAME; MX, TXT and the like don't count) and no covering wildcard, `--apply` creates a
 **proxied A record** to the host's
 `platform.public_ipv4`. It never edits or deletes an existing record.
+
+### Gateways: a hostname for a service huta doesn't run
+
+A target with `kind = "gateway"` runs nothing. huta does its edge exactly as for an app (DNS
+record, Origin CA certificate, strict SSL rule, a vhost with the Cloudflare-only filter and the
+access log, plan and approval, journaled change, `huta traffic`) and proxies to an upstream the
+operator names. It doesn't build, release, check or roll back that service.
+
+```toml
+[targets.media]
+kind = "gateway"
+hosts = ["media.example.org"]
+gateway = { to = "100.64.0.5:8080", secret = "GATEWAY_KEY", header = "X-Gateway-Key" }
+edge = { body = "1g", timeout = "10m" }
+```
+
+- `to` is an IP address and port in loopback, private (10/8, 172.16/12, 192.168/16), CGNAT
+  (100.64/10) or ULA (fc00::/7) space. Names and public addresses are refused: the host never
+  proxies to the internet.
+- `secret` and `header` (together, optional): huta sends that header with the secret's value to
+  the upstream. The value lives in its own file (`/etc/caddy/huta-secrets/<p>--<t>.caddy`,
+  root and the `caddy` group only) that the vhost imports; the vhost itself never holds it.
+  Values with quotes, braces, `$` or spaces are refused. Set it with `huta secret set`.
+- A gateway accepts only `kind`, `hosts`, `gateway`, `edge`, `cloudflare` and `access_log`. A
+  project of gateways only needs no `repo`, `app_toml` or `uid`.
+- `huta edge <p> <t> --apply` (then `huta approve <id>`) creates or changes it. Release
+  commands (`submit`, `status` of a target, `stop`, `logs`, jobs) refuse a gateway.

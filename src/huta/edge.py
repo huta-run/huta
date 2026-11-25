@@ -175,12 +175,26 @@ def render_vhost(platform: Platform, target: Target, cf_ranges: list[str],
     if target.cloudflare == "orange":
         lines += [f"\t@notcf not remote_ip {' '.join(cf_ranges)}", "\tabort @notcf"]
     lines += ["\tencode zstd gzip"]
-    if port is None:
+    knobs = target.edge or {}
+    if "body" in knobs:
+        lines += ["\trequest_body {", f"\t\tmax_size {int(knobs['body'])}", "\t}"]
+    gateway = target.gateway if target.kind == "gateway" else None
+    if port is None and not gateway:
         lines += ['\trespond "not released yet" 503']
     else:
         # No trusted_proxies: remote_ip stays the TCP peer, so the Cloudflare-only filter keeps
         # working (grok design review #8). The visitor's address is CF-Connecting-IP.
-        lines += [f"\treverse_proxy 127.0.0.1:{port}"]
+        upstream = gateway["to"] if gateway else f"127.0.0.1:{port}"
+        inner = []
+        if gateway and gateway.get("secret"):
+            inner += [f"\t\timport {gateway_secret_path(platform, target)}"]
+        if "timeout" in knobs:
+            inner += ["\t\ttransport http {", f"\t\t\tread_timeout {knobs['timeout']}",
+                      f"\t\t\twrite_timeout {knobs['timeout']}", "\t\t}"]
+        if inner:
+            lines += [f"\treverse_proxy {upstream} {{", *inner, "\t}"]
+        else:
+            lines += [f"\treverse_proxy {upstream}"]
     if target.access_log:
         lines += ["\tlog {", f"\t\toutput file {platform.caddy_log_dir}/{target.hosts[0]}.log",
                   "\t}"]
@@ -188,6 +202,45 @@ def render_vhost(platform: Platform, target: Target, cf_ranges: list[str],
         lines += ["\t# access_log = false: no access log for this site"]
     lines += ["}", ""]
     return "\n".join(lines)
+
+
+def gateway_secret_path(platform: Platform, target: Target) -> Path:
+    return platform.caddy_secrets / f"{target.project}--{target.name}.caddy"
+
+
+SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=:@%^*!,;-]{1,4096}")
+
+
+def write_gateway_secret(platform: Platform, target: Target, value: str) -> bool:
+    """The header line a gateway's vhost imports, root:<caddy group> 0640 in a directory only
+    root and that group can enter. The value goes in quotes, so it may not contain anything
+    Caddy would read as syntax (DESIGN-v2 §1). Returns whether the file changed."""
+    if not SECRET_VALUE_RE.fullmatch(value):
+        raise EdgeError(f"gateway secret for {target.project}/{target.name}: the value has "
+                        "characters a Caddy header can't carry (quotes, braces, $, spaces)")
+    gid = grp.getgrnam(platform.caddy_group).gr_gid
+    d = platform.caddy_secrets
+    d.mkdir(mode=0o750, parents=True, exist_ok=True)
+    st = os.lstat(d)
+    if not os.path.isdir(d) or os.path.islink(d) or st.st_uid != os.getuid():
+        raise EdgeError(f"{d} must be a directory owned by root")
+    os.chown(d, os.getuid(), gid)
+    os.chmod(d, 0o750)
+    path = gateway_secret_path(platform, target)
+    text = f'header_up {target.gateway["header"]} "{value}"\n'
+    if path.exists() and not path.is_symlink() and path.read_text() == text:
+        return False
+    tmp = path.with_name(f".{path.name}.huta-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, text.encode())
+        os.fchown(fd, os.getuid(), gid)
+        os.fchmod(fd, 0o640)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    return True
 
 
 def vhost_shape(text: str) -> str:

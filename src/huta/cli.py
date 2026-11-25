@@ -69,10 +69,14 @@ def ctx(project_name: str | None = None):
     return platform, registry[project_name], st
 
 
-def target_of(project, name):
+def target_of(project, name, gateway_ok: bool = False):
     if name not in project.targets:
         raise ConfigError(f"{project.name} has no target {name!r} (targets: {', '.join(project.targets)})")
-    return project.targets[name]
+    t = project.targets[name]
+    if t.kind == "gateway" and not gateway_ok:
+        raise ConfigError(f"{project.name}/{name} is a gateway: nothing runs there to release, "
+                          "start or read (huta edge and huta traffic work)")
+    return t
 
 
 def current_cert(platform, t):
@@ -91,6 +95,9 @@ def cmd_check(a):
             f" boxes {', '.join(project.boxes) or 'none (host CLI only)'}")
         for t in project.targets.values():
             zones = ", ".join(f"{h} → {zone_for(h, platform)}" for h in t.hosts)
+            if t.kind == "gateway":
+                say(f"  gateway {t.name}: {zones} → {t.gateway['to']}")
+                continue
             say(f"  target {t.name}: {zones}; slots {t.slots[0]}/{t.slots[1]}; egress {t.egress};"
                 f" approve {t.approve}; require_ci {t.require_ci}")
     say("registry ok (no shared ports or hosts)")
@@ -114,7 +121,18 @@ def _edge_survey(platform, project, t, cf) -> dict:
     lines.append(f"certificate: {'ok ' + have[0].name if have else 'missing or not covering all hosts (a new one is made)'}")
     inputs = {"hosts": list(t.hosts), "cloudflare": t.cloudflare, "access_log": t.access_log,
               "missing_dns": missing, "cert": have[0].name if have else None,
-              "vhost": edge.installed(platform, t) or ""}
+              "vhost": edge.installed(platform, t) or "", "edge": t.edge}
+    if t.kind == "gateway":
+        g = dict(t.gateway)
+        lines.append(f"gateway → {g['to']}" + (f", header {g['header']} from secret {g['secret']}"
+                                               if g.get("secret") else ""))
+        if g.get("secret"):
+            # The value never appears; its fingerprint binds the plan to it.
+            g["secret_sha256"] = hashlib.sha256(
+                R.secret_value(platform, project.name, g["secret"]).encode()).hexdigest()
+        inputs["gateway"] = g
+    if t.edge:
+        lines.append("edge: " + ", ".join(f"{k} {v}" for k, v in sorted(t.edge.items())))
     return {"lines": lines, "missing": missing, "inputs": inputs}
 
 
@@ -124,6 +142,10 @@ def _edge_apply(platform, project, st, t, cf, missing, how: str) -> None:
         say(f"{h}: {cf.create_proxied_a(h, platform.public_ipv4)}")
     msg, cert = edge.ensure_cert(platform, cf, t)
     say(msg)
+    if t.kind == "gateway" and t.gateway.get("secret"):
+        if edge.write_gateway_secret(platform, t, R.secret_value(platform, project.name,
+                                                                 t.gateway["secret"])):
+            say(f"gateway header file written ({edge.gateway_secret_path(platform, t)})")
     live = st.live(project.name, t.name)
     # Keep whatever the vhost routes to now; never re-point traffic from the database
     # (grok #9). A first edge has no route yet: the 503 form.
@@ -153,7 +175,7 @@ def cmd_edge(a):
     """Dry run by default. --apply makes an edge plan the owner approves (huta approve <id>);
     --now applies at once, for an operator at the console, and is recorded (DESIGN-v2 §0)."""
     platform, project, st = ctx(a.project)
-    t = target_of(project, a.target)
+    t = target_of(project, a.target, gateway_ok=True)
     cf = Cloudflare(platform)
     survey = _edge_survey(platform, project, t, cf)
     for line in survey["lines"]:
@@ -176,7 +198,7 @@ def _approve_plan(platform, registry, st, pid: str, via: str) -> int:
     """Approve and apply a plan that is not a release (DESIGN-v2 §0: infra plans)."""
     r = st.plan_row(pid)
     project = registry[r["project"]]
-    t = target_of(project, r["target"])
+    t = target_of(project, r["target"], gateway_ok=True)
     with st.lock(project.name, t.name, wait=300):
         r = st.plan_row(pid)
         if r["state"] != S.PLANNED:
@@ -250,7 +272,7 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
         # A key a plan made by an older huta doesn't have counts as its default, so an upgrade
         # alone doesn't list every new key as changed.
         dflt = {"env": {}, "secrets": [], "upstreams": {}, "data": None, "jobs": [], "smoke": [],
-                "adopt": "", "access_log": True, "job_secrets": {}, "diag": []}
+                "adopt": "", "access_log": True, "job_secrets": {}, "diag": [], "edge": {}}
         diff = sorted(k for k in set(old) | set(eff) if k != "compose"
                       and old.get(k, dflt.get(k)) != eff.get(k, dflt.get(k)))
         if diff or old.get("compose") != eff.get("compose"):
@@ -318,8 +340,9 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
 
 
 def secret_names(t) -> list[str]:
-    """Every secret name a target uses: its own and its jobs'."""
-    return t.secrets + [n for names in t.job_secrets.values() for n in names]
+    """Every secret name a target uses: its own, its jobs' and a gateway's header."""
+    gw = [t.gateway["secret"]] if t.gateway and t.gateway.get("secret") else []
+    return t.secrets + [n for names in t.job_secrets.values() for n in names] + gw
 
 
 def _gates(gh, project, t, sha):
@@ -1250,7 +1273,7 @@ def cmd_observe(a):
         res = O.crashes(platform, project, project.legacy[a.target]["crashes"],
                         f"{project.name}/{a.target}", a.since)
     else:
-        t = target_of(project, a.target)
+        t = target_of(project, a.target, gateway_ok=a.cmd == "traffic")
         if a.cmd == "egress-log":
             res = O.egress_log(platform, project, t, a.since, a.until)
         elif a.cmd == "traffic":
@@ -1277,6 +1300,8 @@ def cmd_logs_collect(a):
     failed = 0
     for project in registry.values():
         for t in project.targets.values():
+            if t.kind == "gateway":
+                continue          # no containers, no logs (its access log is Caddy's)
             try:
                 L.collect(platform, project, t, st)
             except Exception as e:  # noqa: BLE001 — one target never stops the others

@@ -123,6 +123,8 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
             "jobs": app.get("jobs", []), "smoke": app.get("smoke", []),
             "diag": app.get("diag", []),
             "adopt": t.adopt, "access_log": t.access_log,
+            # v2 keys appear only when set, so a v1 target's dict is unchanged (tests/golden).
+            **({"edge": t.edge} if t.edge else {}),
             "compose": compose_doc(platform, project, t, app,
                                    {s: ("<image>", "<sha>") for s in SLOTS}, with_secrets=False)}
 
@@ -421,6 +423,8 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     """Make the store and Docker agree with what the vhost routes to. Hold the target lock.
     Starts only the routed slot of the live release (if it was stopped); stops only slots
     nothing routes to; thaws the data volume (a backup interrupted while it was frozen)."""
+    if t.kind == "gateway":
+        return       # nothing runs; its edge changes are journaled like every vhost change
     if t.data:
         from .data import thaw
         thaw(R.data_paths(platform, t)[1])

@@ -109,7 +109,20 @@ access_log = true
 logs = { days = 7, max = "200m", boxes = true, jobs = false }   # huta logs (the defaults)
 crashes = 11                   # Bugsink project id (huta crashes)
 adopt = "hello.example.org.caddy"   # moving a live site: its vhost file, replaced at the first release
+edge = { body = "1g", timeout = "10m" }   # v2: request body limit, upstream timeouts (unset: unchanged)
+
+# v2: a gateway, a hostname for a service huta doesn't run (DESIGN-v2 §1). No slots, uid or repo.
+[targets.media]
+kind = "gateway"
+hosts = ["media.example.org"]
+gateway = { to = "100.64.0.5:8080", secret = "GATEWAY_KEY", header = "X-Gateway-Key" }
 ```
+
+A gateway's upstream is an IP in loopback, private, CGNAT or ULA space. Its secret header
+lives in `<platform.caddy_secrets>/<p>--<t>.caddy` (default `/etc/caddy/huta-secrets`,
+root:`caddy_group` 0640, directory 0750), imported by the vhost, so the vhost stays
+world-readable without the value. `reconcile`, release, job and log commands skip or refuse
+gateways; `huta edge` and `huta traffic` work.
 
 **Platform** (`/etc/huta/huta.toml`):
 
@@ -118,6 +131,8 @@ schema = 1
 [platform]
 host = "myhost"
 notify = ["/usr/local/bin/notify-owner"]   # optional fallback, used only without [telegram]
+caddy_secrets = "/etc/caddy/huta-secrets"  # v2 gateways' header files (the default)
+caddy_group = "caddy"                       # the group Caddy runs as (the default)
 [cloudflare]
 zones = ["example.org"]        # huta refuses any Cloudflare call outside this list
 [transport.pull]               # optional

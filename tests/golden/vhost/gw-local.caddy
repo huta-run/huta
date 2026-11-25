@@ -1,0 +1,12 @@
+# managed-by: huta — project gw, target local.
+# Generated from /etc/huta/projects.d/gw.toml. Do not edit by hand.
+local.example.org {
+	tls /etc/huta/tls/example.pem /etc/huta/tls/example.key
+	@notcf not remote_ip 173.245.48.0/20 2400:cb00::/32
+	abort @notcf
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:9000
+	log {
+		output file /var/log/caddy/local.example.org.log
+	}
+}

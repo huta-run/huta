@@ -202,6 +202,10 @@ class Platform:
     logs_max_total: int = 2 << 30                 # [logs] max_total: all targets' logs together
     logs_syslog: bool = False                     # [logs] syslog: also send stored lines to syslog
     crashes: dict = field(default_factory=dict)   # [crashes] url, host (Bugsink; token is a secret)
+    # Gateway secret headers: one file per gateway, root:<caddy_group> 0640, that its vhost
+    # imports (the vhost itself stays world-readable; DESIGN-v2 §1).
+    caddy_secrets: Path = Path("/etc/caddy/huta-secrets")
+    caddy_group: str = "caddy"
 
     def secret(self, name: str) -> str:
         return read_secret(self.secrets_dir / "_platform" / name)
@@ -231,6 +235,9 @@ class Target:
     # read the slots' logs and the jobs' output.
     logs: dict = field(default_factory=lambda: dict(LOGS_DEFAULT))
     crashes: int | None = None                       # its Bugsink project id (huta crashes)
+    kind: str = "app"                                # "app" or "gateway" (DESIGN-v2 §1)
+    gateway: dict | None = None                      # {"to": "ip:port", "secret": NAME, "header": H}
+    edge: dict = field(default_factory=dict)         # {"body": bytes, "timeout": "10m"}
 
     @property
     def egress_allow(self) -> list[str]:
@@ -355,7 +362,64 @@ def load_platform(etc: Path = ETC) -> Platform:
         logs_max_total=_logs_host(d.get("logs", {}))[0],
         logs_syslog=_logs_host(d.get("logs", {}))[1],
         crashes=_crashes_host(d.get("crashes", {})),
+        caddy_secrets=Path(p.get("caddy_secrets", "/etc/caddy/huta-secrets")),
+        caddy_group=_caddy_group(p.get("caddy_group", "caddy")),
     )
+
+
+def _caddy_group(v) -> str:
+    if not isinstance(v, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", v):
+        raise ConfigError("platform.caddy_group must be a group name")
+    return v
+
+
+GATEWAY_NETS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                "::1/128", "fc00::/7")
+
+
+def _gateway_cfg(v, where: str) -> dict:
+    """gateway = { to = "ip:port", secret = "NAME", header = "X-Name" }: the upstream is an IP
+    literal in loopback, private, CGNAT or ULA space, so the host never proxies to the public
+    internet (DESIGN-v2 §1)."""
+    import ipaddress
+    if not isinstance(v, dict) or set(v) - {"to", "secret", "header"} or "to" not in v:
+        raise ConfigError(f"{where}: gateway = {{ to = \"10.0.0.5:8080\", secret = \"NAME\", "
+                          "header = \"X-Gateway-Key\" }")
+    host, port = _hostport(v["to"], f"{where} gateway.to")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise ConfigError(f"{where}: gateway.to must be an IP address, not a name") from None
+    if not any(ip in ipaddress.ip_network(n) for n in GATEWAY_NETS):
+        raise ConfigError(f"{where}: gateway.to must be loopback, private, CGNAT (100.64/10) or "
+                          "ULA: huta does not proxy to public addresses")
+    out = {"to": f"[{host}]:{port}" if ip.version == 6 else f"{host}:{port}"}
+    if "secret" in v or "header" in v:
+        if not ("secret" in v and "header" in v):
+            raise ConfigError(f"{where}: gateway.secret and gateway.header go together")
+        out["secret"] = _env_name(v["secret"], f"{where} gateway.secret")
+        h = v["header"]
+        if not isinstance(h, str) or not HEADER_RE.match(h) or h.lower() in FORBIDDEN_REQ_HEADERS:
+            raise ConfigError(f"{where}: gateway.header must be a plain header name")
+        out["header"] = h
+    return out
+
+
+def _edge_cfg(v, where: str) -> dict:
+    """edge = { body = "1g", timeout = "10m" }: request body limit and upstream timeouts. Unset
+    keys render nothing, so a vhost without them is unchanged."""
+    if not isinstance(v, dict) or set(v) - {"body", "timeout"}:
+        raise ConfigError(f"{where}: edge = {{ body = \"1g\", timeout = \"10m\" }}")
+    out = {}
+    if "body" in v:
+        out["body"] = size_bytes(v["body"], f"{where} edge.body", 1 << 10, 64 << 30)
+    if "timeout" in v:
+        to = v["timeout"]
+        if not isinstance(to, str) or not re.fullmatch(r"[1-9]\d{0,3}[smh]", to) \
+                or duration_s(to, f"{where} edge.timeout", 24 * 3600) > 24 * 3600:
+            raise ConfigError(f"{where}: edge.timeout must be like \"90s\", \"10m\" or \"2h\"")
+        out["timeout"] = to
+    return out
 
 
 def _crashes_host(v: dict) -> dict:
@@ -579,18 +643,48 @@ def load_project(name: str, etc: Path = ETC) -> Project:
         raise ConfigError(f"{where}: schema must be 1")
     if d.get("project") != name:
         raise ConfigError(f"{where}: project must be {name!r}")
-    uid = _need(d, "uid", int, where)
-    if not 20000 <= uid < 30000:
-        raise ConfigError(f"{where}: uid must be in 20000..29999")
+    raw_targets = _need(d, "targets", dict, where)
+    # A project of gateways only runs nothing: no repo, manifest or uid (DESIGN-v2 §1).
+    gateways_only = bool(raw_targets) and all(
+        isinstance(x, dict) and x.get("kind") == "gateway" for x in raw_targets.values())
+    if gateways_only and "uid" not in d:
+        uid = 0
+    else:
+        uid = _need(d, "uid", int, where)
+        if not 20000 <= uid < 30000:
+            raise ConfigError(f"{where}: uid must be in 20000..29999")
     targets = {}
-    for tname, t in _need(d, "targets", dict, where).items():
+    for tname, t in raw_targets.items():
         tw = f"{where} [targets.{tname}]"
         if not NAME_RE.match(tname):
             raise ConfigError(f"{tw}: bad target name")
+        if not isinstance(t, dict):
+            raise ConfigError(f"{tw}: must be a table")
         hosts = [h.lower() for h in _need(t, "hosts", list, tw)]
         for h in hosts:
             if not HOST_RE.match(h):
                 raise ConfigError(f"{tw}: bad host {h!r}")
+        kind = t.get("kind", "app")
+        if kind not in ("app", "gateway"):
+            raise ConfigError(f"{tw}: kind is \"app\" (default) or \"gateway\"")
+        edge_cfg = _edge_cfg(t.get("edge", {}), tw)
+        if kind == "gateway":
+            unknown = set(t) - {"kind", "hosts", "gateway", "edge", "cloudflare", "access_log",
+                                "approve"}
+            if unknown:
+                raise ConfigError(f"{tw}: a gateway accepts hosts, gateway, edge, cloudflare, "
+                                  f"access_log; unknown {sorted(unknown)}")
+            if t.get("cloudflare", "orange") != "orange" or t.get("approve", "always") != "always":
+                raise ConfigError(f"{tw}: cloudflare = \"orange\" and approve = \"always\" only")
+            access_log = t.get("access_log", True)
+            if not isinstance(access_log, bool):
+                raise ConfigError(f"{tw}: access_log must be true or false")
+            targets[tname] = Target(
+                project=name, name=tname, hosts=hosts, cloudflare="orange", slots=(),
+                egress="none", limits={}, approve="always", require_ci=False, keep_releases=0,
+                access_log=access_log, kind="gateway", edge=edge_cfg,
+                gateway=_gateway_cfg(t.get("gateway"), tw))
+            continue
         slots = _need(t, "slots", list, tw)
         if len(slots) != 2 or not all(isinstance(s, int) and 1024 < s < 65536 for s in slots):
             raise ConfigError(f"{tw}: slots must be two ports")
@@ -616,7 +710,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
         unknown = set(t) - {"hosts", "slots", "egress", "approve", "cloudflare", "limits",
                             "require_ci", "keep_releases", "drain", "env", "secrets",
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
-                            "crashes"}
+                            "crashes", "kind", "edge"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -687,7 +781,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             adopt=adopt, access_log=access_log,
             job_secrets={k: list(v) for k, v in sorted(job_secrets.items())},
             logs=_logs_cfg(t.get("logs", {}), tw),
-            crashes=_crash_id(t.get("crashes"), tw),
+            crashes=_crash_id(t.get("crashes"), tw), edge=edge_cfg,
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -695,8 +789,13 @@ def load_project(name: str, etc: Path = ETC) -> Project:
     if not isinstance(boxes, list) or len(boxes) > 64 or not all(
             isinstance(b, str) and GRANT_RE.match(b) for b in boxes) or len(set(boxes)) != len(boxes):
         raise ConfigError(f"{where}: boxes must be a list of distinct box names")
-    return Project(name=name, repo=_need(d, "repo", str, where),
-                   app_toml=_need(d, "app_toml", str, where), uid=uid, targets=targets,
+    if gateways_only:
+        repo, app_toml = d.get("repo", ""), d.get("app_toml", "")
+        if not isinstance(repo, str) or not isinstance(app_toml, str):
+            raise ConfigError(f"{where}: repo and app_toml must be strings")
+    else:
+        repo, app_toml = _need(d, "repo", str, where), _need(d, "app_toml", str, where)
+    return Project(name=name, repo=repo, app_toml=app_toml, uid=uid, targets=targets,
                    boxes=tuple(boxes), log_drop=_log_drop(d.get("log_drop", []), where),
                    legacy=_legacy(d.get("legacy", {}), set(targets), where))
 
@@ -722,9 +821,10 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                                       "the schedule and shipping)")
     ports, hosts, uids = {}, {}, {}
     for p in projects.values():
-        if p.uid in uids:
+        if p.uid and p.uid in uids:
             raise ConfigError(f"uid {p.uid} used by {uids[p.uid]} and {p.name}")
-        uids[p.uid] = p.name
+        if p.uid:
+            uids[p.uid] = p.name
         for t in p.targets.values():
             for port in t.slots:
                 if port in ports:

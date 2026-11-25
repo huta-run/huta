@@ -64,7 +64,7 @@ What every later step stands on.
   timeout + health timeout + drain + copy), at least today's 20 minutes.
 - **Notifications** put data-loss and migration lines first, before the 🔑 lines.
 
-## 1. Gateways: a hostname for a service huta doesn't run
+## 1. Gateways: a hostname for a service huta doesn't run (built)
 
 A target with no container: huta does the edge (DNS record, Origin CA certificate, strict SSL
 rule, generated vhost with the Cloudflare-only filter and access log, plan, approval, journal,
