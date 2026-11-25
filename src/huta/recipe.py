@@ -416,13 +416,14 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     if routed is None:
         if live and edge.adopt_pending(platform, t) is not None:
             # An adopted site's revert put the old file back but died before recording it.
+            # Stop first, record, then clear the phase: a crash in between repeats this branch.
+            for slot, c in cons.items():
+                if c["running"]:
+                    stop_container(c["id"])
             st.revert_live(live["release_id"], None, None,
                            "reverted to the site's old config (finished by reconcile)")
             _phase_clear(platform, t)
             log("reconcile: finished an interrupted revert to the adopted site's old config")
-            for slot, c in cons.items():
-                if c["running"]:
-                    stop_container(c["id"])
             return
         if live:
             # The site answers 503 while the store believes something is live: stop here
@@ -437,6 +438,10 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
                 log(f"reconcile: stopped unrouted slot {slot}")
         for r in st.in_state(project.name, t.name, S.RUNNING, S.APPROVED):
             st.set_state(r["id"], S.NOTHING_ACTIVATED, msg="interrupted before any traffic")
+        # A first release (or an adoption) that died before its switch: nothing ran with data
+        # (no copy is taken without a live release), so the phase has nothing left to undo. Left
+        # in place it would block `huta data import` (crash tests).
+        _phase_clear(platform, t)
         return
 
     c = cons.get(routed)

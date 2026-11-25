@@ -188,8 +188,6 @@ class Scenario:
 
 # ------------------------------------------------------------ scenarios
 # Known bugs found by these tests, each skipped until the commit that fixes it removes the mark.
-BUG_PHASE_LEFT = ("known bug: reconcile leaves the phase file when nothing is routed (first "
-                  "release, adoption), which blocks `huta data import`")
 BUG_REVERT_RETIRES = ("known bug: if reconcile dies while finishing a revert, the failed release "
                       "can end up retired (huta rollback's target)")
 BUG_REVERT_NEEDS_CERT = ("known bug: reconcile's revert needs a usable newest certificate and "
@@ -201,7 +199,6 @@ class StatelessRelease(Scenario, unittest.TestCase):
     project_name, target_name = "hello", "prod"
 
 
-@unittest.skip(BUG_PHASE_LEFT)
 class StatelessFirstRelease(Scenario, unittest.TestCase):
     project_name, target_name = "hello", "prod"
     first_release = True
@@ -242,7 +239,6 @@ class StatelessSwitchRefused(Scenario, unittest.TestCase):
     clean, allowed = NA, {NA}
 
 
-@unittest.skip(BUG_PHASE_LEFT)
 class FirstReleasePublicFail(Scenario, unittest.TestCase):
     """A first release whose public checks fail: nothing to go back to, a human decides."""
     project_name, target_name = "hello", "prod"
@@ -251,14 +247,12 @@ class FirstReleasePublicFail(Scenario, unittest.TestCase):
     clean, allowed = NH, {NA, NH}
 
 
-@unittest.skip(BUG_PHASE_LEFT)
 class AdoptionRelease(Scenario, unittest.TestCase):
     """The first release replaces a hand-written vhost serving the same host."""
     project_name, target_name = "hello", "legacy"
     first_release, adopt_file = True, "legacy-site.caddy"
 
 
-@unittest.skip(BUG_PHASE_LEFT)
 class AdoptionPublicFail(Scenario, unittest.TestCase):
     """The adopted site's own file comes back when the first release fails its checks."""
     project_name, target_name = "hello", "legacy"
