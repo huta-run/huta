@@ -1035,3 +1035,48 @@ class MonitorTomlTypes(unittest.TestCase):
         for bad in ("[monitor]\nenv = [[]]\n", "[monitor]\nenv = [{}]\n", "[monitor]\nenv = [1]\n"):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 parse_app_toml(with_lines(HELLO, after=bad), "hello")
+
+
+class GrantRevoked(Env):
+    """The grant goes when no release that gets the DSN is live or under way (codex review of
+    milestone 2, second look)."""
+
+    def test_dropped_or_failed(self):
+        from huta import egress as E, store as S
+        t = self.target()
+        reg = {"notes": dataclasses.replace(self.registry["notes"],
+                                            targets={**self.registry["notes"].targets, "prod": t})}
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        with mock.patch.object(S, "assert_root_dir", lambda _p: None):
+            st = S.Store(self.platform.state_dir)
+        try:
+            def rel(ask):
+                return st.new_release(project="notes", target="prod", sha="a" * 40, image_id="i",
+                                      image_tag="t", app_toml=json.dumps(self.app(ask)), plan={},
+                                      plan_hash="0", built_by="test")
+            old = rel(["sentry"])
+            st.set_state(old, S.LIVE)
+            self.assertEqual(E.monitor_grants(self.platform, reg), {("notes", "prod")})
+            new = rel(None)                       # a release that drops monitoring goes live
+            st.set_state(new, S.LIVE)
+            st.set_state(old, S.RETIRED)
+            self.assertEqual(E.monitor_grants(self.platform, reg), set())
+            failed = rel(["sentry"])              # a monitored candidate that didn't activate
+            st.set_state(failed, S.NOTHING_ACTIVATED)
+            self.assertEqual(E.monitor_grants(self.platform, reg), set())
+        finally:
+            st.db.close()
+
+    def test_resynced_after_reconcile(self):
+        from huta import recipe
+        t = self.target()
+        with mock.patch.object(recipe, "_reconcile", side_effect=RuntimeError("x")), \
+                mock.patch.object(recipe, "_egress_sync") as sync:
+            with self.assertRaises(RuntimeError):
+                recipe.reconcile(self.platform, None, self.registry["notes"], t, print)
+            sync.assert_called_once()
+        with mock.patch.object(recipe, "_reconcile"), \
+                mock.patch.object(recipe, "_egress_sync") as sync:
+            recipe.reconcile(self.platform, None, self.registry["notes"],
+                             self.registry["notes"].targets["prod"], print)
+            sync.assert_not_called()             # v1 targets: as before

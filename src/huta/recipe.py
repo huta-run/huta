@@ -583,6 +583,16 @@ def import_marker(platform: Platform, t: Target) -> Path:
 # ------------------------------------------------------------------ reconcile
 
 def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log) -> None:
+    try:
+        _reconcile(platform, st, project, t, log)
+    finally:
+        if t.monitor_egress:
+            # The Bugsink grant follows the target's releases (docs/PLAN-monitoring.md §3):
+            # after recovery it may have to go (codex review of milestone 2, second look).
+            _egress_sync(platform, log)
+
+
+def _reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log) -> None:
     """Make the store and Docker agree with what the vhost routes to. Hold the target lock.
     Starts only the routed slot of the live release (if it was stopped); stops only slots
     nothing routes to; thaws the data volume (a backup interrupted while it was frozen)."""

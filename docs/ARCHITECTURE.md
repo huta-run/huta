@@ -351,7 +351,9 @@ window, the ↩️ button) is *planned*.
   asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and
   compose (proxy variables, the egress host), and in the egress policy only while such a
   release of the target is live, approved or running (`egress.monitor_grants`, read-only on
-  `huta.db`). `Target.egress_allow` stays the registry's own list.
+  `huta.db`), resynced after every approval's outcome and every `reconcile` of such a target,
+  so a grant goes when the release that needed it does. `Target.egress_allow` stays the
+  registry's own list.
 - The DSN is listed in the plan's `secret_versions`, so approval refuses a plan whose DSN
   changed since; `ensure` writes it under the project's secrets lock.
 - Order and crashes: remote create → capability (check ids) → `monitors` row → DSN secret. A

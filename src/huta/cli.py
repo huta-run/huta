@@ -931,6 +931,10 @@ def cmd_approve(a):
         if staged:
             # Values go live with the release or not at all (grok secrets #1, #2).
             _settle(platform, st, project, a.release, outcome)
+        if t.monitor_egress:
+            # Whatever the outcome, the Bugsink grant now follows the releases that are live:
+            # one dropped by this release, or by a failed one, goes (docs/PLAN-monitoring.md §3).
+            recipe._egress_sync(platform, say)
         tell(platform, st, a.release)
         if outcome == S.LIVE and plan.get("planned_against_live"):
             tell(platform, st, plan["planned_against_live"], create=False)   # now "replaced"
