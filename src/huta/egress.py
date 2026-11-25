@@ -56,8 +56,12 @@ def monitor_grants(platform, registry) -> set[tuple[str, str]]:
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            rows = con.execute("SELECT project, target, app_toml FROM releases WHERE state IN"
-                               " ('live', 'approved', 'running')").fetchall()
+            # What serves (the live pointer, whatever its release's state: a release left
+            # needs-human may still be the one serving) and what is starting.
+            rows = con.execute(
+                "SELECT project, target, app_toml FROM releases WHERE state IN"
+                " ('live', 'approved', 'running') OR id IN (SELECT release_id FROM live)"
+            ).fetchall()
         finally:
             con.close()
     except sqlite3.Error:

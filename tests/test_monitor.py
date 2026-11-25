@@ -1064,6 +1064,11 @@ class GrantRevoked(Env):
             failed = rel(["sentry"])              # a monitored candidate that didn't activate
             st.set_state(failed, S.NOTHING_ACTIVATED)
             self.assertEqual(E.monitor_grants(self.platform, reg), set())
+            serving = rel(["sentry"])             # left needs-human, but still what serves
+            st.set_state(serving, S.NEEDS_HUMAN)
+            self.assertEqual(E.monitor_grants(self.platform, reg), set())
+            st.set_live("notes", "prod", serving, "a")
+            self.assertEqual(E.monitor_grants(self.platform, reg), {("notes", "prod")})
         finally:
             st.db.close()
 

@@ -350,7 +350,8 @@ window, the ↩️ button) is *planned*.
 - **Egress:** `<dsn_host>:443` is added only for a release that gets `SENTRY_DSN` (the repo
   asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and
   compose (proxy variables, the egress host), and in the egress policy only while such a
-  release of the target is live, approved or running (`egress.monitor_grants`, read-only on
+  release of the target is live (or named by the live pointer), approved or running
+  (`egress.monitor_grants`, read-only on
   `huta.db`), resynced after every approval's outcome and every `reconcile` of such a target,
   so a grant goes when the release that needed it does. `Target.egress_allow` stays the
   registry's own list.
