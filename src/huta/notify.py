@@ -35,7 +35,38 @@ STATE_LINE = {
     S.ROLLED_BACK: "↩️ reverted automatically",
     S.REJECTED: "✖️ rejected",
     S.SUPERSEDED: "⌛ expired or superseded",
+    "applied": "✅ applied",
+    "failed": "🆘 failed, needs a human",
 }
+PLAN_TITLE = {"edge": "🌐 edge change", "restore": "♻️ DATA RESTORE"}
+
+
+def created(st: S.Store, rid: str) -> float:
+    """When a release or a plan was made (its approval window starts there)."""
+    p = st.plan_row(rid)
+    return p["created"] if p else st.release(rid)["created"]
+
+
+def render_plan(st: S.Store, pid: str) -> str:
+    """A plan that is not a release (edge, restore): what it changes, warnings first."""
+    r = st.plan_row(pid)
+    p = json.loads(r["plan"])
+    esc = html.escape
+    lines = [f"{PLAN_TITLE.get(r['kind'], r['kind'])} <b>{esc(r['project'])} → "
+             f"{esc(r['target'])}</b>  ·  <code>{pid}</code>"]
+    body = p.get("lines", [])
+    lines += [esc(x[:400]) for x in body if x.startswith("⚠️")]
+    lines += [esc(x[:300]) for x in body if not x.startswith("⚠️")][:12]
+    state = r["state"]
+    head = STATE_LINE.get(state, state)
+    if state == S.PLANNED:
+        expires = time.strftime("%H:%M", time.localtime(r["created"] + 30 * 60))
+        flag = " --confirm-data-loss" if r["kind"] == "restore" else ""
+        lines += [f"{head} · until {expires}", f"<code>sudo huta approve {pid}{flag}</code>"]
+    else:
+        why = next((ev["msg"] for ev in st.events(pid, limit=5) if ev["kind"] == state), "")
+        lines += [head + (f" — {esc(why[:300])}" if why and why != state else "")]
+    return "\n".join(lines)
 
 
 def _token(platform) -> str | None:
@@ -88,6 +119,8 @@ def history_note(p: dict) -> tuple[str, bool]:
 
 
 def render(st: S.Store, rid: str) -> str:
+    if st.plan_row(rid):
+        return render_plan(st, rid)
     r = st.release(rid)
     p = json.loads(r["plan"])
     e = p.get("effective", {})
@@ -104,6 +137,10 @@ def render(st: S.Store, rid: str) -> str:
             "CI ✓" if p.get("checks", {}).get("ci") == "green" else "CI not required",
         ] if x),
     ]
+    # Data first: a migration (or anything else marked ⚠️) leads, before secrets (DESIGN-v2 §0).
+    for c in p.get("changes", []):
+        if c.startswith("⚠️"):
+            lines.append(esc(c[:400]))
     note, warn = history_note(p)
     if warn or note.startswith("rollback"):
         lines.append(esc(note))
@@ -197,11 +234,14 @@ def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
             return
         a = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
         r = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
-        expires = st.release(rid)["created"] + ttl
+        plan = st.plan_row(rid)
+        yes = {"edge": "✅ Apply", "restore": "♻️ Restore (loses data)"}.get(
+            plan["kind"], "✅ Apply") if plan else "✅ Deploy"
+        expires = created(st, rid) + ttl
         _call(token, "editMessageReplyMarkup", {
             "chat_id": msg["chat"], "message_id": msg["message_id"],
             "reply_markup": {"inline_keyboard": [[
-                {"text": "✅ Deploy", "callback_data": f"{PREFIX}a:{a}"},
+                {"text": yes, "callback_data": f"{PREFIX}a:{a}"},
                 {"text": "❌ Reject", "callback_data": f"{PREFIX}r:{r}"}]]}})
         st.db.execute("INSERT OR REPLACE INTO approvals (release_id, approve_hash, reject_hash, expires,"
                       " chat, message_id) VALUES (?,?,?,?,?,?)",

@@ -91,7 +91,7 @@ edge = { body = "1g", timeout = "10m" }    # also valid on app targets
 - Handing a hostname from a gateway to an app (hostname first, code later) is an explicit
   registry change, planned and approved like any edge change.
 
-## 2. Migrations, exclusive mode
+## 2. Migrations, exclusive mode (built)
 
 ```toml
 # app.toml

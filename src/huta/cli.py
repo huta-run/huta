@@ -190,12 +190,14 @@ def cmd_edge(a):
         return 0
     pid = st.new_plan(project.name, t.name, "edge", {
         "lines": survey["lines"], "inputs": survey["inputs"]})
+    tell(platform, st, pid)
+    ask(platform, st, pid)
     say(f"\nedge plan {pid}; approve with: huta approve {pid}")
     return 0
 
 
-def _approve_plan(platform, registry, st, pid: str, via: str) -> int:
-    """Approve and apply a plan that is not a release (DESIGN-v2 §0: infra plans)."""
+def _approve_plan(platform, registry, st, pid: str, via: str, confirmed: bool = False) -> int:
+    """Approve and apply a plan that is not a release (DESIGN-v2 §0: infra and restore)."""
     r = st.plan_row(pid)
     project = registry[r["project"]]
     t = target_of(project, r["target"], gateway_ok=True)
@@ -207,6 +209,8 @@ def _approve_plan(platform, registry, st, pid: str, via: str) -> int:
         if time.time() - r["created"] > PLAN_TTL:
             st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "approval expired (30 min)")
             raise ConfigError("plan expired; make it again")
+        if r["kind"] == "restore":
+            return _approve_restore(platform, st, project, t, pid, plan, via, confirmed)
         if r["kind"] != "edge":
             raise ConfigError(f"plan {pid}: kind {r['kind']!r} is not handled by this huta")
         cf = Cloudflare(platform)
@@ -215,12 +219,16 @@ def _approve_plan(platform, registry, st, pid: str, via: str) -> int:
             st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "the edge changed since planning")
             raise ConfigError("the edge or its config changed since this plan was made; plan again")
         st.plan_transition(pid, S.PLANNED, S.APPROVED, f"approved {via}")
+        retire_buttons(platform, st, pid)
+        tell(platform, st, pid)
         try:
             _edge_apply(platform, project, st, t, cf, survey["missing"], f"plan {pid}")
         except Exception as e:  # noqa: BLE001 — every failure ends in a recorded outcome
             st.plan_transition(pid, S.APPROVED, "failed", f"{type(e).__name__}: {e}")
+            tell(platform, st, pid)
             raise
         st.plan_transition(pid, S.APPROVED, "applied", "edge applied")
+        tell(platform, st, pid)
     say("outcome: applied")
     return 0
 
@@ -520,11 +528,106 @@ def cmd_show(a):
     return 0
 
 
+def cmd_restore(a):
+    """Plan putting the data back to a restore point, for a release whose code can't run on the
+    current schema (DESIGN-v2 §2). Every write since the point is lost: the plan says so first,
+    and needs --confirm-data-loss on the CLI (or the Telegram button)."""
+    from . import data as D
+    platform, project, st = ctx(a.project)
+    t = target_of(project, a.target)
+    to = st.release(a.to)
+    if (to["project"], to["target"]) != (project.name, t.name):
+        raise ConfigError(f"release {a.to} is not {project.name}/{t.name}'s")
+    runs_on = (json.loads(to["app_toml"]).get("state") or {}).get("runs_on")
+    s = recipe.schema_now(st, t)
+    if s is None:
+        raise ConfigError("this target's data has no recorded schema: there is no restore point "
+                          "a schema points to (huta rollback plans an older image)")
+    if runs_on and s in runs_on:
+        raise ConfigError(f"release {a.to} runs on the current schema {s}: no restore is needed "
+                          "(huta rollback, or submit that commit)")
+    points = st.db.execute("SELECT * FROM restore_points WHERE project=? AND target=? AND"
+                           " kind='data' AND state='kept' ORDER BY created DESC",
+                           (project.name, t.name)).fetchall()
+    pt = next((x for x in points if (x["schema"] in runs_on if runs_on else x["schema"] is None)),
+              None)
+    if pt is None:
+        raise ConfigError(f"no kept restore point holds a schema release {a.to} runs on "
+                          f"({runs_on or 'unversioned'})")
+    if D.fingerprint(Path(pt["path"])) != pt["fingerprint"]:
+        raise ConfigError(f"restore point {pt['id']} changed since it was pinned; refusing it")
+    live = st.live(project.name, t.name)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(pt["created"]))
+    lines = [f"⚠️ RESTORES the data to the copy pinned {when} before release {pt['release_id']} "
+             f"migrated it (schema {pt['schema'] if pt['schema'] is not None else 'unversioned'}). "
+             f"EVERY WRITE SINCE {when} IS LOST.",
+             f"the data is at schema {s} now; release {a.to} ({to['sha'][:12]}) runs on "
+             f"{runs_on or 'unversioned data'}",
+             f"the target stops for the restore and stays stopped; then a release of {a.to} is "
+             "planned for approval"]
+    pid = st.new_plan(project.name, t.name, "restore", {
+        "lines": lines, "point": pt["id"], "path": pt["path"], "fingerprint": pt["fingerprint"],
+        "schema": pt["schema"], "release": a.to, "schema_now": s,
+        "planned_against_live": live["release_id"] if live else None})
+    tell(platform, st, pid)
+    ask(platform, st, pid)
+    for line in lines:
+        say(line)
+    say(f"\nrestore plan {pid}; approve with: huta approve {pid} --confirm-data-loss")
+    return 0
+
+
+def _approve_restore(platform, st, project, t, pid, plan, via, confirmed) -> int:
+    """Hold the target lock. Check the plan still holds, restore, plan the release."""
+    from . import data as D
+    if not confirmed:
+        raise ConfigError("a restore loses data: approve it with --confirm-data-loss (or the "
+                          "Telegram button)")
+    live = st.live(project.name, t.name)
+    stale = None
+    if (live["release_id"] if live else None) != plan["planned_against_live"]:
+        stale = "a release went live since planning"
+    elif recipe.schema_now(st, t) != plan["schema_now"]:
+        stale = "the data's schema changed since planning"
+    elif D.fingerprint(Path(plan["path"])) != plan["fingerprint"]:
+        stale = "the restore point changed since planning"
+    if stale:
+        st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, stale)
+        tell(platform, st, pid)
+        raise ConfigError(f"{stale}; plan the restore again")
+    st.plan_transition(pid, S.PLANNED, S.APPROVED, f"approved {via}")
+    retire_buttons(platform, st, pid)
+    tell(platform, st, pid)
+    try:
+        recipe.restore_point(platform, st, project, t, pid, plan, say)
+    except Exception as e:  # noqa: BLE001 — every failure ends in a recorded outcome
+        st.plan_transition(pid, S.APPROVED, "failed", f"{type(e).__name__}: {e}")
+        tell(platform, st, pid)
+        raise
+    st.plan_transition(pid, S.APPROVED, "applied", "data restored; the target is stopped")
+    tell(platform, st, pid)
+    to = st.release(plan["release"])
+    try:
+        rid = plan_release(platform, project, st, t, to["sha"], to["image_id"], to["image_tag"],
+                           GitHub(platform), note=f"after restore {pid}")
+    except Exception as e:  # noqa: BLE001 — the data is back; the code can be planned again
+        say(f"data restored; planning release {plan['release']} failed: {type(e).__name__}: {e}")
+        say(f"plan it with: huta submit {project.name} {t.name} {to['sha']} {to['image_id']}")
+        return 1
+    st.event("submitted-by", f"restore {pid} on {platform.host}", rid, project.name, t.name)
+    tell(platform, st, rid)
+    ask(platform, st, rid)
+    print_plan(st, rid)
+    say(f"\ndata restored. Approve the release of that code with: huta approve {rid}")
+    return 0
+
+
 def cmd_approve(a):
     platform, registry, st = ctx()
     if st.plan_row(a.release):
         return _approve_plan(platform, registry, st, a.release,
-                             "with the Telegram button" if a.via == "telegram" else "on the host")
+                             "with the Telegram button" if a.via == "telegram" else "on the host",
+                             confirmed=a.via == "telegram" or getattr(a, "confirm_data_loss", False))
     r = st.release(a.release)
     project = registry[r["project"]]
     t = target_of(project, r["target"])
@@ -621,6 +724,8 @@ def cmd_reject(a):
     if p:
         with st.lock(p["project"], p["target"]):
             st.plan_transition(a.release, S.PLANNED, S.REJECTED, "rejected on the CLI")
+        retire_buttons(platform, st, a.release)
+        tell(platform, st, a.release)
         say("rejected")
         return 0
     r = st.release(a.release)
@@ -930,6 +1035,8 @@ def cmd_push_request(a):
 def approve_minutes(r) -> int:
     """How long the approval unit may run: the release's own worst case (migration, health
     wait, drain, copy) plus margin, never less than 20 minutes (DESIGN-v2 §0)."""
+    if "kind" in r.keys():                     # a plan, not a release
+        return 6 * 60 if r["kind"] == "restore" else 20
     try:
         plan = json.loads(r["plan"])
         eff = plan.get("effective") or {}
@@ -966,7 +1073,8 @@ def cmd_press(a):
             raise ValueError("bad relay message")
         kind, rid = N.take_press(platform, st, d.get("data"), d.get("from_id"), d.get("chat_id"),
                                   d.get("message_id"))
-        r = st.release(rid)
+        pr = st.plan_row(rid)
+        r = pr or st.release(rid)
         name = f"{r['project']} → {r['target']}"
         if kind == "a":
             st.event("button", "Deploy pressed in Telegram", rid, r["project"], r["target"])
@@ -977,16 +1085,23 @@ def cmd_press(a):
             toast, ok = f"Deploying {name}…", True
         else:
             with st.lock(r["project"], r["target"]):
-                st.transition(rid, S.PLANNED, S.REJECTED, "rejected with the Telegram button")
+                if pr:
+                    st.plan_transition(rid, S.PLANNED, S.REJECTED, "rejected with the Telegram button")
+                else:
+                    st.transition(rid, S.PLANNED, S.REJECTED, "rejected with the Telegram button")
             retire_buttons(platform, st, rid)
             tell(platform, st, rid)
             toast, ok = f"Rejected {name}", True
     except N.PlanExpired as e:
         # Mark it, so status doesn't keep showing "planned" (site agent's review).
         try:
-            r = st.release(e.rid)
+            pr = st.plan_row(e.rid)
+            r = pr or st.release(e.rid)
             with st.lock(r["project"], r["target"]):
-                st.transition(e.rid, S.PLANNED, S.SUPERSEDED, "approval expired (30 min)")
+                if pr:
+                    st.plan_transition(e.rid, S.PLANNED, S.SUPERSEDED, "approval expired (30 min)")
+                else:
+                    st.transition(e.rid, S.PLANNED, S.SUPERSEDED, "approval expired (30 min)")
             retire_buttons(platform, st, e.rid)
             tell(platform, st, e.rid)
         except Exception:  # noqa: BLE001
@@ -1435,7 +1550,13 @@ def main(argv=None) -> int:
     s.add_argument("sha"); s.add_argument("image"); s.set_defaults(f=cmd_submit)
     s = sub.add_parser("show"); s.add_argument("release"); s.set_defaults(f=cmd_show)
     s = sub.add_parser("approve"); s.add_argument("release")
-    s.add_argument("--via", choices=["cli", "telegram"], default="cli"); s.set_defaults(f=cmd_approve)
+    s.add_argument("--via", choices=["cli", "telegram"], default="cli")
+    s.add_argument("--confirm-data-loss", action="store_true",
+                   help="required to approve a restore plan on the CLI")
+    s.set_defaults(f=cmd_approve)
+    s = sub.add_parser("restore"); s.add_argument("project"); s.add_argument("target")
+    s.add_argument("--to", required=True, help="the release whose code the data goes back for")
+    s.set_defaults(f=cmd_restore)
     s = sub.add_parser("reject"); s.add_argument("release"); s.set_defaults(f=cmd_reject)
     s = sub.add_parser("rollback"); s.add_argument("project"); s.add_argument("target")
     s.set_defaults(f=cmd_rollback)

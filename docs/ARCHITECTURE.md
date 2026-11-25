@@ -308,8 +308,10 @@ huta edge <project> <target> [--apply|--now]   certificate, vhost, Cloudflare ru
 huta import-dev <project> <ref>          import huta-build/<project>:<sha12> from the dev box
 huta submit <project> <target> <sha> <image>
 huta show <release> | reject <release>
-huta approve <release> [--via cli|telegram]   --via telegram: what a Deploy press runs
-huta rollback <project> <target>
+huta approve <id> [--via cli|telegram] [--confirm-data-loss]   a release, or an edge or
+                                         restore plan; restore needs --confirm-data-loss on the CLI
+huta rollback <project> <target>         refused if that code can't run on the current schema
+huta restore <project> <target> --to <release>   plan: data back to a restore point (loses writes)
 huta reconcile <project> <target>
 huta status [project [target]] | log [release]   with a target: its containers now (runstate.py)
 huta logs <project> <target> [--since --until --grep --tail --slot --release --job]
@@ -348,6 +350,12 @@ recorded one runs exclusive: stop every writer → copy (quiet) → pin the copy
 schema recorded, phase `migrated` → start, check, switch. Any failure before the switch, or a
 crash, restores the copy and the schema: nothing but the migration wrote since the copy.
 `health_timeout` (registry) sets how long a new slot has to get healthy.
+Restore plans (`huta restore`) put a kept restore point back for code that can't run on the
+current schema: stop marker, stop every slot, rsync the pin (its fingerprint checked again), the
+point's schema recorded, phase `restoring` so reconcile redoes it after a crash. The target stays
+stopped; a release of that code is planned. A release that fails on a stopped target leaves it
+stopped. Plans (edge, restore) get Telegram history messages and buttons like releases; data-loss
+and migration lines come first in every message.
 A switch back replays the vhost files Caddy served before the switch (kept in the phase record
 when the switch starts), so it needs no certificate check and no call to Cloudflare; if it
 can't be done, the release ends `needs-human` with the reason. `tests/test_crash.py` kills a

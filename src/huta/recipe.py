@@ -377,7 +377,8 @@ def _phase_set(platform: Platform, t: Target, **rec) -> None:
 # (DESIGN-v2 §0). Later milestones add their stages here together with what reconcile does.
 PHASE_VERSION = 2
 KNOWN_STAGES = {None, "switching", "checks",
-                "migrating", "migrated"}      # DESIGN-v2 §2: exclusive migrations
+                "migrating", "migrated",      # DESIGN-v2 §2: exclusive migrations
+                "restoring"}                  # DESIGN-v2 §2: restore plans
 
 
 def _phase_get(platform: Platform, t: Target) -> dict | None:
@@ -456,6 +457,29 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     if why_not:
         st.event("needs-human", f"reconcile stopped: {why_not}", None, project.name, t.name)
         raise RecipeError(f"{why_not}; the phase file is kept: needs a human")
+    ph0 = _phase_get(platform, t)
+    if ph0 and ph0.get("stage") == "restoring":
+        # An approved restore was interrupted: do it again (it is idempotent), then the target
+        # stays stopped as the plan said. The plan is recorded as applied.
+        log("reconcile: finishing an interrupted restore")
+        _finish_restore(platform, st, project, t, ph0, log)
+        p = st.plan_row(ph0["rid"])
+        if p and p["state"] == S.APPROVED:
+            st.plan_transition(ph0["rid"], S.APPROVED, "applied",
+                               "data restored (finished by reconcile); the target is stopped")
+    # Plans (not releases) of this target that were approved but never recorded an outcome: the
+    # process died. A restore that got as far as restoring counts as applied; anything else is
+    # failed (an edge change was undone by the edge journal, so plan it again).
+    for p in st.db.execute("SELECT id, kind FROM plans WHERE project=? AND target=? AND state=?",
+                           (project.name, t.name, S.APPROVED)).fetchall():
+        done = p["kind"] == "restore" and st.db.execute(
+            "SELECT 1 FROM events WHERE release_id=? AND kind='restored'", (p["id"],)).fetchone()
+        if done:
+            st.plan_transition(p["id"], S.APPROVED, "applied", "data restored (recorded by "
+                               "reconcile); the target is stopped")
+        else:
+            st.plan_transition(p["id"], S.APPROVED, "failed", "interrupted before it finished "
+                               "(reconcile); plan it again")
 
     if routed is None:
         if live and edge.adopt_pending(platform, t) is not None:
@@ -626,6 +650,8 @@ def migration(st: S.Store, t: Target, app: dict) -> dict | None:
                               "none ([state] schema): it can't tell whether its code runs on it")
         return None
     if s is not None and m < s:
+        if s in (st_cfg.get("runs_on") or []):
+            return {"from": s, "to": s, "run": False}   # older code that runs on newer data
         raise RecipeError(f"this release is for schema {m}, and the data is at {s}: going back "
                           f"needs a restore (huta restore {t.project} {t.name} --to <release>), "
                           "never a migration down")
@@ -682,6 +708,54 @@ def run_migrate(platform: Platform, st: S.Store, project: Project, t: Target, ap
     if rc != 0:
         raise RecipeError(f"the migration failed (exit {rc}): {tail[-300:]}")
     log(f"migration done: the data is at schema {mig['to']}")
+
+
+def restore_point(platform: Platform, st: S.Store, project: Project, t: Target, pid: str,
+                  plan: dict, log) -> None:
+    """Put a pinned copy back (an approved restore plan, DESIGN-v2 §2): mark the target stopped
+    (so nothing starts it on data it may not run on), stop every slot and any migration, restore,
+    record the point's schema. The phase lets reconcile finish it after a crash. Hold the target
+    lock."""
+    from . import data as D
+    if jobs_running(t):
+        raise RecipeError("a job of this target is running; restore when it has finished")
+    _phase_set(platform, t, v=PHASE_VERSION, stage="restoring", rid=pid, idle=None,
+               point=plan["point"], path=plan["path"], fingerprint=plan["fingerprint"],
+               schema=plan["schema"])
+    _finish_restore(platform, st, project, t, _phase_get(platform, t), log)
+
+
+def _finish_restore(platform, st, project, t, phase: dict, log) -> None:
+    from pathlib import Path as _P
+    from . import data as D
+    stopped_marker(platform, t).write_text(f"stopped for restore {phase['rid']}\n")
+    sh(["docker", "rm", "-f", migrate_name(t)], check=False)
+    for slot, c in slot_containers(t).items():
+        if c["running"]:
+            stop_container(c["id"])
+        if slot_containers(t).get(slot, {}).get("running"):
+            raise RecipeError(f"slot {slot} would not stop: not restoring")
+    D.restore_pin(platform, project, t, _P(phase["path"]), phase["fingerprint"], log)
+    st.set_resource_schema(t.project, t.name, "data", phase["schema"], phase["rid"])
+    st.event("restored", f"data restored to restore point {phase['point']}; the target is "
+             "stopped until a release starts it", phase["rid"], t.project, t.name)
+    _phase_clear(platform, t)
+
+
+def prune_restore_points(platform: Platform, st: S.Store, t: Target, log) -> None:
+    """Keep the newest restore points (at least 2, else keep_releases); drop older ones. Never
+    fails a release."""
+    from . import data as D
+    keep = max(2, t.keep_releases)
+    rows = st.db.execute("SELECT id FROM restore_points WHERE project=? AND target=? AND"
+                         " state='kept' ORDER BY created DESC", (t.project, t.name)).fetchall()
+    for r in rows[keep:]:
+        try:
+            D.drop_pin(platform, t, r["id"])
+            st.db.execute("UPDATE restore_points SET state='dropped' WHERE id=?", (r["id"],))
+            log(f"restore point {r['id']} dropped (keeping the newest {keep})")
+        except Exception as e:  # noqa: BLE001
+            log(f"WARNING restore point {r['id']} not dropped: {e}")
 
 
 def _reset_schema(st: S.Store, t: Target, phase: dict) -> None:
@@ -754,6 +828,9 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
         live_slot, idle = None, "a"
         images = {s: (rel["image_id"], rel["sha"]) for s in SLOTS}
     adopting = not live and edge.adopt_pending(platform, t) is not None
+    # A stopped target (huta stop, or a restore) stays stopped if this release fails: the old
+    # slot may not belong on the data any more.
+    was_stopped = stopped_marker(platform, t).exists()
     st.set_state(rid, S.RUNNING, slot=idle, msg=f"starting slot {idle} on 127.0.0.1:{port_of[idle]}")
 
     if has_data:
@@ -818,7 +895,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     except (RecipeError, D.DataError) as e:
         return _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot,
                                     stopped_old, cur, health, port_of, f"{failing}: {e}", log,
-                                    copied, mig_rec if migrated else None)
+                                    copied, mig_rec if migrated else None, was_stopped)
 
     # 2. Switch traffic: one validated, graceful caddy reload (an adopted site's old file goes
     #    in the same transaction). The intent is recorded first, with what puts the previous
@@ -849,11 +926,13 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
         return _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot,
                                     stopped_old, cur, health, port_of,
                                     f"switch refused, old config still serving: {e}", log, copied,
-                                    mig_rec if migrated else None)
+                                    mig_rec if migrated else None, was_stopped)
     st.make_live(rid, idle, live["release_id"] if live else None, f"live on slot {idle}")
     stopped_marker(platform, t).unlink(missing_ok=True)     # a release starts it again
     if mig and not mig["run"] and mig["from"] != mig["to"]:
         st.set_resource_schema(project.name, t.name, "data", mig["to"], rid)   # starts versioning
+    if migrating:
+        prune_restore_points(platform, st, t, log)
     # Until its public checks have passed, the release is not finished (grok #2).
     _phase_set(platform, t, **{**phase_rec, "stage": "checks", "copied": False})
     if adopting:
@@ -947,7 +1026,8 @@ def after_switch(platform, st, project, t, log) -> str | None:
 
 
 def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_slot, stopped_old,
-                         cur, health, port_of, why, log, copied=False, mig_rec=None) -> str:
+                         cur, health, port_of, why, log, copied=False, mig_rec=None,
+                         was_stopped=False) -> str:
     try:
         st.event("slot-state", L.slot_state(t, idle), rid, project.name, t.name)
     except Exception:  # noqa: BLE001 — a note for the human, never the outcome
@@ -980,7 +1060,7 @@ def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_
                     _reset_schema(st, t, {**ph, "migrated": True, **mig_rec, "rid": rid})
                 _phase_set(platform, t, **{**ph, "copied": False, "restored": True,
                                            "migrated": False})
-            if stopped_old:
+            if stopped_old and not was_stopped:
                 _bring_back(platform, t, live_slot, port_of[live_slot], health, cur["sha"], log)
             _phase_clear(platform, t)
         except Exception as e2:  # noqa: BLE001 — any failure here needs a human

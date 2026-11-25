@@ -372,6 +372,20 @@ class FakeHost:
         self._op("restore point pinned")
         return self.root / "pins" / rid, "fp-" + rid
 
+    def fingerprint(self, path):
+        if self._faults().get("pin_changed"):
+            return "changed"
+        return "fp-" + Path(path).name
+
+    def restore_pin(self, platform, project, t, path, fp, log):
+        if fp != self.fingerprint(path):
+            raise data.DataError("restore point changed")
+        v = self._load("data")
+        e = v[f"{t.project}/{t.name}"]
+        e["writes"] = list(e["pins"][Path(path).name])
+        self._save("data", v)
+        self._op("data restored from pin")
+
     def schema(self, t):
         st = self.store()
         try:
@@ -480,6 +494,9 @@ class FakeHost:
             patch(data, "copy_consistent", self.copy_consistent)
             patch(data, "restore_copy", self.restore_copy)
             patch(data, "pin_copy", self.pin_copy)
+            patch(data, "fingerprint", self.fingerprint)
+            patch(data, "restore_pin", self.restore_pin)
+            patch(data, "drop_pin", lambda platform, t, rid: None)
             patch(recipe, "_docker_run", self.docker_run)
             patch(Cloudflare, "ip_ranges", staticmethod(self.ip_ranges))
             patch(Cloudflare, "ensure_host_strict", lambda _self, h: f"{h}: strict")

@@ -26,7 +26,7 @@ Rules for every milestone:
 | 0b | One release description for every manifest; `order[0]` sites read it | built |
 | 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | built |
 | 1 | Gateways, `edge` knobs on every vhost | built |
-| 2 | Migrations, exclusive mode; `health_timeout`; restore plans | in progress: migrations built; rollback guard, restore plans, plan buttons next |
+| 2 | Migrations, exclusive mode; `health_timeout`; restore plans | built |
 | 3 | Several containers per target; images map | planned |
 | 4 | Postgres per target | planned |
 | 5 | External publishing (Pages, Workers) | planned |
@@ -67,7 +67,7 @@ Rules for every milestone:
   it or supersedes it if the edge changed; `huta reject`/`show` take plan ids; `--now` applies
   at once and is recorded.
 - The Telegram approval unit's limit comes from the release (health wait, migration, drain).
-- Telegram buttons for non-release plans: with milestone 2 (restore plans need them).
+- Telegram buttons for non-release plans: built with milestone 2.
 
 ## 1–6
 

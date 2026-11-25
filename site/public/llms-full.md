@@ -1052,6 +1052,13 @@ new schema; then the new code starts and is checked as usual.
   any one-writer release; going back means a restore.
 - `online = true` (migrating while the old release serves) and a result `check` are *planned*.
 
+Going back across a schema: `huta rollback` refuses code whose `runs_on` doesn't include the
+data's current schema. `huta restore <project> <target> --to <release>` plans putting back the
+restore point pinned before the migration (huta keeps the newest `keep_releases`, at least 2),
+loses every write since, and needs `--confirm-data-loss` or the Telegram button; huta checks the
+point's fingerprint at approval. The target then stays stopped until the release of that code,
+which is planned for you, is approved.
+
 ### `[[smoke]]`
 
 HTTP checks, data only. Each check is a GET; redirects are not followed (a 3xx can be the
@@ -2175,9 +2182,10 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta import-dev <project> <ref>` | import `huta-build/<project>:<sha12>` from the dev box by hand |
 | `huta submit <project> <target> <sha> <image>` | verify and plan by hand |
 | `huta show <release>` | print a plan |
-| `huta approve <release> [--via cli\|telegram]` | re-check everything and run the release. `--via telegram` is what a Deploy button press runs (as a transient systemd unit); it only changes how the approval is recorded. Default `cli` |
+| `huta approve <id> [--via cli\|telegram] [--confirm-data-loss]` | re-check everything and run the release, or apply an edge or restore plan. `--via telegram` is what a button press runs (as a transient systemd unit); it only changes how the approval is recorded. A restore plan needs `--confirm-data-loss` on the CLI |
 | `huta reject <release>` | reject a planned release |
-| `huta rollback <project> <target>` | **plan** a release of the previous image; it then needs `huta approve` |
+| `huta rollback <project> <target>` | **plan** a release of the previous image; it then needs `huta approve`. Refused when that code can't run on the data's current schema (its `runs_on` lacks it): then `huta restore` |
+| `huta restore <project> <target> --to <release>` | **plan** putting the data back to the restore point pinned before the migration that left a schema `<release>` runs on. Every write since that point is lost, and the plan says so first. Approve with `huta approve <id> --confirm-data-loss` (or the Telegram button). The target stops and stays stopped; a release of `<release>`'s code is then planned for approval |
 | `huta reconcile <project> <target>` | repair state from what the vhost actually routes to |
 | `huta status [project] [-n N]` | recent releases on the host (default 20) |
 | `huta status <project> <target> [-n N]` | that target's releases, then its containers now (as on dev) |

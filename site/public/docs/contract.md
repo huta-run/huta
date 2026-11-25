@@ -194,6 +194,13 @@ new schema; then the new code starts and is checked as usual.
   any one-writer release; going back means a restore.
 - `online = true` (migrating while the old release serves) and a result `check` are *planned*.
 
+Going back across a schema: `huta rollback` refuses code whose `runs_on` doesn't include the
+data's current schema. `huta restore <project> <target> --to <release>` plans putting back the
+restore point pinned before the migration (huta keeps the newest `keep_releases`, at least 2),
+loses every write since, and needs `--confirm-data-loss` or the Telegram button; huta checks the
+point's fingerprint at approval. The target then stays stopped until the release of that code,
+which is planned for you, is approved.
+
 ### `[[smoke]]`
 
 HTTP checks, data only. Each check is a GET; redirects are not followed (a 3xx can be the
