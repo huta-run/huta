@@ -1547,7 +1547,11 @@ def _platform_secret(a):
 def cmd_monitor(a):
     from . import monitor as M
     if a.action == "tick":
-        raise ConfigError("huta monitor tick is planned (milestone 4)")
+        platform, registry, st = ctx()
+        res = M.tick(platform, registry, st, log=say)
+        if res.get("left"):
+            say(f"tick out of time: {res['left']} target(s) wait for the next one")
+        return 0
     if not (a.project and a.target):
         raise ConfigError(f"huta monitor {a.action} <project> <target>")
     platform, project, st = ctx(a.project)

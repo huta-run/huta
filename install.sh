@@ -43,6 +43,9 @@ install -m 0644 -o root -g root systemd/huta-egress.service /etc/systemd/system/
 # The log collector (huta logs): installed, kept current and enabled.
 install -m 0644 -o root -g root systemd/huta-logs.service /etc/systemd/system/huta-logs.service
 install -m 0644 -o root -g root systemd/huta-logs.timer /etc/systemd/system/huta-logs.timer
+# The monitoring tick: installed, kept current and enabled; it does nothing without [monitoring].
+install -m 0644 -o root -g root systemd/huta-monitor.service /etc/systemd/system/huta-monitor.service
+install -m 0644 -o root -g root systemd/huta-monitor.timer /etc/systemd/system/huta-monitor.timer
 # The pull transport's units, kept current where the operator installed them.
 for u in huta-intake.service huta-intake.path; do
   if [[ -f /etc/systemd/system/$u ]]; then
@@ -55,6 +58,7 @@ if [[ -f /usr/local/sbin/huta-ssh ]]; then
 fi
 systemctl daemon-reload
 systemctl enable --now huta-logs.timer
+systemctl enable --now huta-monitor.timer
 if systemctl is-enabled --quiet huta-intake.path 2>/dev/null; then
   systemctl reset-failed huta-intake.service huta-intake.path 2>/dev/null || true
   systemctl restart huta-intake.path

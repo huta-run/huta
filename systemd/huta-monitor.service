@@ -1,0 +1,13 @@
+[Unit]
+Description=huta: probe public health, ping monitoring checks (huta monitor tick)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/huta monitor tick
+TimeoutStartSec=2min
+# root is required (huta.db, the secrets for redaction and tokens); keep the rest tight.
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=yes
+Nice=10

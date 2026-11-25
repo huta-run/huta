@@ -314,8 +314,8 @@ content.
 
 ## Monitoring (`monitor.py`)
 
-Built so far (docs/PLAN-monitoring.md milestones 1 and 2): the remote resources and the
-variables they give containers. The rest of the plan (job checks, the probe timer, the watch
+Built so far (docs/PLAN-monitoring.md milestones 1, 2 and 4): the remote resources, the
+variables they give containers, and the probe. The rest of the plan (job checks, the watch
 window, the ↩️ button) is *planned*.
 
 - `ensure` makes what a target's `monitor` grants, once, and finds it again by name
@@ -347,6 +347,18 @@ window, the ↩️ button) is *planned*.
   slot only when its compose is next written.
 - `effective` gains `monitor` (kinds, the variable names, what is missing and why, the egress
   added) only for targets with `monitor`; the plan says it as a `📈 monitoring:` line.
+- **Probe** (`huta monitor tick`, `huta-monitor.timer` every minute; nothing without
+  `[monitoring]`): one tick at a time (`<state_dir>/monitor.lock`), no target lock, 45 s for all
+  of it, targets in turn so a slow one can't starve the rest. For each target with
+  `monitor.uptime` and a live release: one GET of `https://<host><health>` per host, 5 s,
+  passing only with `ok: true` and the live sha. Skipped while a phase file or the stop marker
+  exists, and dropped if the live release, its episode or those changed during the request (a
+  held target lock alone isn't a reason: a backup holds it for hours while the site serves).
+  The last 60 samples go to `<state_dir>/monitor/<p>--<t>.probe.json`; a change between ok and
+  failing is an event (`probe-down`, `probe-up`). With `[monitoring.healthchecks]` each result
+  is also pinged to the target's uptime check (made by the tick if missing, at most hourly), and
+  with `self = true` huta pings its own check every tick.
+- `recipe.public_check` (after a switch) now also requires `ok: true`, as the slot check does.
 - **Egress:** `<dsn_host>:443` is added only for a release that gets `SENTRY_DSN` (the repo
   asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and
   compose (proxy variables, the egress host), and in the egress policy only while such a
@@ -415,7 +427,8 @@ huta revoke <box>                        push: remove a box
 huta client-bundle                       the client as a .tar.gz on stdout
 huta secret list|set|import|rm|discard <project> [NAME…] [--from <env file>]   set/import drop a staged value
 huta secret list|set|rm _platform [NAME]   the host's own tokens (never given to a container)
-huta monitor status|ensure <project> <target>   what is wired up / make what is missing
+huta monitor status|ensure <project> <target>   what is wired up (and the last probe) / make what is missing
+huta monitor tick                        probe public health, ping checks (huta-monitor.timer, every minute)
 huta data status|ensure|import|export <project> <target> [dir | path…]
 huta backup <project> <target>           consistent copy + ship (the timer runs it)
 huta job list|run <project> <target> [name]

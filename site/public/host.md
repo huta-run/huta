@@ -404,8 +404,10 @@ Targets with several components need the firewall fragment's `huta_intra` set (i
 `systemd/nftables-huta-egress.nft.example`; load it again if yours predates it, then
 `sudo huta egress sync`).
 
-Monitoring hooks (optional; built so far: the remote resources and the variables they give
-containers, `[monitor]` in the contract; the probe, job checks and watch windows are planned):
+Monitoring hooks (optional; built so far: the remote resources, the variables they give
+containers (`[monitor]` in the contract), and a probe of each monitored site every minute
+(`huta-monitor.timer`, installed and enabled by `install.sh`); job checks and watch windows are
+planned):
 if the human already runs healthchecks, Bugsink or Matomo, huta can make a check, a project or
 a site per target that asks for it (`monitor = { … }` in the registry). Each table is
 optional; leave out the services they don't run.

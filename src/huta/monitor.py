@@ -626,5 +626,218 @@ def status_lines(platform: Platform, st, project: Project, t: Target) -> list[st
             out.append(f"{kind}: healthchecks check {r['name']} ({r['state']})")
     if "uptime" in t.monitor and "uptime" not in rows and not platform.monitoring.get("healthchecks"):
         out = [x for x in out if not x.startswith("uptime:")] + [
-            "uptime: probed by huta only (no [monitoring.healthchecks]; the probe is planned)"]
+            "uptime: probed by huta only (no [monitoring.healthchecks])"]
+    if "uptime" in t.monitor:
+        ring = samples(platform, t)
+        if ring:
+            last = ring[-1]
+            when = time.strftime("%H:%M:%S", time.localtime(last.get("ts", 0)))
+            bad = sum(1 for x in ring if not x.get("ok"))
+            out.append(f"probe: last {when} " + ("ok" if last.get("ok") else
+                                                  f"FAILED ({last.get('why', '')})")
+                       + f"; {bad} of the last {len(ring)} failed")
+        else:
+            out.append("probe: no sample yet (huta-monitor.timer runs every minute)")
     return out
+
+
+# ------------------------------------------------------------------ the tick (milestone 4)
+#
+# huta-monitor.timer runs `huta monitor tick` every minute: one tick at a time (a lock outside
+# locks/), no target lock taken or waited for, 45 s for everything. It probes the public health
+# URL of every target with monitor.uptime, keeps the last samples itself, and pings the target's
+# healthchecks check when one is configured. Targets are taken in turn, so a slow one can't
+# starve the rest.
+
+TICK_BUDGET = 45
+PROBE_TIMEOUT = 5
+RING = 60
+ENSURE_RETRY = 3600        # seconds between tick attempts to make a missing check
+
+
+def samples_file(platform: Platform, t: Target):
+    return platform.state_dir / "monitor" / f"{t.project}--{t.name}.probe.json"
+
+
+def samples(platform: Platform, t: Target) -> list[dict]:
+    """The last RING probe samples, oldest first; a missing or broken file is an empty one."""
+    try:
+        v = json.loads(samples_file(platform, t).read_text())
+    except (OSError, ValueError):
+        return []
+    return [s for s in v if isinstance(s, dict)] if isinstance(v, list) else []
+
+
+def _write_json(path, value) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps(value).encode())
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def _snapshot(platform: Platform, st, t: Target):
+    """What must not change around a probe: the live release and its episode, and whether a
+    release is at work (a phase file) or the target is stopped. None: don't probe now."""
+    from .recipe import _phase_file, stopped_marker
+    live = st.live(t.project, t.name)
+    if not live or _phase_file(platform, t).exists() or stopped_marker(platform, t).exists():
+        return None
+    return (live["release_id"], live["since"])
+
+
+def probe_host(host: str, path: str, sha: str, timeout: float = PROBE_TIMEOUT) -> str | None:
+    """One request to https://<host><path>: None if it answered ok with the live sha, else a
+    short reason. Through the public edge, as a visitor would reach it."""
+    from .ext import UA
+    try:
+        status, _h, raw = transport("GET", f"https://{host}{path}",
+                                    {"User-Agent": UA, "Cache-Control": "no-cache",
+                                     "Accept-Encoding": "identity"}, None, timeout)
+    except Exception as e:  # noqa: BLE001
+        return f"no answer ({type(e).__name__})"
+    if status != 200:
+        return f"status {status}"
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return "answer is not JSON"
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        return "not ok"
+    if body.get("sha") != sha:
+        return f"reports {str(body.get('sha'))[:12]}"
+    return None
+
+
+def probe_target(platform: Platform, st, project: Project, t: Target, log=lambda _m: None):
+    """Probe every host of the target once. Returns the sample, or None when it was skipped
+    (nothing live, a release at work, stopped, or any of that changed during the probe)."""
+    from . import spec as SP
+    before = _snapshot(platform, st, t)
+    if before is None:
+        return None
+    rel = st.release(before[0])
+    app = json.loads(rel["app_toml"])
+    path = SP.public(app).get("health", "/healthz")
+    whys = [f"{h}: {w}" for h in t.hosts if (w := probe_host(h, path, rel["sha"]))]
+    if _snapshot(platform, st, t) != before:
+        return None                              # a release started or ended meanwhile
+    sample = {"ts": time.time(), "release": before[0], "since": before[1], "ok": not whys,
+              "why": redact("; ".join(whys))[:300]}
+    old = samples(platform, t)
+    _write_json(samples_file(platform, t), (old + [sample])[-RING:])
+    prev = old[-1] if old else None
+    if prev is not None and prev.get("ok") != sample["ok"]:
+        st.event("probe-up" if sample["ok"] else "probe-down",
+                 "public health answers again" if sample["ok"] else sample["why"],
+                 before[0], project.name, t.name)
+        log(f"{project.name}/{t.name}: probe {'up' if sample['ok'] else 'down: ' + sample['why']}")
+    return sample
+
+
+def _ping(platform: Platform, uuid: str, suffix: str) -> bool:
+    try:
+        status, _h, _b = transport("GET", ping_url(platform, uuid, suffix), {}, None, 5)
+        return status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@contextmanager
+def _tick_lock(platform: Platform):
+    """One tick at a time; a tick that finds the lock held yields False and does nothing."""
+    p = platform.state_dir / "monitor.lock"
+    fd = os.open(p, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def tick(platform: Platform, registry: dict, st, log=lambda _m: None) -> dict:
+    """One minute's work. Returns {"probed", "skipped", "left"} counts. Never raises for a
+    target: each one's failure is logged and the next goes on."""
+    out = {"probed": 0, "skipped": 0, "left": 0}
+    if not platform.monitoring:
+        return out
+    with _tick_lock(platform) as mine:
+        if not mine:
+            out["busy"] = 1
+            return out
+        end = time.monotonic() + TICK_BUDGET
+        state_path = platform.state_dir / "monitor" / "tick.json"
+        try:
+            state = json.loads(state_path.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        todo = sorted(((p, t) for p in registry.values() for t in p.targets.values()
+                       if t.kind != "gateway" and "uptime" in t.monitor),
+                      key=lambda pt: (pt[0].name, pt[1].name))
+        if todo:
+            k = int(state.get("cursor", 0)) % len(todo)
+            todo = todo[k:] + todo[:k]
+        hc = platform.monitoring.get("healthchecks")
+        for i, (project, t) in enumerate(todo):
+            if end - time.monotonic() < PROBE_TIMEOUT * len(t.hosts) + 1:
+                out["left"] = len(todo) - i
+                state["cursor"] = int(state.get("cursor", 0)) + i   # the rest go first next time
+                break
+            try:
+                s = probe_target(platform, st, project, t, log)
+                out["probed" if s else "skipped"] += 1
+                if s and hc:
+                    row = st.monitor(project.name, t.name, "uptime", name(platform, t))
+                    if row is None:
+                        key = f"ensure:{project.name}/{t.name}"
+                        if time.time() - float(state.get(key, 0)) > ENSURE_RETRY \
+                                and end - time.monotonic() > ENSURE_BUDGET:
+                            state[key] = time.time()
+                            ensure(platform, st, project, t, kinds=("uptime",), log=log)
+                            row = st.monitor(project.name, t.name, "uptime", name(platform, t))
+                    if row is not None:
+                        _ping(platform, row["remote_id"], "" if s["ok"] else "fail")
+            except Exception as e:  # noqa: BLE001 — one target never stops the others
+                log(f"{project.name}/{t.name}: probe failed: {type(e).__name__}")
+        else:
+            state["cursor"] = int(state.get("cursor", 0)) + 1
+        if hc and hc.get("self") and time.monotonic() < end:
+            try:
+                _self_ping(platform, st, state, end, log)
+            except Exception as e:  # noqa: BLE001
+                log(f"self check: {type(e).__name__}")
+        _write_json(state_path, state)
+    return out
+
+
+SELF_PROJECT, SELF_TARGET = "_host", "self"
+
+
+def _self_ping(platform: Platform, st, state: dict, end: float, log) -> None:
+    """huta's own check: 'the tick ran'. Made once (find-or-create), then pinged every tick."""
+    n = self_name(platform)
+    row = st.monitor(SELF_PROJECT, SELF_TARGET, "self", n)
+    if row is None:
+        if time.time() - float(state.get("ensure:self", 0)) < ENSURE_RETRY \
+                or end - time.monotonic() < 15:
+            return
+        state["ensure:self"] = time.time()
+        deadline = time.monotonic() + min(15, end - time.monotonic())
+        spec = {"name": n, "timeout": 300, "grace": 600, "tags": platform.monitoring["prefix"],
+                "desc": f"huta's monitor tick on {platform.host}"}
+        exists = hc_find(platform, n, deadline)
+        first = {} if exists else {"channels": platform.monitoring["healthchecks"]["channels"]}
+        c = hc_upsert(platform, {**spec, **first}, deadline)
+        remember_capability(platform, c["uuid"])
+        st.set_monitor(SELF_PROJECT, SELF_TARGET, "self", n, c["uuid"], spec)
+        row = st.monitor(SELF_PROJECT, SELF_TARGET, "self", n)
+    _ping(platform, row["remote_id"], "")

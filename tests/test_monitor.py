@@ -1086,3 +1086,178 @@ class GrantRevoked(Env):
             recipe.reconcile(self.platform, None, self.registry["notes"],
                              self.registry["notes"].targets["prod"], print)
             sync.assert_not_called()             # v1 targets: as before
+
+
+# ------------------------------------------------------------------ milestone 4
+
+class Tick(unittest.TestCase):
+    """huta monitor tick: the probe, its samples, skips, budget and pings."""
+
+    def setUp(self):
+        from huta import cfg, monitor as M, runtime, store
+        self.M = M
+        self.dir = Path(tempfile.mkdtemp(prefix="huta-tick-"))
+        self.etc = etc_copy()
+        plat, reg = load(self.etc)
+        self.platform = dataclasses.replace(plat, state_dir=self.dir / "state",
+                                            secrets_dir=self.etc / "secrets",
+                                            monitoring={"prefix": "huta", "healthchecks": None,
+                                                        "bugsink": None, "matomo": None})
+        self.project = reg["hello"]
+        self.t = dataclasses.replace(self.project.targets["prod"], monitor={"uptime": True})
+        self.project.targets["prod"] = self.t
+        self.registry = {"hello": self.project}
+        self.patches = [mock.patch.object(store, "assert_root_dir", lambda _p: None),
+                        mock.patch.object(runtime, "_root_dir", _no_uid_root_dir),
+                        mock.patch.object(M, "read_secret", _plain_read_secret),
+                        mock.patch.object(cfg, "read_secret", _plain_read_secret),
+                        mock.patch.object(cfg, "_SECRETS", [])]
+        for p in self.patches:
+            p.start()
+        self.st = store.Store(self.platform.state_dir)
+        from tests._util import app_toml
+        self.rid = self.st.new_release(project="hello", target="prod", sha="a" * 40,
+                                       image_id="i", image_tag="t",
+                                       app_toml=json.dumps(app_toml("hello")), plan={},
+                                       plan_hash="0", built_by="test")
+        self.st.set_state(self.rid, "live")
+        self.st.set_live("hello", "prod", self.rid, "a")
+        self.health = {"ok": True, "sha": "a" * 40}
+        self.calls = []
+        self.fm = FM.FakeMonitoring(self.dir / "mon.json")
+
+    def tearDown(self):
+        self.st.db.close()
+        for p in reversed(self.patches):
+            p.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        shutil.rmtree(self.etc, ignore_errors=True)
+
+    def transport(self, method, url, headers, body, timeout=10):
+        self.calls.append(url)
+        if url.startswith("https://") and "/ping/" not in url and "/api/" not in url:
+            if isinstance(self.health, Exception):
+                raise self.health
+            return 200, {}, json.dumps(self.health).encode()
+        return self.fm.handle(method, url, headers, body, timeout)
+
+    def tick(self):
+        with mock.patch.object(self.M, "transport", self.transport):
+            return self.M.tick(self.platform, self.registry, self.st)
+
+    def test_probe_ok(self):
+        self.assertEqual(self.tick()["probed"], 1)
+        s = self.M.samples(self.platform, self.t)
+        self.assertEqual([x["ok"] for x in s], [True])
+        self.assertEqual(s[0]["release"], self.rid)
+        self.assertEqual(self.calls, [f"https://{h}/healthz" for h in self.t.hosts])
+
+    def test_ok_and_sha_both_required(self):
+        for health, why in (({"ok": False, "sha": "a" * 40}, "not ok"),
+                            ({"ok": True, "sha": "b" * 40}, "reports bbbbbbbbbbbb"),
+                            (OSError("refused"), "no answer")):
+            with self.subTest(why=why):
+                self.health = health
+                self.tick()
+                self.assertIn(why, self.M.samples(self.platform, self.t)[-1]["why"])
+
+    def test_transitions_are_events(self):
+        self.tick()
+        self.health = {"ok": False}
+        self.tick()
+        self.tick()
+        self.health = {"ok": True, "sha": "a" * 40}
+        self.tick()
+        kinds = [e["kind"] for e in reversed(self.st.events(limit=20))
+                 if e["kind"].startswith("probe-")]
+        self.assertEqual(kinds, ["probe-down", "probe-up"])
+
+    def test_skips_a_release_at_work_and_a_stopped_target(self):
+        from huta import recipe
+        for marker in (recipe._phase_file(self.platform, self.t),
+                       recipe.stopped_marker(self.platform, self.t)):
+            with self.subTest(marker=marker.name):
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("{}")
+                self.assertEqual(self.tick()["skipped"], 1)
+                marker.unlink()
+        self.assertEqual(self.M.samples(self.platform, self.t), [])
+        self.assertEqual(self.calls, [])
+
+    def test_held_target_lock_does_not_skip(self):
+        with self.st.lock("hello", "prod"):
+            self.assertEqual(self.tick()["probed"], 1)
+
+    def test_change_during_probe_drops_the_sample(self):
+        real = self.transport
+
+        def switch(*a, **k):
+            from huta import store as S
+            out = real(*a, **k)
+            self.st.set_live("hello", "prod", self.rid, "b")     # a new episode
+            return out
+        with mock.patch.object(self.M, "transport", switch):
+            res = self.M.tick(self.platform, self.registry, self.st)
+        self.assertEqual(res["skipped"], 1)
+        self.assertEqual(self.M.samples(self.platform, self.t), [])
+
+    def test_ring_is_capped(self):
+        f = self.M.samples_file(self.platform, self.t)
+        self.M._write_json(f, [{"ts": 1, "ok": True}] * 70)
+        self.tick()
+        self.assertEqual(len(self.M.samples(self.platform, self.t)), self.M.RING)
+        f.write_text("not json")
+        self.tick()
+        self.assertEqual(len(self.M.samples(self.platform, self.t)), 1)
+
+    def test_one_tick_at_a_time(self):
+        with self.M._tick_lock(self.platform) as mine:
+            self.assertTrue(mine)
+            self.assertEqual(self.tick().get("busy"), 1)
+
+    def test_budget_and_turns(self):
+        many = {}
+        for i in range(6):
+            t = dataclasses.replace(self.t, name=f"t{i}", hosts=[f"t{i}.example.org"])
+            many[t.name] = t
+            self.st.set_live("hello", t.name, self.rid, "a")
+        project = dataclasses.replace(self.project, targets=many)
+        reg = {"hello": project}
+        clock = [0.0]
+
+        def slow(*a, **k):
+            clock[0] += 2
+            return self.transport(*a, **k)
+        with mock.patch.object(self.M, "transport", slow), \
+                mock.patch.object(self.M.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(self.M, "TICK_BUDGET", 7):
+            first = self.M.tick(self.platform, reg, self.st)
+            self.assertGreater(first["left"], 0)
+            seen = [c.split("/")[2] for c in self.calls]
+            self.calls.clear()
+            clock[0] = 100.0
+            self.M.tick(self.platform, reg, self.st)
+            nxt = [c.split("/")[2] for c in self.calls]
+        self.assertNotEqual(seen[0], nxt[0])            # the ones left out go first
+
+    def test_without_monitoring_nothing(self):
+        self.platform = dataclasses.replace(self.platform, monitoring={})
+        self.assertEqual(self.tick(), {"probed": 0, "skipped": 0, "left": 0})
+        self.assertEqual(self.calls, [])
+
+    def test_pings_a_check_when_configured(self):
+        pdir = self.etc / "secrets" / "_platform"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "HEALTHCHECKS_API_KEY").write_text(FM.HC_KEY)
+        self.platform.monitoring["healthchecks"] = {
+            "url": "http://127.0.0.1:8000", "ping": "https://hc.example.org/ping", "host": "",
+            "channels": "*", "self": True}
+        self.tick()
+        hc = self.fm.state()["hc"]
+        names = sorted(c["name"] for c in hc["checks"].values())
+        self.assertEqual(names, ["huta__self_host.example.org", "huta_hello_prod"])
+        self.assertEqual(sorted(p["action"] for p in hc["pings"]), ["0", "0"])
+        self.health = {"ok": False}
+        self.tick()
+        self.assertIn("fail", [p["action"] for p in self.fm.state()["hc"]["pings"]])
+        self.assertEqual(self.fm.creates("hc"), 2)

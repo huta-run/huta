@@ -502,9 +502,12 @@ def public_check(host: str, path: str, sha: str, timeout: float = 30) -> None:
             body = _get_json(f"https://{host}{path}", min(10, left),
                              {"Cache-Control": "no-cache", "User-Agent": UA,
                               "Accept-Encoding": "identity"})
-            if body.get("sha") == sha:
+            # ok, as the slot's own health check requires (milestone 4 of the monitoring plan):
+            # an app that says it's unhealthy doesn't pass by reporting the right sha.
+            if body.get("ok") is True and body.get("sha") == sha:
                 return
-            last = f"reports {str(body.get('sha'))[:12]}"
+            last = (f"reports {str(body.get('sha'))[:12]}" if body.get("sha") != sha
+                    else "reports not ok")
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {e}"[:120]
         time.sleep(min(2, max(0, deadline - time.monotonic())))
