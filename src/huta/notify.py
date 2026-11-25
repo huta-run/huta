@@ -70,6 +70,9 @@ def history_note(p: dict) -> tuple[str, bool]:
         "behind": f"goes back {n('behind') if 'behind' in h else '?'} from the live {live}",
         "diverged": f"drops {n('behind') if 'behind' in h else '?'} of the live {live} "
                     f"and adds {n('ahead') if 'ahead' in h else '?'}",
+        "unrelated": (f"can't compare: the live {live} is not in the repo (it moved, or its "
+                      "history was replaced)" if h.get("live_in_repo") is False else
+                      f"can't compare: shares no history with the live {live}"),
     }.get(h.get("status"), f"couldn't compare with the live {live}: {h.get('error', '?')}")
     # A rollback is the owner's explicit choice of an older image: say what it is, whatever the
     # comparison shows (rolling back twice can be "ahead"), with no warning (codex #5).

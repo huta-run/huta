@@ -2467,8 +2467,10 @@ plan 1a2b3c4d · myapp → prod · state planned
 - from → to: the live sha (or `(nothing live)`) and the new sha, and how they relate on GitHub:
   `N commits ahead of the live …`, `the same commit as the live … (a redeploy)`, or a warning:
   `⚠️ DOWNGRADE: goes back N commits from the live …`, `⚠️ NOT BASED ON LIVE: drops N commits
-  of the live … and adds M`, `⚠️ couldn't compare with the live …`. huta only warns; whether
-  going back is right is the approver's call. A rollback always starts that line with
+  of the live … and adds M`, `⚠️ can't compare: the live … is not in the repo (it moved, or its
+  history was replaced)`, `⚠️ can't compare: shares no history with the live …`, or
+  `⚠️ couldn't compare with the live …: <error>` when GitHub couldn't be asked. huta only warns;
+  whether going back is right is the approver's call. A rollback always starts that line with
   `rollback: ` and never warns, whatever the comparison shows;
 - the image name and immutable image id the host imported;
 - the effective runtime config, decided by the host: env and secret names, egress, upstreams,

@@ -24,7 +24,8 @@ dev is trusted to *ask*, never to act. The host trusts only what it checks itsel
    with success), read
    `deploy/app.toml` from git at that sha, check the image (id, labels, non-root, linux/amd64),
    compute the effective config, compare the sha with the live one (GitHub compare: ahead,
-   behind, diverged, identical), record a plan with a hash. A plan that goes back or isn't based
+   behind, diverged, identical; or unrelated, when the live commit isn't in the repo or shares
+   no history with it), record a plan with a hash. A plan that goes back or isn't based
    on live carries a warning (plan text, Telegram, the submit answer's `warning`); it never
    refuses: going back on purpose is the owner's call. A refused submit untags its image.
 4. **approve** (owner): with the ✅ Deploy button on the release's message in the Telegram topic, or

@@ -66,6 +66,14 @@ class GitHub:
         bad = ExtError(f"{repo}: compare {base[:12]}...{head[:12]} failed")
         if not isinstance(r, dict):
             raise bad
+        if r.get("status") not in ("ahead", "behind", "diverged", "identical"):
+            # GitHub answers 404 both when base isn't in the repo (it moved, or its history was
+            # replaced) and when the two commits share no history. Say which, in words.
+            if not self.has_commit(repo, base):
+                return {"status": "unrelated", "live_in_repo": False}
+            if "no common ancestor" in str(r.get("message", "")).lower():
+                return {"status": "unrelated", "live_in_repo": True}
+            raise bad
         st, a, b = r.get("status"), r.get("ahead_by"), r.get("behind_by")
         if st not in ("ahead", "behind", "diverged", "identical") or not all(
                 type(x) is int and 0 <= x < 10**7 for x in (a, b)):
@@ -75,6 +83,17 @@ class GitHub:
                               "diverged": (True, True), "identical": (False, False)}[st]:
             raise bad
         return {"status": st, "ahead": a, "behind": b}
+
+    def has_commit(self, repo: str, sha: str) -> bool:
+        """True if the repo has this commit; False only on a clear 404 or 422 from GitHub."""
+        try:
+            _req("GET", f"{self.API}/repos/{repo}/commits/{urllib.parse.quote(sha)}", self._h,
+                 raw=True)
+        except ExtError as e:
+            if str(e).endswith(("HTTP 404", "HTTP 422")):
+                return False
+            raise
+        return True
 
     def read_file(self, repo: str, path: str, sha: str) -> str:
         h = dict(self._h, Accept="application/vnd.github.raw")
