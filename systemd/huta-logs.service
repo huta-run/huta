@@ -1,0 +1,14 @@
+[Unit]
+Description=huta: store new slot output, redacted (huta logs)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/huta logs-collect
+TimeoutStartSec=10min
+# root is required (Docker's log files, the secrets for redaction); keep the rest tight.
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=yes
+Nice=10
+IOSchedulingClass=idle

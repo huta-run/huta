@@ -1,0 +1,17 @@
+# huta.run as a huta project. Data only: the host decides users, ports and hosts.
+schema = 1
+project = "huta-site"
+order = ["web"]          # top-level keys must come before the first [table] in TOML
+
+[images.web]
+dockerfile = "site/Dockerfile"
+context = "site"
+
+[components.web]
+image = "web"
+kind = "http"
+port = 8080
+health = "/healthz"
+
+[state]
+kind = "none"

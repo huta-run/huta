@@ -1,0 +1,24 @@
+# static-web-server config. The app's own HTTP rules live here, in the image, not in host Caddy.
+[general]
+host = "0.0.0.0"
+port = 8080
+root = "/public"
+log-level = "info"
+compression = true
+cache-control-headers = true
+directory-listing = false
+
+[advanced]
+
+[[advanced.headers]]
+source = "**"
+[advanced.headers.headers]
+X-Content-Type-Options = "nosniff"
+Referrer-Policy = "strict-origin-when-cross-origin"
+X-Served-By = "huta-hello"
+
+[[advanced.headers]]
+source = "/healthz"
+[advanced.headers.headers]
+Content-Type = "application/json"
+Cache-Control = "no-store"

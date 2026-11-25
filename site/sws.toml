@@ -1,0 +1,117 @@
+# static-web-server 2.33 config for huta.run. The site's own HTTP rules live here, in the image,
+# not in host Caddy.
+#
+# Strategy: no catch-all "**" rule. Live testing showed sws 2.33 does not merge several matching
+# [[advanced.headers]] rules the way we assumed (headers from one rule went missing). So the
+# rules are written per file type, and EVERY rule repeats the full security header set. Paths
+# that two rules can both match ("/" and "/index.html") get identical security headers, so the
+# result doesn't depend on which rule wins. Every file the site serves matches one rule:
+# /, *.html, *.md, *.txt, *.css, *.svg, *.png, /healthz. A new file type needs its own rule.
+
+[general]
+host = "0.0.0.0"
+port = 8080
+root = "/public"
+log-level = "info"
+compression = true
+# Cache-Control is set explicitly below, per file type.
+cache-control-headers = false
+directory-listing = false
+page404 = "/public/404.html"
+
+[advanced]
+
+# The landing page and other HTML.
+[[advanced.headers]]
+source = "/"
+[advanced.headers.headers]
+Content-Type = "text/html; charset=utf-8"
+Cache-Control = "public, max-age=300"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"
+
+[[advanced.headers]]
+source = "**/*.html"
+[advanced.headers.headers]
+Content-Type = "text/html; charset=utf-8"
+Cache-Control = "public, max-age=300"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"
+
+# Agent docs: markdown and plain text, with an explicit charset.
+[[advanced.headers]]
+source = "**/*.md"
+[advanced.headers.headers]
+Content-Type = "text/markdown; charset=utf-8"
+Cache-Control = "public, max-age=300"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"
+
+[[advanced.headers]]
+source = "**/*.txt"
+[advanced.headers.headers]
+Content-Type = "text/plain; charset=utf-8"
+Cache-Control = "public, max-age=300"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"
+
+# Not fingerprinted, so cached for an hour only. Content-Type comes from sws (text/css,
+# image/svg+xml).
+[[advanced.headers]]
+source = "**/*.{css,svg}"
+[advanced.headers.headers]
+Cache-Control = "public, max-age=3600"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"
+
+# Raster brand images (brand/og.png for link previews). Content-Type comes from sws (image/png).
+[[advanced.headers]]
+source = "**/*.png"
+[advanced.headers.headers]
+Cache-Control = "public, max-age=3600"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"
+
+# The release check: never cached anywhere (the host compares the sha after the switch).
+[[advanced.headers]]
+source = "/healthz"
+[advanced.headers.headers]
+Content-Type = "application/json"
+Cache-Control = "no-store"
+Strict-Transport-Security = "max-age=31536000"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+Content-Security-Policy = "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+Cross-Origin-Opener-Policy = "same-origin"

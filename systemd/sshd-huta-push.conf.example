@@ -1,0 +1,33 @@
+# sshd drop-in for huta's push transport (example; adapt the address range).
+# One system user per dev box: huta-<box>, member of the group huta-push, no password, no sudo,
+# no docker group. Every login runs huta-ssh, which hands one request to huta-push.socket; the
+# host learns the box from the user's uid.
+#
+# Boxes are added and removed with huta, not here:
+#   sudo huta enroll <box> --from <box ip> --pubkey '<key line>'   # user, pinned key, registry login
+#   sudo huta revoke <box>
+# `huta enroll` writes /var/lib/huta-ssh/<box>/.ssh/authorized_keys (root-owned, 0644) as
+#   restrict,from="<box ip>" ssh-ed25519 AAAA… huta-push@<box>
+# so each key works only from its box's address. This file never needs a per-box change.
+#
+# Allow every push user, but only from the tailnet (or whatever private range the boxes use).
+# WARNING: as soon as any AllowUsers line exists, sshd lets in ONLY the users it lists. So put
+# the pattern on the host's existing AllowUsers line, next to the admin users, and never add
+# an AllowUsers line that lists only huta-* (that would lock out everyone else):
+#   AllowUsers <existing users> huta-*@100.64.0.0/10
+# The line is commented out here for that reason.
+#AllowUsers <existing users> huta-*@100.64.0.0/10
+
+Match User huta-*
+    ForceCommand /usr/local/sbin/huta-ssh
+    PermitTTY no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitUserRC no
+    LogLevel VERBOSE
+
+# End the block explicitly: some sshd versions would apply it to everything after the include.
+Match all

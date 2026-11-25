@@ -1,0 +1,14 @@
+{
+  "name": "openclaw-huta-press",
+  "version": "0.1.0",
+  "description": "Relays Telegram inline-button presses for huta (callback_data huta:...) to huta's local press socket",
+  "type": "module",
+  "private": true,
+  "main": "./index.js",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.9.4"
+  }
+}

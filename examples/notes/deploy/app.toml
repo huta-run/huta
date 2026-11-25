@@ -1,0 +1,35 @@
+# notes: the huta v1 example. Data only: the host decides users, ports, hosts, egress, secrets.
+schema = 1
+project = "notes"
+order = ["web"]
+
+[images.web]
+dockerfile = "examples/notes/Dockerfile"
+context = "examples/notes"
+
+[components.web]
+image = "web"
+kind = "http"
+port = 8080
+health = "/healthz"
+data = "/data"                 # the target's data volume is mounted here
+concurrent_safe = true         # each slot writes its own file (hits.<slot>.log); the host must allow it too
+
+[state]
+kind = "data"
+
+[[smoke]]
+path = "/"
+status = 200
+contains = "<title>notes</title>"
+headers = { "content-security-policy" = "frame-ancestors 'none'" }
+
+[[smoke]]
+path = "/nope"
+status = 404
+
+[[jobs]]
+name = "rotate"
+cmd = ["python", "/app/app.py", "rotate"]
+schedule = "*-*-* 04:20:00"
+timeout = "5m"

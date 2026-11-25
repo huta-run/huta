@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>huta · agents build, your server checks, you approve</title>
+<meta name="description" content="huta lets coding agents release to a server you own without a shell on it. The agent builds an image and asks, the server checks every claim, you approve, and the new release is verified on an idle slot before traffic switches to it.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#C6D1CA">
+<link rel="canonical" href="https://huta.run/">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/brand/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="text/markdown" href="/index.md" title="This page as Markdown">
+<link rel="alternate" type="text/markdown" href="/llms.md" title="llms.md">
+<link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="huta">
+<meta property="og:url" content="https://huta.run/">
+<meta property="og:title" content="huta · agents build, you approve">
+<meta property="og:description" content="Coding agents release to a server you own without a shell on it. The server checks, you approve, the release is switched in on a verified slot.">
+<meta property="og:image" content="https://huta.run/brand/og.png">
+<meta property="og:image" content="https://huta.run/brand/og.svg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="huta: agents build, you approve">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="wrap" id="main">
+  <div class="bar"><a class="logo" href="/" aria-label="huta"><svg viewBox="0 0 64 56" aria-hidden="true">
+      <polygon points="9.1,36 32,49.2 32,53 9.1,39.8" fill="#182B26"/><polygon points="54.9,36 32,49.2 32,53 54.9,39.8" fill="#10201C"/><polygon points="32,22.8 54.9,36 32,49.2 9.1,36" fill="#2B4A42"/>
+      <polygon points="16.8,21.7 24.4,26.1 24.4,39.3 16.8,34.9" fill="#DCD7C6"/><polygon points="37.7,18.4 24.4,26.1 24.4,39.3 37.7,31.6" fill="#C2BCA8"/><polygon points="30.1,14 37.7,18.4 24.4,26.1 16.8,21.7" fill="#F7F4EA"/>
+      <polygon points="26.3,27.2 33.9,31.6 33.9,44.8 26.3,40.4" fill="#8AAB9C"/><polygon points="47.2,23.9 33.9,31.6 33.9,44.8 47.2,37.1" fill="#73978A"/><polygon points="39.6,19.5 47.2,23.9 33.9,31.6 26.3,27.2" fill="#A9C4B7"/>
+      <polygon points="29.1,7.95 40.6,6.85 23.4,16.75 12,17.85" fill="#3F6A5E"/><polygon points="40.6,6.85 52,21.15 34.9,31.05 23.4,16.75" fill="#243E38"/>
+    </svg><span>huta</span></a><span>Agents: read <a href="/llms.md">/llms.md</a> first. New server? <a href="/host.md">/host.md</a>. Installing the client? <a href="/install.md">/install.md</a></span><span><a href="/index.md">view as markdown</a></span></div>
+
+  <div class="walk">
+    <ol class="steps">
+      <li class="step" id="s1">
+        <div class="k"><i>dev</i>on any machine: a dev box, a laptop</div>
+        <h2>An agent builds an image and asks.</h2>
+        <p>That is the only thing it can send. It has no shell on your server and writes no config there.</p>
+        <div class="d">huta pack · huta submit prod</div>
+      </li>
+      <li class="step" id="s2">
+        <div class="k"><i>host</i>at the gate</div>
+        <h2>Your server checks every claim itself.</h2>
+        <p>It fetches the commit from GitHub, reads the manifest from that commit, and compares the image against it.</p>
+        <div class="d">on main ✓ · CI green ✓ · image id, labels, user ✓</div>
+      </li>
+      <li class="step you" id="s3">
+        <div class="k"><i>you</i>at the barrier</div>
+        <h2>Then it waits for you.</h2>
+        <p>A plan says exactly what would change. Nothing moves until you approve: one tap in Telegram, or one command.</p>
+                <div class="tg" role="img" aria-label="The release's message arrives in Telegram with Deploy and Reject buttons; after the tap the buttons go and the message says the release is being checked.">
+          <div class="tg-top"><div class="tg-av"><div class="tg-ping"></div></div><div><div class="tg-name">Releases</div><div class="tg-sub">huta · bot</div></div><div class="tg-badge">1</div></div>
+          <div class="tg-body">
+            <div class="tg-msg">
+              <p class="from">huta</p>
+              <p>🚀 <b>myapp → prod</b> · <span class="m">1a2b3c4d</span></p>
+              <p><span class="m">9f8e7d6 → 0123456</span> · code-only</p>
+              <p>from mybox (push) · main ✓ · CI ✓</p>
+              <p class="tg-st"><span class="st-wait"><span class="dotw"></span>waiting for approval · until 14:32</span><span class="st-run">✓ approved by you · deploying to slot b</span></p>
+              <p class="tm">14:02</p>
+            </div>
+            <div class="tg-keys"><span class="tg-go">Deploy</span><span>Reject</span><i class="tg-tap"></i></div>
+          </div>
+        </div>
+        <div class="d">or: sudo huta approve 1a2b3c4d · the plan expires in 30 minutes</div>
+      </li>
+      <li class="step" id="s4">
+        <div class="k"><i>host</i>in the empty bay</div>
+        <h2>The new release proves itself first.</h2>
+        <p>It starts where no visitor can reach it and must answer with the commit it was built from.</p>
+        <div class="d">slot b started · /healthz = 0123456 · no traffic yet</div>
+      </li>
+      <li class="step" id="s5">
+        <div class="k"><i>host</i>on the road</div>
+        <h2>Visitors move over without a gap.</h2>
+        <p>One graceful reload: new requests go to the new release, and requests already in flight finish on the old one. Then it stops, and is kept so it can be put back.</p>
+        <div class="d">vhost switched · slot a drained 10 s · outcome: live</div>
+      </li>
+    </ol>
+
+    <div class="stagewrap" role="img" aria-label="A small works seen from a corner: a crate travels a belt, passes a checking gate, waits at a barrier, enters the second bay under a glass roof, and the visitors' road switches to it.">
+      <div class="fit"><div class="world">
+        <div class="map"></div>
+        <div class="sh sh-bays"></div>
+        <div class="b m-belt p-belt"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-bench"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-screen"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-post1"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-post2"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-lintel"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok p-lit an a-lit"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-beam p-beam an a-beam"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-bpost"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-blamp a-wait"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-arm an a-arm"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-belt p-wire"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-pulse an a-pulse"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok p-blamp an a-open"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-desk"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-belt p-stem an a-stem"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-key an a-key"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok p-keyok an a-keyok"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-baya"><i class="t">a</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-sage p-bayb"><i class="t">b</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-old an a-old"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-road p-roada"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-road p-roadb"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-roada lit an a-was"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-roadb lit an a-live"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-trunk"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-sw an a-sw"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-hub"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-dot a-va an a-was"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-dot a-va d2 an a-was"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-dot a-va d3 an a-was"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-dot a-vb an a-live"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-dot a-vb d2 an a-live"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine p-dot a-vb d3 an a-live"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-off p-bca"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-off p-bcb"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-bca an a-was"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok p-bcb an a-live"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber p-crate an a-crate"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-rp1"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-rp2"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-rp3"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone p-rp4"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="roof r2"></div>
+        <div class="roof r1"></div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="sect" id="setup">
+    <p class="k">before the first release</p>
+    <h2>Setting up the server is one line too.</h2>
+  </div>
+
+  <div class="walk setup">
+    <ol class="steps">
+      <li class="step" id="h1">
+        <div class="k"><i>vps</i>a fresh server, one agent on it</div>
+        <h2>Start from an empty server.</h2>
+        <p>Install any coding agent on a new VPS and give it one line. It reads the setup guide from huta.run and works from there.</p>
+        <div class="d">Set this server up for huta. Follow https://huta.run/host.md</div>
+      </li>
+      <li class="step" id="h2">
+        <div class="k"><i>agent</i>surveying the plot</div>
+        <h2>It looks before it touches anything.</h2>
+        <p>A read-only pass first: architecture, virtualization, cgroups, loop devices, Python, open ports, firewall, ssh. A blocker stops it, with the reason.</p>
+        <div class="d">x86_64 ✓ · kvm ✓ · cgroup2 ✓ · loop ✓</div>
+      </li>
+      <li class="step you" id="h3">
+        <div class="k"><i>you</i>at the safe</div>
+        <h2>You answer, and type the keys yourself.</h2>
+        <p>Your domains, a name for the host, your tailnet. The GitHub and Cloudflare tokens go in at a hidden prompt in your own session; the agent never sees them. Then Docker, Caddy and Tailscale go down as the ground.</p>
+        <div class="d">GITHUB_TOKEN set · Cloudflare token active</div>
+      </li>
+      <li class="step" id="h4">
+        <div class="k"><i>agent</i>at the fence</div>
+        <h2>Walls go up with a way back.</h2>
+        <p>Every firewall and ssh change is applied with a five-minute undo, and stays only once your new login works. Nobody gets locked out.</p>
+        <div class="d">nft -c ✓ · sshd -t ✓ · new session ✓ · undo cancelled</div>
+      </li>
+      <li class="step" id="h5">
+        <div class="k"><i>host</i>ready for releases</div>
+        <h2>Then huta moves in.</h2>
+        <p>Installed from a commit you have seen, containers fenced off behind the egress guard, and a registry and an ssh door on the tailnet for your dev boxes. Each of those then runs install.md.</p>
+        <div class="d">huta check · registry ok · huta edge myapp prod --apply</div>
+      </li>
+    </ol>
+
+    <div class="stagewrap" role="img" aria-label="An empty plot: an agent arrives, a beam surveys the ground and four checks light up, two keys drop into a safe, foundations for Docker, Caddy and Tailscale go down, a fence rises with a lamp that turns from amber to green, then the two bays, a gate and a road appear and visitors start to arrive.">
+      <div class="fit"><div class="world">
+        <div class="map"></div>
+        <div class="b m-slab q-plot"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine q-agent sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-ascr sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-off q-c1"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok q-c1 sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-off q-c2"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok q-c2 sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-off q-c3"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok q-c3 sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-off q-c4"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok q-c4 sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-beam q-beam s-beam"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine q-safe sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-k1 s-key"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-k2 s-key"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-belt q-dock sd"><i class="t">docker</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-cad sd"><i class="t">caddy</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-sage q-ts sd"><i class="t">tailnet</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-fb sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-fl sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-ff sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-fr1 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-fr2 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine q-up sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-ul sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok q-ulok sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-ba sd"><i class="t">a</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-sage q-bb sd"><i class="t">b</i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-rp1 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-rp2 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-rp3 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-rp4 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-crate sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-g1 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-g2 sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-bone q-gl sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-ok q-glit sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-road q-road sd"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-roadlit sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine q-v sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine q-v d2 sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-pine q-v d3 sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="b m-amber q-pkt sf"><i class="t"></i><i class="f"></i><i class="r"></i></div>
+        <div class="q-roof sr"></div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="after">
+    <div>
+      <h3>Say it to your agent.</h3>
+      <div class="say">
+        <div class="say-row"><b>in a project</b><span>Get this project ready to deploy with huta. Start at https://huta.run/llms.md</span></div>
+        <div class="say-row"><b>on a new server</b><span>Set this server up for huta. Follow https://huta.run/host.md</span></div>
+        <div class="say-row"><b>on your machine</b><span>Set this machine up to release with huta. Follow https://huta.run/install.md</span></div>
+      </div>
+      <p class="say-note">Click a line to select it, then paste it into Claude Code, Codex or any agent with a shell.</p>
+    </div>
+    <div>
+      <h3>Every approved release ends in a recorded outcome.</h3>
+      <dl class="out">
+        <div><dt>live</dt><dd>Checked on its own slot, then switched.</dd></div>
+        <div><dt>nothing-activated</dt><dd>Traffic never moved. What was live keeps serving.</dd></div>
+        <div><dt>rolled-back</dt><dd>Public checks failed after the switch. Traffic went back.</dd></div>
+        <div><dt>needs-human</dt><dd>huta stopped and said why.</dd></div>
+      </dl>
+    </div>
+    <div>
+      <h3 id="status">What exists today</h3>
+      <p class="lead">Running in production on one server. Anything not listed as available does not exist yet.</p>
+      <div class="cols">
+        <ul class="have">
+          <li>One HTTP container per project, on two slots</li>
+          <li>Secrets and settings from the server; a dev box can send a secret's value, which goes live with the next approved release</li>
+          <li>Outbound HTTPS by hostname allowlist, and named host services; no DNS or route out otherwise</li>
+          <li>A data volume per target, consistent backups shipped off the server, import and export on the server</li>
+          <li>Scheduled jobs in the live release's image</li>
+          <li>Smoke checks before the switch, public checks after it, automatic switch back</li>
+          <li>Taking over a live site without a gap</li>
+        </ul>
+        <ul class="have">
+          <li>From a dev box on the same server (pull), or from any enrolled machine (push)</li>
+          <li>One-tap Deploy and Reject in Telegram, owner only; <code>huta approve</code> on the server always works</li>
+          <li>Read-only debugging for agents: <code>status</code>, <code>log</code>, <code>jobs</code>, <code>logs</code>, <code>egress-log</code>, <code>traffic</code>, <code>crashes</code>, <code>diag</code></li>
+          <li>Caddy as the edge with generated vhosts, Cloudflare Origin CA certificates</li>
+          <li>Crash recovery with <code>huta reconcile</code>; rollback as an approved plan</li>
+        </ul>
+      </div>
+      <p class="lead">Planned, not built:</p>
+      <ul class="plan">
+        <li>Several containers per project, Postgres, migrations, gateways, external publishing</li>
+        <li><code>huta snapshot</code>: a sanitized copy of data for debugging</li>
+        <li>Unattended releases</li>
+        <li>Monitoring hooks; TLS without Cloudflare</li>
+      </ul>
+    </div>
+    <div>
+      <h3 id="docs">Docs, written for agents</h3>
+      <ul class="docs">
+        <li><a href="/host.md">Set up a host</a> <span>an empty VPS, step by step</span></li>
+        <li><a href="/install.md">Install the client</a> <span>a dev box or laptop</span></li>
+        <li><a href="/docs/start.md">Start here</a> <span>prerequisites, then the checklist</span></li>
+        <li><a href="/docs/contract.md">Contract</a> <span>every app.toml key, image rules</span></li>
+        <li><a href="/docs/runtime.md">Runtime</a> <span>secrets, egress, data, jobs, checks</span></li>
+        <li><a href="/docs/moving.md">Moving a live site</a> <span>taking over a site without a gap</span></li>
+        <li><a href="/docs/dockerfile.md">Dockerfiles</a> <span>copy-paste patterns</span></li>
+        <li><a href="/docs/commands.md">Commands</a> <span>what each prints, release states</span></li>
+        <li><a href="/docs/transports.md">Transports</a> <span>pull and push</span></li>
+        <li><a href="/docs/approval.md">Approval</a> <span>plans, expiry, notifications</span></li>
+        <li><a href="/docs/rules.md">Rules</a> <span>what agents may and may not do</span></li>
+        <li><a href="/docs/faq.md">FAQ</a> <span>exact refusals and what to do</span></li>
+      </ul>
+    </div>
+    <p class="foot">This page is packaged as an ordinary huta project and released by huta itself. <a href="/healthz">/healthz</a> names the commit it came from. No cookies, no tracking, no scripts. Also as <a href="/index.md">Markdown</a>.</p>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 16 16">
+  <title>huta</title>
+  <style>
+    .tile{fill:#243E38;stroke:#90AEA0}.roof{stroke:#F4F1E8}.a{fill:#F4F1E8}.b{fill:#90AEA0}
+    @media (prefers-color-scheme: dark){.tile{fill:#F4F1E8;stroke:#F4F1E8}.roof{stroke:#243E38}.a{fill:#243E38}.b{fill:#243E38}}
+  </style>
+  <rect class="tile" fill="#243E38" stroke="#90AEA0" x=".5" y=".5" width="15" height="15" rx="3.5"/>
+  <path class="roof" stroke="#F4F1E8" d="m4.5 6 3.5-3 3.5 3" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path class="a" fill="#F4F1E8" d="M4 8h3v5H4z"/>
+  <path class="b" fill="#90AEA0" d="M9 8h3v5H9z"/>
+</svg>

@@ -1,0 +1,32 @@
+# huta egress: what huta containers (bridges dp-*) may do on the host. Only open TCP to the
+# egress daemon (4880-4899); nothing else on the host, and nothing forwarded anywhere. The
+# daemon is then the only way out (DESIGN-v1 §2).
+#
+# Two parts:
+# 1. the accept your main input chain needs (its policy is drop), in that chain's table;
+# 2. a guard table, evaluated before it, that drops everything else from dp-*, whatever later
+#    rules (open ports, Docker's own forward accepts) would allow. It resets itself, so loading
+#    the file again doesn't duplicate rules.
+# Adjust part 1 to your ruleset's table and chain names. Check with `nft -c -f`, then apply.
+
+table inet filter {
+	chain input {
+		iifname "dp-*" tcp dport 4880-4899 accept comment "huta egress daemon"
+	}
+}
+
+table inet huta_guard
+delete table inet huta_guard
+table inet huta_guard {
+	chain input {
+		type filter hook input priority filter - 5; policy accept;
+		iifname "dp-*" ct state established,related accept
+		iifname "dp-*" ct state invalid drop
+		iifname "dp-*" tcp dport 4880-4899 accept
+		iifname "dp-*" counter drop comment "huta containers: nothing else on the host"
+	}
+	chain forward {
+		type filter hook forward priority filter - 5; policy accept;
+		iifname "dp-*" counter drop comment "huta containers: no route out, only the egress daemon"
+	}
+}

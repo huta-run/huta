@@ -1,0 +1,32 @@
+[Unit]
+Description=huta egress: the only way out for huta containers (CONNECT allowlist + upstreams)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I -B -c 'import sys; sys.path.insert(0, "/opt/huta/lib"); from huta.egress import serve; sys.exit(serve())'
+DynamicUser=yes
+Restart=always
+RestartSec=2
+# It reads /run/huta-egress/policy.json (root-written, world-readable) and nothing else.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target

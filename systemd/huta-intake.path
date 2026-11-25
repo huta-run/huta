@@ -1,0 +1,10 @@
+[Unit]
+Description=huta: watch the pull inbox for requests from the dev box
+
+[Path]
+# Fires when a request is renamed into place (clients write .<id>.json.tmp, then rename).
+PathChanged=/srv/huta-dev/inbox
+Unit=huta-intake.service
+
+[Install]
+WantedBy=paths.target

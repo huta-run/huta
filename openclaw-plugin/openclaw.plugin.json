@@ -1,0 +1,34 @@
+{
+  "id": "huta-press",
+  "name": "huta press relay",
+  "description": "Relays Telegram inline-button presses with callback_data huta:... to huta's local unix socket. No LLM involvement.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "socketPath": {
+        "type": "string",
+        "default": "/run/huta/press.sock",
+        "description": "huta's press socket (the gateway user needs write permission on it)"
+      },
+      "timeoutMs": {
+        "type": "number",
+        "default": 10000,
+        "description": "Whole-exchange timeout for one press"
+      },
+      "feedback": {
+        "type": "string",
+        "enum": [
+          "errors",
+          "reply",
+          "none"
+        ],
+        "default": "errors",
+        "description": "errors (default): reply only when huta refused or was unavailable (huta edits its own DM message on success); reply: always post huta's text; none: never"
+      }
+    }
+  }
+}

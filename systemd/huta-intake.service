@@ -1,0 +1,18 @@
+[Unit]
+Description=huta: process pull-transport requests (submit and the read-only ops)
+After=docker.service
+# No start rate limit: huta-intake.path starts this once per request file, and a box sending
+# several reads back to back hit systemd's default (5 in 10 s). The unit then failed with
+# start-limit-hit and the path stopped triggering, so nothing, submit included, was answered.
+# One run drains the whole inbox, so extra starts cost little.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/huta intake
+# A submit imports an image and runs GitHub and Cloudflare checks; bounded, not forever.
+TimeoutStartSec=15min
+# root is required (docker, incus, the edge); keep the rest tight.
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=yes

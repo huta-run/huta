@@ -1,0 +1,12 @@
+[Unit]
+Description=huta: one Telegram button press
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/huta press
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60
+ProtectHome=read-only
+PrivateTmp=yes

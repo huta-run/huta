@@ -1,0 +1,61 @@
+#!/usr/bin/python3 -I
+"""huta-ssh: the forced command for push users (sshd `Match User huta-*` ForceCommand, and command= on each key).
+
+Runs as the box's own unprivileged user `huta-<box>`. Reads one request (16 KB max, 30 s max)
+from stdin and hands it to the root service over /run/huta/push.sock. The service learns the box
+from this process's uid (SO_PEERCRED), so nothing here or in the request can claim another box.
+It ignores whatever command the client asked for and never runs docker or reads /etc/huta.
+"""
+
+import json
+import os
+import select
+import socket
+import sys
+import time
+
+MAX = 16 * 1024
+READ_DEADLINE = 30
+
+
+def fail(msg: str) -> int:
+    print(json.dumps({"v": 1, "ok": False, "error": f"huta-ssh: {msg}"}), flush=True)
+    return 2
+
+
+def main() -> int:
+    raw, deadline = b"", time.monotonic() + READ_DEADLINE
+    fd = sys.stdin.fileno()
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return fail(f"no complete request within {READ_DEADLINE} s")
+        ready, _, _ = select.select([fd], [], [], left)
+        if not ready:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        raw += chunk
+        if len(raw) > MAX:
+            return fail("request too large")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(900)
+    try:
+        s.connect("/run/huta/push.sock")
+        s.sendall(raw)
+        s.shutdown(socket.SHUT_WR)
+        out = b""
+        while chunk := s.recv(65536):
+            out += chunk
+            if len(out) > 2 << 20:
+                # A cut answer is not JSON: say so instead of passing half of it on.
+                return fail("the host's answer is too large")
+    except OSError as e:
+        return fail(f"host service unavailable ({e.strerror or e})")
+    sys.stdout.buffer.write(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

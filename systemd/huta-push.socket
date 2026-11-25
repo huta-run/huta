@@ -1,0 +1,16 @@
+[Unit]
+Description=huta: push transport socket (requests from huta-ssh)
+
+[Socket]
+ListenStream=/run/huta/push.sock
+SocketUser=root
+# Only push users (huta-<box>, members of huta-push) may connect; the service still checks the
+# peer's uid itself (SO_PEERCRED) and maps it to the box.
+SocketGroup=huta-push
+SocketMode=0660
+DirectoryMode=0755
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

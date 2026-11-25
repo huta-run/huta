@@ -1,0 +1,16 @@
+[Unit]
+Description=huta: one push-transport request
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/huta push-request
+# stdin is the connection (the service reads the request and writes the one-line JSON answer on
+# it); anything else it prints goes to the journal, so the answer is never mixed with log lines.
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=yes

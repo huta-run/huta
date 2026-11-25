@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">huta — ship to your own server</title>
+  <desc id="desc">agents build, you approve. A quiet deploy platform, at huta.run and huta.md.</desc>
+  <rect width="1200" height="630" fill="#F4F1E8"/>
+  <path d="M80 80H1120 M80 550H1120" stroke="#90AEA0"/>
+  <g transform="translate(80 181) scale(2.5)"><rect x="1" y="1" width="62" height="62" rx="14" fill="#243E38" stroke="#90AEA0" stroke-width="2"/>
+  <path d="M17 25 32 13 47 25" fill="none" stroke="#F4F1E8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="17" y="32" width="12" height="19" rx="2" fill="#F4F1E8"/>
+  <rect x="35" y="32" width="12" height="19" rx="2" fill="#90AEA0"/></g>
+  <g transform="translate(286 181) scale(2.5)" stroke="#243E38"><path d="M4 8V52 M4 37V36C4 21 28 21 28 36V52 M44 26V40C44 56 68 56 68 40V26 M88 12V42Q88 52 100 52 M78 26H102 M144 26V52 M144 39C144 21 118 21 118 39S144 57 144 39" fill="none" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g fill="#243E38" font-family="ui-monospace, 'DejaVu Sans Mono', monospace">
+    <text x="80" y="411" font-size="24">ship to your own server · agents build, you approve</text>
+    <text x="80" y="516" font-size="17">huta.run</text>
+    <text x="1120" y="516" font-size="17" text-anchor="end">huta.md</text>
+  </g>
+</svg>

@@ -1,0 +1,540 @@
+# huta architecture
+
+## Roles
+
+| Role | Where | Trusted with |
+|---|---|---|
+| **dev** | a build box or container, often with coding agents | building images, running tests, asking for a release |
+| **host** | the production server, `huta` as root | everything: it verifies, plans and acts |
+| **owner** | a person | approving production releases |
+
+dev is trusted to *ask*, never to act. The host trusts only what it checks itself.
+
+## A release
+
+1. **pack** (dev): refuse a dirty tree (tracked changes), export the commit with `git archive`
+   (untracked and git-ignored files never reach the build), build `linux/amd64` with
+   `RELEASE_SHA` and labels `org.opencontainers.image.revision=<sha>` and
+   `run.huta.project=<project>`, tag `huta-build/<project>:<sha12>`.
+2. **import** (host): pull transport: `docker save` from the dev box, the archive is checked and
+   every name stripped; push transport: pulled from the host's registry **by digest**. Either
+   way the image is loaded by id and named `huta/<project>:<sha12>-<id12>`.
+3. **submit** (host): check the sha is on `origin/main` (and, if required, that the newest
+   GitHub Actions run of the workflow named `ci` for that sha on a push to `main` is completed
+   with success), read
+   `deploy/app.toml` from git at that sha, check the image (id, labels, non-root, linux/amd64),
+   compute the effective config, compare the sha with the live one (GitHub compare: ahead,
+   behind, diverged, identical), record a plan with a hash. A plan that goes back or isn't based
+   on live carries a warning (plan text, Telegram, the submit answer's `warning`); it never
+   refuses: going back on purpose is the owner's call. A refused submit untags its image.
+4. **approve** (owner): with the ✅ Deploy button on the release's message in the Telegram topic, or
+   `huta approve <release>` on the host (both end up in `cmd_approve`). Re-check everything
+   under the target lock (state, 30-minute expiry, what is live, effective config, main, CI),
+   then run the recipe. Expiry is applied here: an old plan stays `planned` until an approve
+   attempt (CLI, or a late button press) marks it `superseded`.
+5. **run** (`web` recipe): start the idle slot, verify `/healthz` reports `{"ok": true,
+   "sha": "<sha>"}` on its own loopback port (the app must listen on `0.0.0.0` at the
+   `app.toml` port inside the container), switch the vhost to it (journaled edge
+   transaction, one graceful reload), keep the old slot running for the target's `drain`
+   seconds, stop it, check the public URL. Long requests, streams and websockets on the old slot
+   can be cut.
+
+Every **approved** release ends in an outcome: `live`, `rolled-back` (it went live, its public
+checks failed, traffic went back), `nothing-activated` (traffic never moved
+to it: the previous release keeps serving, or on a first deploy the vhost still answers 503
+`not released yet`), `needs-human`. A refusal before approval leaves no release; an unapproved
+plan stays `planned` or becomes `superseded` / `rejected`.
+
+## The contract
+
+**Repo side** (`deploy/app.toml`, data only). Strict where it matters: unknown top-level keys,
+unknown keys in `[components.*]`, `[images.*]` (`dockerfile`, `context`), `[state]` (`kind`:
+`none` or `data`), `[build]` (`test`), `[[smoke]]` and `[[jobs]]` are errors; `preflight` and
+`external` must be empty; `components.*.image` must name the one `[images.*]` table. v1 keys
+(data mount, `concurrent_safe`, smoke checks, jobs) are specified in `DESIGN-v1.md` and the
+agent docs (`site/public/docs/contract.md`, `runtime.md`).
+
+```toml
+schema = 1
+project = "hello"
+order = ["web"]            # top-level keys come before the first [table]
+
+[images.web]
+dockerfile = "examples/hello/Dockerfile"
+context = "examples/hello"
+
+[components.web]
+image = "web"
+kind = "http"
+port = 8080
+health = "/healthz"
+
+[state]
+kind = "none"
+```
+
+**Host side** (`/etc/huta/projects.d/<project>.toml`, root-owned; unknown target keys are
+errors, uids unique across projects, ports and hosts unique across targets):
+
+```toml
+schema = 1
+project = "hello"
+repo = "example/hello"
+app_toml = "deploy/app.toml"
+uid = 20001
+boxes = ["devbox"]             # dev boxes that may submit it and read status/log/jobs/logs (none: CLI only)
+log_drop = ["enter setup code"]   # log lines holding one (case-insensitive) are never stored
+[legacy.hello-old]             # a service of the project huta doesn't run: huta logs/crashes read it
+unit = "hello.service"
+env_file = "/opt/hello/.env"   # its values are redacted too; unreadable: nothing is shown
+crashes = 12                   # optional Bugsink project id
+
+[targets.prod]
+hosts = ["hello.example.org"]
+cloudflare = "orange"          # v0: orange only (Origin CA cert + Cloudflare-only filter)
+slots = [18300, 18301]         # two loopback ports
+egress = "none"                # or ["api.example.com:443", "*.cdn.example.net:443"]
+limits = { memory = "64m", cpus = 0.5, pids = 64 }   # also tmp = "64m"
+approve = "always"             # v0: always only
+require_ci = true
+keep_releases = 5
+drain = 10                     # seconds the old slot keeps running after the switch (0..300)
+# v1, optional (DESIGN-v1.md):
+env = { PUBLIC_ORIGIN = "https://hello.example.org" }
+secrets = ["API_TOKEN"]        # /etc/huta/secrets/<project>/<NAME>, set with `huta secret set`
+upstreams = ["vpn-exit"]       # names from huta.toml [upstreams.*]
+data = { size = "2g", backup = "hourly", concurrent = false }
+access_log = true
+logs = { days = 7, max = "200m", boxes = true, jobs = false }   # huta logs (the defaults)
+crashes = 11                   # Bugsink project id (huta crashes)
+adopt = "hello.example.org.caddy"   # moving a live site: its vhost file, replaced at the first release
+```
+
+**Platform** (`/etc/huta/huta.toml`):
+
+```toml
+schema = 1
+[platform]
+host = "myhost"
+notify = ["/usr/local/bin/notify-owner"]   # optional fallback, used only without [telegram]
+[cloudflare]
+zones = ["example.org"]        # huta refuses any Cloudflare call outside this list
+[transport.pull]               # optional
+inbox = "/srv/huta-dev/inbox"
+outbox = "/srv/huta-dev/outbox"
+container = "devbox"
+owner_uid = 1001000
+[transport.push]               # optional
+registry_local = "127.0.0.1:5000"
+registry_public = "registry.example.org:4882"
+ssh_host = "host.example.org"  # what `huta enroll` tells boxes to ssh to
+ssh_port = 22
+registry_project = "huta-registry"   # compose project restarted on enroll/revoke
+# boxes = ["mybox"]            # optional, older configs; enrolled boxes need no entry here
+                               # (which projects a box may use: each project's own `boxes`)
+[telegram]                     # optional: history messages and one-tap approval
+history_chat = -1001234567890
+history_thread = 12
+token_json = "/path/to/bot-config.json"
+token_keys = ["bot", "token"]
+owner_id = 123456789           # the owner's Telegram user id; the only one who can press
+relay_user = "chatgw"          # the only user allowed on the press socket
+buttons = true                 # only once the relay plugin is installed
+[backup]                       # needed by targets with data (unless their backup = "off")
+dir = "/var/backups/huta"
+ship = ["/usr/local/sbin/huta-ship"]   # sends <dir>/<p>/<t>/current off the server; 75 = skipped
+[logs]                         # optional
+max_total = "2g"               # all targets' stored logs together; oldest hours go first
+syslog = false                 # true: also send each stored (redacted) line to syslog
+[crashes]                      # optional: Bugsink on this host, for huta crashes
+url = "http://127.0.0.1:8000"  # loopback only; token: secrets/_platform/BUGSINK_TOKEN
+host = "bugs.example.org"      # the Host header its ALLOWED_HOSTS accepts
+[upstreams.vpn-exit]           # a host service containers may reach (opt-in per target)
+to = "127.0.0.1:1080"
+port = 4881                    # 4881..4899
+```
+
+Secrets live in `/etc/huta/secrets/` (root 0700), one file each. A value a dev box sent (op
+`secret`) waits in `secrets/<project>/.staged/<NAME>` until a release that uses it is approved
+(see "Secrets from a box" below). The platform ones are
+`_platform/GITHUB_TOKEN` (read-only) and `_platform/CLOUDFLARE_API_TOKEN` (Zone Read, DNS Edit,
+SSL and Certificates Edit, Zone Settings Edit, Config Rules Edit). Push boxes' registry
+passwords are `registry/<box>`.
+
+**Setting up a host.** What a host needs besides huta itself (an amd64 KVM-class server with
+cgroup v2 and loop devices; Docker with the compose plugin; Caddy importing
+`<caddy_sites>/*.caddy`; nftables with the egress guard; Tailscale for boxes and the registry;
+the registry compose project; the push socket and sshd drop-in; the two platform tokens) and the
+order to do it in: `site/public/host.md` (https://huta.run/host.md), written for an agent on
+that server.
+
+## What huta generates
+
+- **compose** per target (`/var/lib/huta/compose/<p>/<t>/compose.yaml`): services `slot-a` and
+  `slot-b` running the image **by id**, as the project uid, read-only root filesystem, `/tmp`
+  tmpfs, `cap_drop: ALL`, `no-new-privileges`, memory/cpu/pids limits, ports on 127.0.0.1 only,
+  env from the registry (`env`, `secrets`) plus `RELEASE_SHA`, `HUTA_PROJECT`, `HUTA_TARGET`,
+  `HUTA_SLOT`, `dns: 127.0.0.254` (no name resolution: Docker's resolver would be a way out), a
+  bridge named `dp-<hash>`; with egress or upstreams the proxy variables and
+  `huta-egress:host-gateway`; with data the volume bind-mounted at the manifest's path;
+  `logging` pinned to `json-file` 10m×3, uncompressed (the collector reads those files).
+  The host firewall gives `dp-*` bridges nothing but the egress daemon's ports
+  (`systemd/nftables-huta-egress.nft.example`).
+- **egress policy** (`/run/huta-egress/policy.json`, root-written, world-readable): subnet →
+  target, allowlist, upstreams, plus the host's own addresses and Docker subnets to refuse.
+  `huta-egress.service` (DynamicUser) reads it.
+- **data volume** per target: `/var/lib/huta/data/<p>/<t>.img` (ext4, sparse), a generated
+  mount unit (`Before=docker.service`) at `/var/lib/huta/data/<p>/<t>/`; backups in
+  `[backup] dir`/`<p>/<t>/{current,previous}`.
+- **timers** per target: `huta-job_<p>_<t>_<job>.{timer,service}` and
+  `huta-backup_<p>_<t>.{timer,service}` in `/etc/systemd/system` (marker line; only huta's own
+  names are touched).
+- **vhost** per target (`<caddy sites dir>/<host>.caddy`): TLS with the target's Origin CA
+  certificate, the Cloudflare-only filter, and `reverse_proxy` to the **one** live slot (or a
+  503 `not released yet` before the first release).
+- **Cloudflare**: one Origin CA certificate per target covering all its hosts; a per-host
+  Configuration Rule `ssl = strict` (zone-wide settings are never changed, foreign rules are
+  never rewritten and are re-read to prove it).
+
+## Logs (`logs.py`) and status now (`runstate.py`)
+
+- **Capture.** Slots log to `json-file` (pinned in compose). `huta logs-collect`
+  (`huta-logs.timer`, every minute) reads each slot container's files from a cursor (container
+  id → inode and offset, `<state_dir>/logs/<p>/<t>/.cursor.json`), follows Docker's rotation,
+  joins Docker's 16 KiB partial entries into lines (cut at 64 KiB without a newline), and
+  appends records to `<state_dir>/logs/<p>/<t>/<YYYY-MM-DDTHH>.jsonl` (UTC hour files, root
+  0600). The cursor only moves past complete lines. `recipe.compose("up", …)` collects the
+  target first, because `up` may recreate a slot container and its log; a failed start is
+  collected right after its slot stops, and its container state goes into the release's events
+  (`slot-state`). Jobs (`--log-driver none`) write their relayed output there too.
+  One collector per target at a time (`flock` on `.lock`), separate from the target lock.
+- **Gate at ingest, again at read.** A line holding a project `log_drop` string (raw text,
+  lowercase) is dropped; otherwise `cfg.redact`, then cut at 8192 characters. Nothing
+  unredacted is stored. A read redacts again (values learned since) and re-applies `log_drop`,
+  then `--grep` (substring, lowercase, after redaction), then `--tail`, then the answer budget
+  (900 000 bytes of JSON-encoded text; newest lines win; every cut is said in a `‹…›` line). A
+  read scans at most 20 s.
+- **Retention.** Per target `logs.days` (hour files older go) and `logs.max` (oldest hours go,
+  never the current one); then `[logs] max_total` over all targets.
+- **Access.** Op `logs` has the same `boxes` check as `status`; then `logs.boxes` for slot
+  output and `logs.jobs` for `--job`. Each read is an event `logs-read` with the box, the
+  filters and the line count. The operator's `huta logs` collects first.
+- **syslog** (`[logs] syslog = true`): each stored line, after the gate, also goes to syslog
+  (ident `huta/<p>/<t>`, facility daemon; stderr at notice). Off by default: the journal is
+  readable by more users than huta's store.
+- **Status now** (op `status`, and `huta status <p> <t>`): per slot container `docker inspect`
+  (state, started, restarts, exit code, OOMKilled), its cgroup v2 files (found from its pid and
+  checked by name: `memory.current/peak/max/events`, `pids.current/peak/max/events`,
+  `cpu.stat` over 1 s, `cpu.max`), one health request to the live slot (`recipe._get_json`:
+  no proxy, no redirect, capped, 3 s), `statvfs` of the data mount, `last.json` of the backup,
+  and established connections from the target's subnet to ports 4880..4899 (`ss`). Failure to
+  read any of it never fails the status.
+
+## Other reads for boxes (`observe.py`, `diag.py`)
+
+All take the same `boxes` check, are bounded (20 s of scanning, 64 MiB read, the logs answer
+budget), redacted, and recorded as events (`<op>-read`, `diag-start`/`diag`), never with their
+content.
+
+- **egress-log** (op `egress-log`): `journalctl -u huta-egress.service` in the window (at most
+  8 days), lines `refused <p>/<t> …: <why>` and `<p>/<t> → upstream <u> unreachable`, counted
+  per minute and reason. The peer address is dropped; names off the allowlist are already
+  masked by the daemon.
+- **traffic** (op `traffic`): the target's Caddy access logs (`<caddy_log_dir>/<host>.log` and
+  rolled `<host>-*.log[.gz]` newer than the window). Only `ts`, `status`, `duration` and the
+  method (from a fixed list) are read out: per-minute status classes and the 5xx list.
+- **crashes** (op `crashes`): Bugsink's API (`[crashes] url`, loopback only, `Host` from
+  `[crashes] host`, no proxy, no redirect, 8 MiB per answer) with the platform token
+  `BUGSINK_TOKEN`. Bugsink tokens are global, which is why boxes never get one: the host reads
+  only the target's (or legacy entry's) project id. Issues by `last_seen` since the window, at
+  most 20; for each, the newest event's release, environment and `stacktrace_md` (4000
+  characters, 80 lines). Every line passes the log gate.
+- **legacy** (`[legacy.<name>]`): `huta logs <p> <name>` reads `journalctl -u <unit>`; first every
+  value in `env_file` becomes a redaction needle (opened `O_NOFOLLOW`, regular, ≤ 1 MiB); if it
+  can't be read nothing is shown. Nothing writes to the unit, its files or its database.
+- **diag** (op `diag`): one per target at a time (`Store.acquire(<p>, "_diag-<t>")`).
+  `docker run --rm --name huta-diag_<p>_<t> --network none`, the slot hardening, `--log-driver
+  none`, env = registry `env` + `RELEASE_SHA`, `HUTA_PROJECT`, `HUTA_TARGET`, `HUTA_DIAG`
+  (no secrets). With data, `cp -al` of `<backup dir>/<p>/<t>/current` to `.diag-<random>` in the
+  same directory (hard links: a backup rotating `current` can't pull files from under the
+  run), bind-mounted read-only at the data path, removed afterwards. `timeout` from
+  `[[diag]]` (≤ 5 min), output ≤ 256 KiB, then the log gate. `[[diag]]` is part of
+  `recipe.effective`, so adding or changing one shows in the plan.
+- **Crash:** a dead huta leaves the container and the snapshot; the next diag of the target
+  removes both (`docker rm -f` by name, `rm -rf` of `.diag-*`).
+
+## Crash safety
+
+- Every vhost change is journaled (`/var/lib/huta/edge/*.pending` plus `.prev`), validated as
+  the `caddy` user and reverted on any failure. `recover()` undoes a half-done change.
+- `reconcile` (run before every action, and as `huta reconcile`) treats the slot the vhost routes
+  to as the truth: it repairs the live pointer, marks interrupted releases `nothing-activated`
+  and stops slots nothing routes to.
+- Every host helper command (docker, incus, git) runs with a deadline.
+- The log collector writes the lines, then its cursor (atomic rename): a crash between the two
+  stores at most one run's lines twice; it never loses or exposes any.
+
+## Commands (host, as root)
+
+```
+huta check                               validate the whole registry
+huta edge <project> <target> [--apply]   certificate, vhost, Cloudflare rule, A record if no A/AAAA/CNAME
+huta import-dev <project> <ref>          import huta-build/<project>:<sha12> from the dev box
+huta submit <project> <target> <sha> <image>
+huta show <release> | reject <release>
+huta approve <release> [--via cli|telegram]   --via telegram: what a Deploy press runs
+huta rollback <project> <target>
+huta reconcile <project> <target>
+huta status [project [target]] | log [release]   with a target: its containers now (runstate.py)
+huta logs <project> <target> [--since --until --grep --tail --slot --release --job]
+huta logs-collect                        store new slot output, apply caps (huta-logs.timer, every minute)
+huta egress-log|traffic <project> <target> [--since --until]   egress refusals / edge summary
+huta crashes <project> <target|legacy> [--since]              Bugsink issues
+huta diag <project> <target> <name>      a [[diag]] of the live release (diag.py)
+huta intake                              pull: process the inbox (huta-intake.path/.service)
+huta push-request                        push: one request per connection (huta-push.socket); exits 0 when
+                                         it answered, refusals included; 1 only on a huta error
+huta press                               one Telegram button press (huta-press.socket); a refused press
+                                         exits 0, a wrong peer, bad config or huta error exits 1
+huta enroll <box> --from <ip> --pubkey '<key>'   push: add or update a box, print its settings
+huta revoke <box>                        push: remove a box
+huta client-bundle                       the client as a .tar.gz on stdout
+huta secret list|set|import|rm|discard <project> [NAME…] [--from <env file>]   set/import drop a staged value
+huta data status|ensure|import|export <project> <target> [dir | path…]
+huta backup <project> <target>           consistent copy + ship (the timer runs it)
+huta job list|run <project> <target> [name]
+huta units <project> <target>            rewrite job and backup timers from the live release
+huta egress sync                         refresh the egress daemon's policy
+huta stop|start|restart <project> <target>
+```
+
+The `web` recipe with v1 (details in `DESIGN-v1.md`): concurrent targets start the new slot,
+check health and smoke on loopback, switch, run the public checks while the old slot runs
+(failure: switch back, `rolled-back`), drain, stop the old. One-writer targets (data without
+host and repo both allowing concurrency) stop the old slot, copy the data, start the new one
+(failure before the switch: restore the copy, start the old slot, `nothing-activated`; after:
+`needs-human`). `reconcile` additionally thaws a frozen volume, starts the routed slot of the
+live release if a crash left it stopped, and finishes an interrupted revert as `rolled-back`.
+
+## Transports: how dev asks
+
+Both are available and carry the same request (`src/huta/proto.py`) into the same verify → plan
+→ approve path.
+
+**Request rules (both):** one JSON object, at most 16 KB, duplicate keys refused, `v` must be
+the integer `1`, fields exact per op (`submit`, `status`, `log`, `jobs`, `secret`; `credentials` push only;
+`digest` required on a push submit and refused on pull), names matched in full. A request id
+(16 hex) can be used **once**, across both transports; a retry needs a new id (the client makes
+one per call). Every answer is `{"v": 1, "id": <id or null if unparsable>, "ts": <unix>, "ok":
+..., ...}`; the client refuses an answer whose id is not its request's. Who sent a request is
+never read from it. `submit`, `status`, `jobs` and `log` (through the release's project) need
+the box in the project's `boxes`; otherwise the answer is the same as for a missing project or
+release, so a box can't learn what else the host runs.
+
+**pull:** for a dev box on the same host (an Incus container in v0).
+
+- an inbox directory owned by the dev box's user (as the host maps it) and an outbox only root
+  can write, both mounted into the dev box (for example `/huta/inbox` read-write, `/huta/outbox`
+  read-only), plus a root-only work directory on the same filesystem (`work`, default
+  `<inbox>/../work`);
+- the client writes `.<id>.json.tmp` and renames it to `<id>.json`. `huta-intake.path` runs
+  `huta intake`, which only accepts names `<16 hex>.json`, removes anything else (stale temp
+  files after 10 minutes), handles at most 50 requests per run, one at a time, claims each by
+  renaming it into the work directory before opening it (O_NOFOLLOW, regular file of the dev
+  uid, size cap), and requires the id inside to equal the file name;
+- the image comes from `incus exec <container> -- docker save` (15-minute deadline), checked:
+  one image, plain relative entries, at most 20000 entries and 2 GiB logical size, no sparse
+  files or duplicate paths; then every name is stripped and it is loaded by id;
+- answers are written to the outbox (kept 7 days, at most 500).
+
+**push:** for any dev box with ssh to the host.
+
+- each box has its own system user `huta-<box>` in group `huta-push`, home
+  `/var/lib/huta-ssh/<box>` (root-owned), `authorized_keys` line
+  `restrict,command="/usr/local/sbin/huta-ssh",from="<ip>" <key>` (the key alone can't get a
+  shell, even without the sshd block);
+- sshd needs **no per-box change**: one static drop-in with `AllowUsers huta-*@<tailnet CIDR>`
+  (on the host's existing `AllowUsers` line, if any) and `Match User huta-*` →
+  `ForceCommand /usr/local/sbin/huta-ssh`, no TTY or forwarding, closed with `Match all`
+  (`systemd/sshd-huta-push.conf.example`); each key is pinned to its box with `from=`;
+- `huta-ssh` (as `huta-<box>`) reads one request (16 KB, 30 s) and passes it to
+  `huta-push.socket` (`/run/huta/push.sock`, group `huta-push`). `huta push-request` (root)
+  learns the box from the socket peer's uid (`SO_PEERCRED`), accepts it when `huta-<box>` is
+  in the `huta-push` group (or the box is in the optional `[transport.push] boxes`), and
+  writes exactly one JSON line back; logs go to the journal;
+- `huta login` (op `credentials`) hands the box its own registry login (`secrets/registry/<box>`)
+  for `docker login --password-stdin`; `huta submit` pushes to the registry and sends the
+  reported digest; the host pulls `<registry_local>/huta-build/<project>@<digest>`;
+- **enrolling a box** (operator, as root):
+  - `huta enroll <box> --from <ip> --pubkey '<key line>'` creates the group and user if
+    needed, writes the pinned key, creates the registry login, rebuilds the registry's
+    htpasswd from `secrets/registry/*` and restarts the registry (compose project
+    `registry_project`), then prints one JSON line:
+    `{"box", "ssh": "huta-<box>@<ssh_host>", "port": <ssh_port>, "registry": <registry_public>,
+    "host_key": <the host's ed25519 key>}`. Re-running replaces the key (and fixes the user's
+    home, shell and group); a different key also gets a new registry password. Keys:
+    `ssh-ed25519` or `ecdsa-sha2-nistp256`, parsed with `ssh-keygen -l`; `--from` a plain IP;
+    box names at most 27 characters (`huta-<box>` ≤ 32). The registry restart needs exactly one
+    `registry` service container in `registry_project`, or enroll fails;
+  - `huta revoke <box>` cuts access first (key, push group, registry login), then ends the
+    box's sessions, removes the user and its home, and restarts the registry; a box that is
+    mid-request can't block it;
+  - `huta client-bundle` writes the installed client (`install-client.sh` + `src/huta`) as a
+    `.tar.gz` to stdout, so a box can get it with `ssh <host> sudo huta client-bundle | tar -xz`;
+- **on the box:** `install-client.sh --box <box> --keygen-only` (makes `~/.ssh/id_huta_push`,
+  prints the public line), then `install-client.sh --box <box> --settings <enroll JSON>`
+  (refuses settings for another box; pins the host key; writes `client.toml`). The manual form
+  `--ssh huta-<box>@<host> --port <port> --registry <host:port> --host-key "<key>"` still works.
+  The box needs Python 3.11+, Docker, `~/.local/bin` on `PATH`, and a registry its Docker trusts
+  (real TLS, or listed in `insecure-registries`). Agent-guided flow: `site/public/install.md`
+  (https://huta.run/install.md).
+
+On the dev box, `huta` (the same command, as a normal user) is the client:
+
+```
+huta pack   [--app deploy/app.toml]       # dirty tree refused; builds from git archive of HEAD
+huta submit <target> [--app …] [--no-wait | --follow]   # --no-wait: pull only; --follow: until the outcome
+huta status <project> <target>            # the target's last 10 releases, then its containers now
+huta log    <release>                     # its last 50 events
+huta jobs   <project> <target>            # live jobs, next runs, last 20 outcomes (no output)
+huta logs   <project> <target> [--since 1h --until … --grep text --tail N --slot a|b|live|previous
+            --release id --job name]       # redacted container output (or a legacy unit's journal)
+huta egress-log|traffic <project> <target> [--since 1h --until …]
+huta crashes <project> <target|legacy> [--since 1d]
+huta diag   <project> <target> <name>
+huta secret set <project> <NAME>          # value from stdin; staged until an approved release
+huta secret import <project> NAME… --from <env file>
+huta login                                # push only
+huta self-update                          # replace this client with the host's version now
+```
+
+with `~/.config/huta/client.toml` (`transport = "pull"` plus `[pull] inbox, outbox`, or
+`transport = "push"` plus `[push] registry, ssh, port, key, known_hosts`; optional top-level
+`auto_update = false`).
+
+**Secrets from a box.** Op `secret` {project, name, value} (both transports; the value is one
+line of 1..8192 characters with no control characters, so line-by-line job-log redaction
+catches it; multi-line secrets are set by the operator; never quoted in an error). The box must
+be in the project's `boxes`, and the name must already be in the registry (`secrets` or
+`job_secrets` of any target): a box can't add names, read values or reach other projects. The
+host writes the value root-only to `secrets/<p>/.staged/<NAME>` (unique `O_EXCL|O_NOFOLLOW`
+temp file, rename, directory fsync; over pull the client writes the request 0600 and removes
+it if the host never claims it) and records an event with the box but not the value. Nothing
+reads staged values except planning and approval.
+
+Every step that touches a project's secret files (staging, the operator's `secret` commands,
+planning, approval from its checks until the release's outcome, settling) holds the project's
+**secrets lock** (`Store.lock(<p>, "_secrets")`, taken after the target lock). So no value
+changes between a plan's checks and the moment its containers read their environment. A box
+that sends a value while a release of the project runs waits up to 20 s, then is told to send
+it again.
+
+- `plan_release` treats a staged value as set (a first release needs no operator step), lists
+  `🔑 new value for secret <NAME>, sent by a dev box <time>` in the plan's changes (so the plan
+  is `infra`; the line names the project's other targets that use the name), and stores
+  `staged_secrets` = {name: inode:mtime_ns:size} and `secret_versions` (the same fingerprint of
+  every live secret the target uses).
+- `huta approve` supersedes the plan when a live fingerprint differs (another target's release
+  applied a value, or the operator set one). Before recording the approval it **claims** every
+  planned file (rename to `.claim-<rid>-<NAME>`; a value a box sends meanwhile lands beside it
+  and stays staged) and checks each fingerprint on the claimed file; on a mismatch the claims
+  go back and the plan is superseded (the approval isn't used up). After the approval is
+  recorded, each claimed value goes live with the old one kept aside first
+  (`.prev-<rid>-<NAME>`, a hard link, or `.none-<rid>-<NAME>` when there was none), with
+  directory fsyncs and an event before and after.
+- **Values go live with the release or not at all.** After the outcome, `live` and
+  `needs-human` (the new slot may be serving) keep the new values and drop the old copies;
+  `nothing-activated` and `rolled-back` put the old values back and stage the new ones again
+  (unless a newer one was sent meanwhile), with an event. While the release runs, the
+  project's jobs already read the new values.
+- **Crash:** the journal files are named by release id. `reconcile`, `submit` and `rollback`
+  settle every journal whose release has an outcome (`settle_journal`, under the secrets
+  lock, so no apply is in progress): kept for `live`, `retired`, `needs-human`; reverted for
+  `nothing-activated`, `rolled-back`, `rejected`, `superseded` and `planned` (claims taken
+  before a crash during approval); left alone while the release is still `approved` or
+  `running` until its own target's `reconcile` decides it. A crash between keeping the old
+  value and the rename is told apart by inode, so the old value is never staged as new.
+- A project's secrets are shared by its targets: a value applied by one target's release
+  reaches the other targets' jobs at their next run (the plan says so), and their pending
+  plans can no longer be approved.
+- The operator's `huta secret set/import` drop a staged value for the same name (theirs is
+  newer); `huta secret discard` drops one and keeps the live value; `list` shows staged ones.
+- Redaction (`cfg.redact`) reads every live value under `secrets/` but **not** staged values,
+  journals or temp files (dot names): a box chooses those, and as needles they could blank out
+  plan text the owner must read. Every value `read_secret` returns for use is added to the
+  process's cache, so a value applied by another process after the cache loaded is still
+  redacted. Each value becomes several needles (`cfg.needles`): its parts (entries split on
+  whitespace `, ; & |`, `k=v` values, every URL userinfo found anywhere in the value, its
+  password) and each of those URL-encoded, JSON-escaped and base64 at all three alignments;
+  under 8 characters a part is skipped, except the context-bound forms `:pass@`, `user:pass@`
+  and the base64 of `user:pass` (from 3 characters) and a bare `user:pass` (from 6).
+- A live value that is replaced or removed (`huta secret set/import/rm`, an approved release's
+  apply, a revert) is first hard-linked into `secrets/.retired/<p>.<NAME>.<unix time>.<rand>`
+  (`runtime.retire`); `cfg.redact` keeps those as needles for 30 days, then they are deleted.
+  These were live, so a box didn't choose them.
+
+**Client updates.** Every answer carries `"huta": "<host revision>"` (`/opt/huta/REVISION`). The
+client records its own in `~/.local/lib/huta-client/REVISION` (written by `install-client.sh`).
+After any command, if they differ, the client sends op `client` (both transports): the host
+answers with the same bundle as `huta client-bundle` plus `REVISION`, base64 with its sha256.
+The client checks the hash and that every tar entry is a regular file in a fixed list
+(`src/huta/*.py`, `install-client.sh`, `REVISION`), unpacks next to the install and swaps the
+directory in (two renames). With `auto_update = false` it only prints
+`huta: the server runs <x>, this client <y>; update with huta self-update`. Only per-user
+installs update themselves (never `/opt/huta`). The client trusts the host already: a pinned
+ssh host key (push) or a root-owned read-only outbox (pull).
+
+## Notifications
+
+With `[telegram]`, the host keeps **one history message per release** (HTML) and edits it as
+the release moves: waiting for approval (with the approve command and the expiry), approved /
+deploying, live (hosts and slot), not activated / needs a human / rejected / expired (with the
+reason), replaced. Failures to notify never affect a release. Without `[telegram]`,
+`platform.notify` (an argv that gets the text on stdin) is told when a plan waits.
+
+## One-tap approval
+
+With `history_chat`, `owner_id`, `relay_user` and `buttons = true`, every new plan (submit over
+either transport, CLI submit, rollback) gets two inline buttons on **its history message in the
+configured topic** (`notify.ask_owner` edits that message's `reply_markup`). One message per
+release, in one place:
+
+- `callback_data` is `huta:a:<22 chars>` (Deploy) / `huta:r:<22 chars>` (Reject): 128 random
+  bits each, single use, expiring with the plan (30 min), stored only as SHA-256 hashes
+  (`approvals` table, with the message's chat and id).
+- The chat gateway (OpenClaw) receives the press. The `huta-press` plugin
+  (`openclaw-plugin/`, deterministic, no LLM, never logs the data) claims the `huta`
+  namespace and writes `{v, data, from_id, chat_id, message_id}` to `/run/huta/press.sock`
+  (root, group `huta-press`, 0660). `huta-press.socket` runs `huta press`, which also checks
+  the peer is `relay_user` (`SO_PEERCRED`).
+- `notify.take_press` checks: presser is `owner_id`; chat is `history_chat` (or `owner_id`);
+  the hash matches an open plan and is consumed atomically; the press came from that plan's
+  own message (same chat and message id); not expired (a late press marks the release `superseded`). Deploy runs
+  `huta approve <id> --via telegram` as a transient systemd unit (same checks as the CLI);
+  Reject rejects. The message is edited as the release moves; the keyboard is removed when the
+  plan is decided. CLI approve/reject and expiry retire the buttons (`close_ask`).
+- Safe in a group against other members and bots: only `owner_id` is accepted, and only huta's
+  own message carries the secret, so a lookalike button can't approve anything.
+- **Known limit:** huta trusts `from_id` from the relay. The secrets sit in the message's
+  keyboard (visible to the bot account and chat clients) and the gateway may store updates
+  durably, so anything running as `relay_user` (for example the chat bot's own AI agents) can
+  read a Deploy string and forge an owner press. Operators accept this when they enable
+  `buttons`. Planned: a receiver only huta controls (its own bot token, root-only), so presses
+  don't pass through the chat agent.
+- The plugin replies in chat only on refusal (`this button is no longer valid`,
+  `only the owner can approve`, `this button doesn't belong to this chat`,
+  `not a huta button`, `this plan expired; submit again`) or if huta is unreachable
+  (`huta is unavailable; use sudo huta approve on the host`). OpenClaw answers the callback
+  itself, so there is no toast.
+- Operator setup: install `openclaw-plugin/` as a local plugin (its README), add the gateway
+  user to `huta-press`, restart that user's systemd manager (a service restart keeps the old
+  groups), then set `buttons = true`. Until then the buttons stay off: an unclaimed press would
+  reach the chat agent as text.
+
+The CLI `huta approve` remains the fallback.
+
+## Not yet
+
+Unattended releases, plain (non-Cloudflare) TLS, several components per project, the `pg`,
+`gateway` and `external` recipes, migrations with schema versions, read-only debug access for
+agents beyond what exists (`snapshot`), monitoring hooks, plain-HTTP egress.
