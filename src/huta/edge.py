@@ -26,6 +26,9 @@ from pathlib import Path
 
 from .cfg import Platform, Target, assert_root_dir
 
+# The markers and the lock file below (<state_dir>/edge/edge.lock) are also an interface: other
+# tools that edit Caddy on the same host take the lock and leave marked files alone. Change
+# either and they silently lose that protection.
 MARKER = "# managed-by: huta"
 LEGACY_MARKERS = ("# managed-by: slipway",)   # files written before the rename to huta
 UPSTREAM_RE = re.compile(r"reverse_proxy 127\.0\.0\.1:(\d+)")
