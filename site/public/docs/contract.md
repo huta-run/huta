@@ -23,7 +23,7 @@ Data only. Strict:
 - **top level:** only the keys in the table below; anything else is refused;
 - **`[components.<name>]`**, **`[images.<name>]`**, **`[state]`**, **`[build]`**,
   **`[[smoke]]`**, **`[[jobs]]`**, **`[[diag]]`:** only their listed keys; anything else is refused;
-- `preflight` and `external` are known keys but must be absent or empty (*planned*).
+- `preflight` is a known key but must be absent or empty (*planned*).
 
 ### TOML pitfall: top-level keys first
 

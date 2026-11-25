@@ -15,13 +15,16 @@ owner: approves (CLI today; one-tap Telegram buttons next)
 host:  start idle slot → verify /healthz reports the sha → switch the vhost → stop the old slot
 ```
 
-Status: **early (v1)**. One recipe (`web`: one HTTP component, two loopback slots), Caddy as
-the edge, Cloudflare Origin CA certificates and per-host SSL rules, crash recovery
-(`huta reconcile`). Per target, as the host grants: secrets and env, outbound HTTPS by hostname
-allowlist and named host services (no DNS or route out otherwise), a data volume with
-consistent backups shipped off the server, scheduled jobs, smoke checks with an automatic switch
-back, and taking over a live site's vhost (`docs/DESIGN-v1.md`). Running in production on one
-host.
+Status: **v2**. The `web` recipe: one HTTP component or several per target (a slot is the whole
+set, workers hand over after the switch), two loopback slots, Caddy as the edge, Cloudflare
+Origin CA certificates and per-host SSL rules, crash recovery (`huta reconcile`, tested by
+killing every step on a fake host). Per target, as the host grants: secrets and env, outbound
+HTTPS by hostname allowlist and named host services (no DNS or route out otherwise), a data
+volume with consistent backups shipped off the server, its own Postgres, schema migrations
+(exclusive or online, with restore points and restore plans), scheduled jobs, smoke checks with
+an automatic switch back, taking over a live site's vhost, gateways for services huta doesn't
+run, and publishing to Cloudflare Pages and Workers (`docs/DESIGN-v1.md`, `docs/DESIGN-v2.md`).
+Running in production on one host.
 
 ## Ideas it's built on
 

@@ -104,12 +104,26 @@ on outside services.
 
 With `state.kind = "data"` and `components.<c>.data = "/data"`, the target has its own
 filesystem of a fixed size (the operator's `data.size`), mounted read-write at that path in the
-web container and in every job.
+components that name it and in every job that runs in one of them.
 
 - It is owned by the project uid, mode 0700. It contains an empty `lost+found` (root's, leave it).
 - When it is full, writes fail with "no space left". `huta data status` shows the use. The
   operator can grow it (never shrink); the next release or `huta data ensure` applies it.
 - Nothing else is writable except `/tmp` (tmpfs, lost on restart).
+
+### Postgres
+
+With `state.kind = "postgres"` (and `postgres = { … }` granted in the registry), every component
+gets `DATABASE_URL=postgresql://app:…@postgres:5432/app`. The `app` role reads and writes rows;
+it can't create or change tables. Schema changes go in `[migrate]`, whose container gets
+`DATABASE_URL` for the `migrate` role (it owns the schema) and reaches only the database. Your
+code should connect with that variable as given (it contains the password; never log it).
+
+### Several components
+
+Each component also gets `HUTA_COMPONENT=<its name>` and reaches the others of its slot by name
+(`http://api:8081`); they are excluded from the egress proxy (`NO_PROXY`). Only the public
+component receives the target's own secrets; others get what the registry names for them.
 
 ### One writer, or two at once
 

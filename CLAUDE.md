@@ -45,4 +45,10 @@ It lives at https://github.com/huta-run/huta, and every commit and commit messag
 - `tests/test_crash.py` kills a release after every step (a forked child, `os._exit`) on the
   fake host in `tests/fakehost.py`, runs `reconcile` and checks the invariants. A new durable
   step in a release gets recorded there as a step, so it is crashed after too.
+- A new phase stage goes into `recipe.KNOWN_STAGES` together with what `reconcile` does with
+  it; a stage `reconcile` doesn't know stops it with needs-human (it never clears a record it
+  can't resolve). Add a crash scenario for it in `tests/test_crash.py`.
+- Site docs: `site/public/llms-full.{txt,md}` contain every page in `site/public/docs/` plus
+  `host.md` and `install.md` verbatim, and `llms.txt` equals `llms.md`. Edit a page and its copies
+  in the same change (a test checks it). The full suite takes about three minutes.
 - Commits: small, present-tense subject, why in the body.

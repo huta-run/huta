@@ -182,11 +182,16 @@ does not exist yet.
 - [x] Caddy as the edge with generated vhosts, Cloudflare Origin CA certificates, per-host SSL
   rules
 - [x] Crash recovery with `huta reconcile`; rollback as an approved plan
+- [x] v2: several containers per target (a slot is the whole set; workers hand over after the
+  switch)
+- [x] v2: Postgres per target, run by huta (pinned image, own volume and networks, app and
+  migrate roles, dumps, planned upgrades)
+- [x] v2: schema migrations, exclusive (with a pinned restore point) or online; restore plans
+- [x] v2: gateways (a hostname for a service huta doesn't run); edge changes as approved plans
+- [x] v2: publishing to Cloudflare Pages and Workers as a step of a release
 
 ### Planned (not yet)
 
-- [ ] Several containers per project, Postgres, migrations with schema versions, gateways,
-  external publishing
 - [ ] `huta snapshot`: a sanitized copy of data for debugging
 - [ ] Unattended releases
 - [ ] Monitoring hooks; plain (non-Cloudflare) TLS

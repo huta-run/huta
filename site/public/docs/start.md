@@ -47,8 +47,9 @@ Details: [transports.md](transports.md), [commands.md](commands.md).
 
 ## What huta can deploy
 
-Exactly one HTTP container per project (the `web` recipe): a static site or an HTTP service.
-The host can give it, when the operator grants them in the host registry:
+An HTTP service or a static site (the `web` recipe): one container, or several components per
+target (a web front, an API, workers) that release together. The host can give it, when the
+operator grants them in the host registry:
 
 - **secrets and settings** as environment variables;
 - **outbound HTTPS** to an allowlist of hostnames, and named host services (upstreams);
@@ -56,12 +57,17 @@ The host can give it, when the operator grants them in the host registry:
   file on it is fine);
 - **scheduled jobs** that run in the same image;
 - **smoke checks** before traffic moves, and an automatic switch back when the public checks
-  fail.
+  fail;
+- **its own Postgres**, run by huta, with an `app` role for the code and a `migrate` role for
+  schema changes;
+- **schema migrations** (`[migrate]`), exclusive by default, online when everyone allows it,
+  with a pinned restore point and restore plans to go back;
+- **publishing to Cloudflare** Pages or Workers as a step of the release.
 
-What each means for your code: [Runtime](runtime.md). Moving a site that already runs on the
-server: [Moving a live site](moving.md). Not available: several containers per project,
-Postgres as a managed service, preflight checks, plain-HTTP egress. If the project needs one
-of those, tell the human.
+What each means for your code: [Runtime](runtime.md) and [Contract](contract.md). Moving a site
+that already runs on the server: [Moving a live site](moving.md). Not available: preflight
+checks, plain-HTTP egress, a data volume and a database on one target together, unattended
+releases. If the project needs one of those, tell the human.
 
 ## Checklist, in order
 

@@ -264,11 +264,13 @@
           <li>Read-only debugging for agents: <code>status</code>, <code>log</code>, <code>jobs</code>, <code>logs</code>, <code>egress-log</code>, <code>traffic</code>, <code>crashes</code>, <code>diag</code></li>
           <li>Caddy as the edge with generated vhosts, Cloudflare Origin CA certificates</li>
           <li>Crash recovery with <code>huta reconcile</code>; rollback as an approved plan</li>
+          <li>Several containers per target: a slot is the whole set, workers hand over after the switch</li>
+          <li>Postgres per target, run by huta; schema migrations with restore points and restore plans</li>
+          <li>Gateways for services huta doesn't run; publishing to Cloudflare Pages and Workers</li>
         </ul>
       </div>
       <p class="lead">Planned, not built:</p>
       <ul class="plan">
-        <li>Several containers per project, Postgres, migrations, gateways, external publishing</li>
         <li><code>huta snapshot</code>: a sanitized copy of data for debugging</li>
         <li>Unattended releases</li>
         <li>Monitoring hooks; TLS without Cloudflare</li>
