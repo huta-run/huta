@@ -1,0 +1,138 @@
+{
+  "access_log": true,
+  "adopt": "",
+  "cloudflare": "orange",
+  "compose": {
+    "name": "huta_hello_prod",
+    "networks": {
+      "n2": {
+        "driver_opts": {
+          "com.docker.network.bridge.enable_icc": "false",
+          "com.docker.network.bridge.name": "dp-4ebfb9dd3faf"
+        },
+        "name": "huta_hello_prod_n2"
+      }
+    },
+    "services": {
+      "slot-a": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": 1.0,
+        "dns": [
+          "127.0.0.254"
+        ],
+        "environment": {
+          "HUTA_PROJECT": "hello",
+          "HUTA_SLOT": "a",
+          "HUTA_TARGET": "prod",
+          "RELEASE_SHA": "<sha>"
+        },
+        "image": "<image>",
+        "labels": {
+          "run.huta.project": "hello",
+          "run.huta.sha": "<sha>",
+          "run.huta.slot": "a",
+          "run.huta.target": "prod"
+        },
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "compress": "false",
+            "max-file": "3",
+            "max-size": "10m"
+          }
+        },
+        "mem_limit": "256m",
+        "networks": [
+          "n2"
+        ],
+        "pids_limit": 128,
+        "ports": [
+          "127.0.0.1:19100:8080"
+        ],
+        "pull_policy": "never",
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "stop_grace_period": "10s",
+        "tmpfs": [
+          "/tmp:size=16777216,mode=1777"
+        ],
+        "user": "29001:29001"
+      },
+      "slot-b": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": 1.0,
+        "dns": [
+          "127.0.0.254"
+        ],
+        "environment": {
+          "HUTA_PROJECT": "hello",
+          "HUTA_SLOT": "b",
+          "HUTA_TARGET": "prod",
+          "RELEASE_SHA": "<sha>"
+        },
+        "image": "<image>",
+        "labels": {
+          "run.huta.project": "hello",
+          "run.huta.sha": "<sha>",
+          "run.huta.slot": "b",
+          "run.huta.target": "prod"
+        },
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "compress": "false",
+            "max-file": "3",
+            "max-size": "10m"
+          }
+        },
+        "mem_limit": "256m",
+        "networks": [
+          "n2"
+        ],
+        "pids_limit": 128,
+        "ports": [
+          "127.0.0.1:19101:8080"
+        ],
+        "pull_policy": "never",
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "stop_grace_period": "10s",
+        "tmpfs": [
+          "/tmp:size=16777216,mode=1777"
+        ],
+        "user": "29001:29001"
+      }
+    }
+  },
+  "container_port": 8080,
+  "data": null,
+  "diag": [],
+  "drain": 10,
+  "egress": "none",
+  "env": {},
+  "health": "/healthz",
+  "hosts": [
+    "hello.example.org"
+  ],
+  "job_secrets": {},
+  "jobs": [],
+  "limits": {},
+  "secrets": [],
+  "slots": [
+    19100,
+    19101
+  ],
+  "smoke": [],
+  "uid": 29001,
+  "upstreams": {}
+}

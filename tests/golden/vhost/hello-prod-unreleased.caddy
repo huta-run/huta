@@ -1,0 +1,12 @@
+# managed-by: huta — project hello, target prod.
+# Generated from /etc/huta/projects.d/hello.toml. Do not edit by hand.
+hello.example.org {
+	tls /etc/huta/tls/example.pem /etc/huta/tls/example.key
+	@notcf not remote_ip 173.245.48.0/20 2400:cb00::/32
+	abort @notcf
+	encode zstd gzip
+	respond "not released yet" 503
+	log {
+		output file /var/log/caddy/hello.example.org.log
+	}
+}

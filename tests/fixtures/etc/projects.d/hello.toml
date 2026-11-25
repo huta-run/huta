@@ -1,0 +1,10 @@
+# Test fixture: the simplest v1 target (no data, no egress, no secrets, all defaults).
+schema = 1
+project = "hello"
+repo = "example/hello"
+app_toml = "examples/hello/deploy/app.toml"
+uid = 29001
+
+[targets.prod]
+hosts = ["hello.example.org"]
+slots = [19100, 19101]

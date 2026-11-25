@@ -1,0 +1,19 @@
+# Test fixture: a made-up host. Nothing here is a real host, address or account.
+schema = 1
+
+[platform]
+host = "host.example.org"
+state_dir = "/var/lib/huta"
+caddy_sites = "/etc/caddy/Caddyfile.d"
+caddy_log_dir = "/var/log/caddy"
+
+[cloudflare]
+zones = ["example.org"]
+
+[upstreams.mail-relay]
+to = "127.0.0.1:2525"
+port = 4881
+
+[upstreams.media]
+to = "100.64.0.5:8080"
+port = 4882

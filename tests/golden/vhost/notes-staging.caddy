@@ -1,0 +1,10 @@
+# managed-by: huta — project notes, target staging.
+# Generated from /etc/huta/projects.d/notes.toml. Do not edit by hand.
+staging.notes.example.org {
+	tls /etc/huta/tls/example.pem /etc/huta/tls/example.key
+	@notcf not remote_ip 173.245.48.0/20 2400:cb00::/32
+	abort @notcf
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:19112
+	# access_log = false: no access log for this site
+}

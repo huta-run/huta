@@ -36,4 +36,10 @@ It lives at https://github.com/huta-run/huta, and every commit and commit messag
   Agents learn huta from the site, so a stale page is a bug. Mark anything not built yet as
   "planned".
 - Write docs with Edit/Write, not through shell quoting.
+- **Run the tests before every commit:** `python3 -I -m unittest discover -s tests -t .`
+  (standard library only). `tests/golden/` holds what huta generates today for v1 targets
+  (compose, vhost, the plan's `effective`, names). Those snapshots are the compatibility
+  contract: a target that uses no new feature must run exactly as before. Rewrite them
+  (`HUTA_UPDATE_GOLDEN=1`) only for an intended change, and say why in the commit. Test
+  fixtures use made-up values only, like everything else here.
 - Commits: small, present-tense subject, why in the body.

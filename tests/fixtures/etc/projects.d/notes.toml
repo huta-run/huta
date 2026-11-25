@@ -1,0 +1,26 @@
+# Test fixture: a v1 target using most registry settings (data, egress, secrets, upstreams,
+# limits, job secrets), plus a second target with a single writer and no access log.
+schema = 1
+project = "notes"
+repo = "example/notes"
+app_toml = "examples/notes/deploy/app.toml"
+uid = 29002
+boxes = ["dev"]
+
+[targets.prod]
+hosts = ["notes.example.org", "www.notes.example.org"]
+slots = [19110, 19111]
+egress = ["api.example.com:443", "*.example.net:443"]
+upstreams = ["mail-relay"]
+drain = 5
+env = { NOTES_TITLE = "notes", PRICE = "$5" }
+secrets = ["NOTES_TOKEN"]
+job_secrets = { rotate = ["ROTATE_KEY"] }
+limits = { memory = "512m", cpus = 2, pids = 256, tmp = "64m" }
+data = { size = "2g", backup = "hourly", concurrent = true }
+
+[targets.staging]
+hosts = ["staging.notes.example.org"]
+slots = [19112, 19113]
+access_log = false
+data = { size = "1g", backup = "daily" }

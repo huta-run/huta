@@ -1,0 +1,132 @@
+{
+  "name": "huta_notes_staging",
+  "networks": {
+    "n2": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "false",
+        "com.docker.network.bridge.name": "dp-a3cfb62f7cab"
+      },
+      "name": "huta_notes_staging_n2"
+    }
+  },
+  "services": {
+    "slot-a": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "HUTA_PROJECT": "notes",
+        "HUTA_SLOT": "a",
+        "HUTA_TARGET": "staging",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.project": "notes",
+        "run.huta.sha": "0123456789abcdef0123456789abcdef01234567",
+        "run.huta.slot": "a",
+        "run.huta.target": "staging"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": [
+        "n2"
+      ],
+      "pids_limit": 128,
+      "ports": [
+        "127.0.0.1:19112:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29002:29002",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/notes/staging",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    },
+    "slot-b": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "HUTA_PROJECT": "notes",
+        "HUTA_SLOT": "b",
+        "HUTA_TARGET": "staging",
+        "RELEASE_SHA": "ffffffffffffffffffffffffffffffffffffffff"
+      },
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.project": "notes",
+        "run.huta.sha": "ffffffffffffffffffffffffffffffffffffffff",
+        "run.huta.slot": "b",
+        "run.huta.target": "staging"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": [
+        "n2"
+      ],
+      "pids_limit": 128,
+      "ports": [
+        "127.0.0.1:19113:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29002:29002",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/notes/staging",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    }
+  }
+}

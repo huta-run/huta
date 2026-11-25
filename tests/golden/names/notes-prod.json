@@ -1,0 +1,9 @@
+{
+  "bridge": "dp-f7b5042cbaf5",
+  "compose": "huta_notes_prod",
+  "network": "huta_notes_prod_n2",
+  "services": [
+    "slot-a",
+    "slot-b"
+  ]
+}

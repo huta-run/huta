@@ -1,0 +1,193 @@
+{
+  "access_log": false,
+  "adopt": "",
+  "cloudflare": "orange",
+  "compose": {
+    "name": "huta_notes_staging",
+    "networks": {
+      "n2": {
+        "driver_opts": {
+          "com.docker.network.bridge.enable_icc": "false",
+          "com.docker.network.bridge.name": "dp-a3cfb62f7cab"
+        },
+        "name": "huta_notes_staging_n2"
+      }
+    },
+    "services": {
+      "slot-a": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": 1.0,
+        "dns": [
+          "127.0.0.254"
+        ],
+        "environment": {
+          "HUTA_PROJECT": "notes",
+          "HUTA_SLOT": "a",
+          "HUTA_TARGET": "staging",
+          "RELEASE_SHA": "<sha>"
+        },
+        "image": "<image>",
+        "labels": {
+          "run.huta.project": "notes",
+          "run.huta.sha": "<sha>",
+          "run.huta.slot": "a",
+          "run.huta.target": "staging"
+        },
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "compress": "false",
+            "max-file": "3",
+            "max-size": "10m"
+          }
+        },
+        "mem_limit": "256m",
+        "networks": [
+          "n2"
+        ],
+        "pids_limit": 128,
+        "ports": [
+          "127.0.0.1:19112:8080"
+        ],
+        "pull_policy": "never",
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "stop_grace_period": "10s",
+        "tmpfs": [
+          "/tmp:size=16777216,mode=1777"
+        ],
+        "user": "29002:29002",
+        "volumes": [
+          {
+            "bind": {
+              "create_host_path": false
+            },
+            "source": "/var/lib/huta/data/notes/staging",
+            "target": "/data",
+            "type": "bind"
+          }
+        ]
+      },
+      "slot-b": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": 1.0,
+        "dns": [
+          "127.0.0.254"
+        ],
+        "environment": {
+          "HUTA_PROJECT": "notes",
+          "HUTA_SLOT": "b",
+          "HUTA_TARGET": "staging",
+          "RELEASE_SHA": "<sha>"
+        },
+        "image": "<image>",
+        "labels": {
+          "run.huta.project": "notes",
+          "run.huta.sha": "<sha>",
+          "run.huta.slot": "b",
+          "run.huta.target": "staging"
+        },
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "compress": "false",
+            "max-file": "3",
+            "max-size": "10m"
+          }
+        },
+        "mem_limit": "256m",
+        "networks": [
+          "n2"
+        ],
+        "pids_limit": 128,
+        "ports": [
+          "127.0.0.1:19113:8080"
+        ],
+        "pull_policy": "never",
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "stop_grace_period": "10s",
+        "tmpfs": [
+          "/tmp:size=16777216,mode=1777"
+        ],
+        "user": "29002:29002",
+        "volumes": [
+          {
+            "bind": {
+              "create_host_path": false
+            },
+            "source": "/var/lib/huta/data/notes/staging",
+            "target": "/data",
+            "type": "bind"
+          }
+        ]
+      }
+    }
+  },
+  "container_port": 8080,
+  "data": {
+    "backup": "daily",
+    "bytes": 1073741824,
+    "concurrent": false,
+    "concurrent_safe": false,
+    "mount": "/data",
+    "size": "1g"
+  },
+  "diag": [],
+  "drain": 10,
+  "egress": "none",
+  "env": {},
+  "health": "/healthz",
+  "hosts": [
+    "staging.notes.example.org"
+  ],
+  "job_secrets": {},
+  "jobs": [
+    {
+      "cmd": [
+        "python",
+        "/app/app.py",
+        "rotate"
+      ],
+      "name": "rotate",
+      "schedule": "*-*-* 04:20:00",
+      "timeout": 300
+    }
+  ],
+  "limits": {},
+  "secrets": [],
+  "slots": [
+    19112,
+    19113
+  ],
+  "smoke": [
+    {
+      "contains": "<title>notes</title>",
+      "headers": {
+        "content-security-policy": "frame-ancestors 'none'"
+      },
+      "path": "/",
+      "request_headers": {},
+      "status": 200
+    },
+    {
+      "contains": "",
+      "headers": {},
+      "path": "/nope",
+      "request_headers": {},
+      "status": 404
+    }
+  ],
+  "uid": 29002,
+  "upstreams": {}
+}

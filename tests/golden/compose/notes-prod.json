@@ -1,0 +1,164 @@
+{
+  "name": "huta_notes_prod",
+  "networks": {
+    "n2": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "false",
+        "com.docker.network.bridge.name": "dp-f7b5042cbaf5"
+      },
+      "name": "huta_notes_prod_n2"
+    }
+  },
+  "services": {
+    "slot-a": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 2.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "ALL_PROXY": "",
+        "HTTPS_PROXY": "http://huta-egress:4880",
+        "HTTP_PROXY": "http://huta-egress:4880",
+        "HUTA_PROJECT": "notes",
+        "HUTA_SLOT": "a",
+        "HUTA_TARGET": "prod",
+        "HUTA_UPSTREAM_MAIL_RELAY": "huta-egress:4881",
+        "NODE_USE_ENV_PROXY": "1",
+        "NOTES_TITLE": "notes",
+        "NOTES_TOKEN": "‹secret›",
+        "NO_PROXY": "localhost,127.0.0.1,huta-egress",
+        "PRICE": "$$5",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567",
+        "all_proxy": "",
+        "http_proxy": "http://huta-egress:4880",
+        "https_proxy": "http://huta-egress:4880",
+        "no_proxy": "localhost,127.0.0.1,huta-egress"
+      },
+      "extra_hosts": [
+        "huta-egress:host-gateway"
+      ],
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.project": "notes",
+        "run.huta.sha": "0123456789abcdef0123456789abcdef01234567",
+        "run.huta.slot": "a",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "512m",
+      "networks": [
+        "n2"
+      ],
+      "pids_limit": 256,
+      "ports": [
+        "127.0.0.1:19110:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=67108864,mode=1777"
+      ],
+      "user": "29002:29002",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/notes/prod",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    },
+    "slot-b": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 2.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "ALL_PROXY": "",
+        "HTTPS_PROXY": "http://huta-egress:4880",
+        "HTTP_PROXY": "http://huta-egress:4880",
+        "HUTA_PROJECT": "notes",
+        "HUTA_SLOT": "b",
+        "HUTA_TARGET": "prod",
+        "HUTA_UPSTREAM_MAIL_RELAY": "huta-egress:4881",
+        "NODE_USE_ENV_PROXY": "1",
+        "NOTES_TITLE": "notes",
+        "NOTES_TOKEN": "‹secret›",
+        "NO_PROXY": "localhost,127.0.0.1,huta-egress",
+        "PRICE": "$$5",
+        "RELEASE_SHA": "ffffffffffffffffffffffffffffffffffffffff",
+        "all_proxy": "",
+        "http_proxy": "http://huta-egress:4880",
+        "https_proxy": "http://huta-egress:4880",
+        "no_proxy": "localhost,127.0.0.1,huta-egress"
+      },
+      "extra_hosts": [
+        "huta-egress:host-gateway"
+      ],
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.project": "notes",
+        "run.huta.sha": "ffffffffffffffffffffffffffffffffffffffff",
+        "run.huta.slot": "b",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "512m",
+      "networks": [
+        "n2"
+      ],
+      "pids_limit": 256,
+      "ports": [
+        "127.0.0.1:19111:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=67108864,mode=1777"
+      ],
+      "user": "29002:29002",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/notes/prod",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    }
+  }
+}

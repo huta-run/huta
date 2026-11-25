@@ -10,6 +10,8 @@ node_modules/
 /tmp/
 # Operator settings stay local (see CLAUDE.md): never commit a real host's config.
 huta.toml
+# The one exception: a made-up test fixture.
+!/tests/fixtures/etc/huta.toml
 client.toml
 *enroll*.json
 /etc/
