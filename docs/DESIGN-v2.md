@@ -192,7 +192,7 @@ cmd = ["python", "-m", "app.worker"]
 - Compose services are `slot-a-<component>`; a one-component target keeps `slot-a`/`slot-b`
   and its single network, unchanged.
 
-## 4. Postgres, one per target
+## 4. Postgres, one per target (built)
 
 ```toml
 # huta.toml (host)

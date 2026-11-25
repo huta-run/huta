@@ -1,0 +1,19 @@
+# Test fixture: one web component on the target's Postgres, migrated with alembic.
+schema = 1
+project = "ledger"
+order = ["web"]
+
+[images.web]
+dockerfile = "Dockerfile"
+
+[components.web]
+image = "web"
+port = 8080
+
+[state]
+kind = "postgres"
+schema = 1
+
+[migrate]
+image = "web"
+cmd = ["alembic", "upgrade", "head"]

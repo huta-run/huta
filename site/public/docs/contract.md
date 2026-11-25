@@ -196,11 +196,23 @@ data = "/data"
 
 ### `[state]`
 
-`kind`: `"none"` (default) or `"data"`. With `"data"` the host gives the target its own
+`kind`: `"none"` (default), `"data"` or `"postgres"` (below). With `"data"` the host gives the target its own
 filesystem (a fixed size, set by the operator), mounted at `components.<c>.data`, backed up on a
 schedule. A plan whose app.toml asks for data while the host registry gives the target none is
 refused: `app.toml mounts data at /data, but the host registry gives myapp/prod no data`.
-Postgres is *planned*; an SQLite file on the data volume works today.
+With `"postgres"` the release uses the target's own database server (the host must grant
+`postgres` in the registry):
+
+- huta runs one Postgres per target, from an image the operator pins by digest, on its own
+  volume and its own internal networks (no route out). Your containers reach it as
+  `postgres:5432`, slot a and slot b each on their own network to it.
+- Your components get `DATABASE_URL` (`postgresql://app:…@postgres:5432/app`). The `app` role
+  may read and write rows but not change the schema: create and change tables in `[migrate]`,
+  which gets the `migrate` role (it owns the schema) and reaches only the database.
+- Releases without a migration overlap as usual (both slots on the database); a migration runs
+  exclusive, with a dump pinned as its restore point, as for data.
+- Backups are `pg_dump` files on the target's schedule, shipped like data copies.
+- A data volume and a database on one target together are not supported yet.
 
 With data, two optional keys version it:
 
@@ -449,6 +461,7 @@ see each other: the box is the unit huta can tell apart.
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
 | `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
+| `postgres` | table | | `version` (a name in `huta.toml` `[postgres.images]`), `size` (256m..2t), `backup` (`hourly`/`daily`/`off`/an OnCalendar, default `daily`), `limits` (default 1g memory, 2 cpus). Needs `[backup]` in `huta.toml`. A target named `<this>-pg` can't exist next to it |
 | `worker_liveness` | int | `10` | 1..300 seconds a new worker must stay up after the switch |
 | `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |
 | `kind` | string | `"app"` | `"gateway"`: a hostname huta proxies to a service it doesn't run (below) |

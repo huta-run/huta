@@ -133,6 +133,8 @@ host = "myhost"
 notify = ["/usr/local/bin/notify-owner"]   # optional fallback, used only without [telegram]
 caddy_secrets = "/etc/caddy/huta-secrets"  # v2 gateways' header files (the default)
 caddy_group = "caddy"                       # the group Caddy runs as (the default)
+[postgres.images]              # v2: the only Postgres images targets may run, pinned by digest
+"17" = "postgres@sha256:<64 hex>"
 [cloudflare]
 zones = ["example.org"]        # huta refuses any Cloudflare call outside this list
 [transport.pull]               # optional
@@ -358,6 +360,17 @@ recorded one runs exclusive: stop every writer → copy (quiet) → pin the copy
 schema recorded, phase `migrated` → start, check, switch. Any failure before the switch, or a
 crash, restores the copy and the schema: nothing but the migration wrote since the copy.
 `health_timeout` (registry) sets how long a new slot has to get healthy.
+Postgres (DESIGN-v2 §4, `pg.py`): one server per target in compose project
+`huta_<p>_<t>_pg`, image from `[postgres.images]`, its own loop volume (`<t>-pg.img`, PGDATA
+`pgdata-<version>`), the project uid, read-only root, internal networks `…_pga`/`_pgb`/`_pgm`
+(slot a, slot b, the migration; bridges `dp-<hash>`, in the guard's `huta_intra` set). Roles
+`huta_owner`, `migrate` (owns the schema) and `app` (rows only), passwords as project secrets
+`HUTA_PG_<TARGET>_<ROLE>`. A release that asks for it: `PG.ensure` (create or repair; a changed
+definition is refused: `huta postgres upgrade` plans it), slots join their network with
+`DATABASE_URL`, `[migrate]` runs on `…_pgm` with the migrate role; copies, pins and restores are
+`pg_dump -Fc` / `pg_restore --single-transaction` under `<backup>/<p>/<t>-pg/`. Jobs join the
+live slot's database network as a second `--network` (Docker 25+). reconcile starts a stopped
+server first; an interrupted upgrade puts the old definition back.
 Restore plans (`huta restore`) put a kept restore point back for code that can't run on the
 current schema: stop marker, stop every slot, rsync the pin (its fingerprint checked again), the
 point's schema recorded, phase `restoring` so reconcile redoes it after a crash. The target stays

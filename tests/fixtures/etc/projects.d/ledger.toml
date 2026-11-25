@@ -1,0 +1,11 @@
+# Test fixture: a target with its own Postgres (DESIGN-v2 §4).
+schema = 1
+project = "ledger"
+repo = "example/ledger"
+app_toml = "deploy/app.toml"
+uid = 29004
+
+[targets.prod]
+hosts = ["ledger.example.org"]
+slots = [19140, 19141]
+postgres = { version = "17", size = "2g", backup = "hourly" }

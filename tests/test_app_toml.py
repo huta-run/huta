@@ -152,6 +152,21 @@ class SeveralComponents(unittest.TestCase):
         self.refused(MULTI.replace('data = "/data"\n', ""), "needs components")
 
 
+class Postgres(unittest.TestCase):
+    """[state] kind = "postgres" (DESIGN-v2 §4)."""
+
+    def test_accepted_with_schema_and_migrate(self):
+        text = HELLO.replace('kind = "none"', 'kind = "postgres"\nschema = 1') + \
+            '\n[migrate]\nimage = "web"\ncmd = ["alembic", "upgrade", "head"]\n'
+        app = parse_app_toml(text, "hello")
+        self.assertEqual(app["state"], {"kind": "postgres", "schema": 1, "runs_on": [1]})
+
+    def test_no_data_volume_with_it(self):
+        text = NOTES.replace('[state]\nkind = "data"', '[state]\nkind = "postgres"')
+        with self.assertRaisesRegex(ConfigError, "not supported yet"):
+            parse_app_toml(text, "notes")
+
+
 class PlannedFeaturesRefused(unittest.TestCase):
     """Today's refusals. A v2 step that builds a feature replaces its test here."""
 
@@ -170,8 +185,6 @@ class PlannedFeaturesRefused(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "not supported by huta yet"):
             parse_app_toml(MIGRATING.replace('"migrate"]', '"migrate"]\nonline = true'), "notes")
 
-    def test_postgres_state(self):
-        self.refused(HELLO.replace('kind = "none"', 'kind = "postgres"'), "state.kind")
 
 
 if __name__ == "__main__":

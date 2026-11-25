@@ -86,8 +86,9 @@ def wanted_units(t: Target, jobs: list[dict]) -> dict[str, str]:
         out[f"{u}.service"] = _service(desc, [HUTA, "job", "run", t.project, t.name, j["name"]],
                                        j["timeout"], container=u)
         out[f"{u}.timer"] = _timer(desc, j["schedule"])
-    if t.data and t.data["backup"] != "off":
-        cal = {"hourly": "hourly", "daily": "*-*-* 03:30:00"}.get(t.data["backup"], t.data["backup"])
+    sched = next((x["backup"] for x in (t.data, t.postgres) if x and x["backup"] != "off"), None)
+    if sched:
+        cal = {"hourly": "hourly", "daily": "*-*-* 03:30:00"}.get(sched, sched)
         desc = f"huta backup {t.project}/{t.name}"
         # The copy may take 6 h and the ship 4 h: the unit must outlast both (grok #8).
         out[f"{backup_unit(t)}.service"] = _service(desc, [HUTA, "backup", t.project, t.name],
@@ -159,7 +160,7 @@ def run_job(platform: Platform, project: Project, t: Target, name: str, st, log)
             from .data import mounted
             if not mounted(R.data_paths(platform, t)[1]):
                 raise ConfigError("the data volume is not mounted")
-        env = R.environment(platform, project, t, rel["sha"], "job", with_secrets=True)
+        env = R.environment(platform, project, t, rel["sha"], "job", with_secrets=True, app=app)
         env["HUTA_JOB"] = name
         for k in t.job_secrets.get(name, []):      # this job's own secrets, never the slots'
             env[k] = R.secret_value(platform, project.name, k)
@@ -177,10 +178,15 @@ def run_job(platform: Platform, project: Project, t: Target, name: str, st, log)
             # wrap it unseen (job secrets review, grok #1).
             entry = ["--entrypoint", cmd[0]]
             cmd = cmd[1:]
+        # With the target's Postgres a job also joins the live slot's database network (as the
+        # slot does); docker run takes a second --network since Docker 25.
+        from . import pg as PG
+        pg_net = (["--network", PG.network(t, live["slot"])]
+                  if t.postgres and PG.wants(app) else [])
         args = ["docker", "run", "--rm", *R.docker_run_args(platform, project, t, app,
                                                             network, env, cname, labels,
                                                             comp_name if SP.several(app) else None),
-                *entry, image, *cmd]
+                *pg_net, *entry, image, *cmd]
         # Values reach docker through its environment (--env NAME), never the command line.
         proc = subprocess.Popen(args, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", **env}, cwd="/",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

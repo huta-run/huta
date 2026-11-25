@@ -24,6 +24,7 @@ from . import runtime as R
 from . import store as S
 from .cfg import Platform, Project, Target
 from .ext import UA
+from . import pg as PG
 from . import spec as SP
 
 TAG_RE = re.compile(r"^huta/[a-z][a-z0-9-]*:[0-9a-f]{12}-[0-9a-f]{12}$")
@@ -185,10 +186,10 @@ def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
             # Pinned, not the host's default: huta logs reads these files (logs.py).
             "logging": L.SLOT_LOGGING,
             "environment": R.compose_escape(R.environment(platform, project, t, sha, slot,
-                                                          with_secrets)),
+                                                          with_secrets, app)),
             "labels": {"run.huta.project": project.name, "run.huta.target": t.name,
                        "run.huta.slot": slot, "run.huta.sha": sha},
-            "networks": [f"n{NET_GEN}"],
+            "networks": [f"n{NET_GEN}", *([f"pg{slot}"] if _uses_pg(t, app) else [])],
         }
         if R.needs_gateway(t):
             svc["extra_hosts"] = [f"{R.EGRESS_HOST}:host-gateway"]
@@ -200,10 +201,12 @@ def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
     # A named key per generation, never `default`: compose treats `default` as the project's own
     # network and tries to delete and recreate it when its options change, which fails while the
     # live slot is attached (found 2026-11-09). A new key is simply created alongside.
+    pg_nets = ({f"pg{s}": {"name": PG.network(t, s), "external": True} for s in SLOTS}
+               if _uses_pg(t, app) else {})
     return {
         "name": compose_name(t),
         "services": services,
-        "networks": {f"n{NET_GEN}": {
+        "networks": {**pg_nets, f"n{NET_GEN}": {
             "name": network_name(t),
             # ICC off: the new (untrusted) slot can't reach the live slot over the bridge
             # (grok #2). Egress and host services are blocked by the host firewall, which
@@ -245,12 +248,13 @@ def _compose_several(platform: Platform, project: Project, t: Target, app: dict,
                 "stop_grace_period": "10s",
                 "logging": L.SLOT_LOGGING,
                 "environment": R.compose_escape(R.component_environment(
-                    platform, project, t, sha, slot, cname, cname == public, with_secrets)),
+                    platform, project, t, sha, slot, cname, cname == public, with_secrets, app)),
                 "labels": {"run.huta.project": project.name, "run.huta.target": t.name,
                            "run.huta.slot": slot, "run.huta.sha": sha,
                            "run.huta.component": cname,
                            **({"run.huta.public": "1"} if cname == public else {})},
-                "networks": {net: {"aliases": [cname]}},
+                "networks": {net: {"aliases": [cname]},
+                             **({f"pg{slot}": {}} if _uses_pg(t, app) else {})},
             }
             if cname == public:
                 svc["ports"] = [f"127.0.0.1:{port}:{int(c.get('port', 8080))}"]
@@ -263,7 +267,36 @@ def _compose_several(platform: Platform, project: Project, t: Target, app: dict,
                 svc["volumes"] = [{"type": "bind", "source": str(where), "target": c["data"],
                                    "bind": {"create_host_path": False}}]
             services_[f"slot-{slot}-{cname}"] = svc
+    if _uses_pg(t, app):
+        networks.update({f"pg{s}": {"name": PG.network(t, s), "external": True} for s in SLOTS})
     return {"name": compose_name(t), "services": services_, "networks": networks}
+
+
+def _uses_pg(t: Target, app: dict) -> bool:
+    return bool(t.postgres) and PG.wants(app)
+
+
+def _res(app: dict):
+    """What a release copies, restores and pins: its data volume or its database."""
+    import types
+    from . import data as D
+    if PG.wants(app):
+        return types.SimpleNamespace(
+            kind="postgres",
+            copy=lambda platform, t, log, quiet=False: PG.copy(platform, t, log, quiet),
+            restore=lambda *a: PG.restore_copy(*a),
+            pin=lambda *a: PG.pin_copy(*a),
+            restore_pin=lambda *a: PG.restore_pin(*a))
+    return types.SimpleNamespace(
+        kind="data",
+        copy=lambda platform, t, log, quiet=False: D.copy_consistent(platform, t, log, quiet=quiet),
+        restore=lambda *a: D.restore_copy(*a),
+        pin=lambda *a: D.pin_copy(*a),
+        restore_pin=lambda *a: D.restore_pin(*a))
+
+
+def _res_of(kind: str | None):
+    return _res({"state": {"kind": kind or "data"}})
 
 
 def compose_file(platform: Platform, t: Target) -> Path:
@@ -489,7 +522,8 @@ def _phase_set(platform: Platform, t: Target, **rec) -> None:
 PHASE_VERSION = 2
 KNOWN_STAGES = {None, "switching", "checks",
                 "migrating", "migrated",      # DESIGN-v2 §2: exclusive migrations
-                "restoring"}                  # DESIGN-v2 §2: restore plans
+                "restoring",                  # DESIGN-v2 §2: restore plans
+                "pg-upgrade"}                 # DESIGN-v2 §4: postgres upgrade plans
 
 
 def _phase_get(platform: Platform, t: Target) -> dict | None:
@@ -543,6 +577,13 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     nothing routes to; thaws the data volume (a backup interrupted while it was frozen)."""
     if t.kind == "gateway":
         return       # nothing runs; its edge changes are journaled like every vhost change
+    if t.postgres:
+        cid = PG.container(t)
+        if cid and not PG.running(t):
+            # The database goes first: the slots that use it start after (DESIGN-v2 §4).
+            sh(["docker", "start", cid])
+            st.event("recovered", "started the target's postgres again", None, project.name, t.name)
+            log("reconcile: started postgres again")
     if t.data:
         from .data import thaw
         thaw(R.data_paths(platform, t)[1])
@@ -569,6 +610,14 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         st.event("needs-human", f"reconcile stopped: {why_not}", None, project.name, t.name)
         raise RecipeError(f"{why_not}; the phase file is kept: needs a human")
     ph0 = _phase_get(platform, t)
+    if ph0 and ph0.get("stage") == "pg-upgrade":
+        # An approved postgres upgrade was interrupted: the old definition comes back (its data
+        # directory was never touched); the plan is recorded as failed below; the slots start
+        # again further down.
+        log("reconcile: undoing an interrupted postgres upgrade")
+        if ph0.get("step") == "switching":
+            PG.revert_upgrade(platform, project, t, ph0["old_doc"], log)
+        _phase_clear(platform, t)
     if ph0 and ph0.get("stage") == "restoring":
         # An approved restore was interrupted: do it again (it is idempotent), then the target
         # stays stopped as the plan said. The plan is recorded as applied.
@@ -620,8 +669,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             # A first release that copied the data (to migrate it) died before its switch:
             # nothing else ran since the copy, so putting it back loses nothing.
             sh(["docker", "rm", "-f", migrate_name(t)], check=False)
-            from .data import restore_copy
-            restore_copy(platform, project, t, log)
+            _res_of(phase.get("res")).restore(platform, project, t, log)
             _reset_schema(st, t, phase)
             _phase_set(platform, t, **{**phase, "copied": False, "restored": True,
                                        "migrated": False})
@@ -648,8 +696,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
                     raise RecipeError(f"slot {slot} would not stop: needs a human")
                 log(f"reconcile: stopped the interrupted release's slot {slot}")
         if phase.get("copied"):
-            from .data import restore_copy
-            restore_copy(platform, project, t, log)
+            _res_of(phase.get("res")).restore(platform, project, t, log)
             _reset_schema(st, t, phase)
             # Restored: never again, even if starting the old slot fails (codex final #1).
             _phase_set(platform, t, **{**phase, "copied": False, "restored": True,
@@ -744,9 +791,9 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
 
 # ------------------------------------------------------------------ migrations (DESIGN-v2 §2)
 
-def schema_now(st: S.Store, t: Target):
-    """The schema the target's data is at, or None (never versioned)."""
-    r = st.resource(t.project, t.name, "data")
+def schema_now(st: S.Store, t: Target, kind: str = "data"):
+    """The schema the target's data (or database) is at, or None (never versioned)."""
+    r = st.resource(t.project, t.name, kind)
     return r["schema"] if r else None
 
 
@@ -757,7 +804,7 @@ def migration(st: S.Store, t: Target, app: dict) -> dict | None:
     schema change without [migrate]."""
     st_cfg = app.get("state") or {}
     m = st_cfg.get("schema")
-    s = schema_now(st, t)
+    s = schema_now(st, t, _res(app).kind)
     if m is None:
         if s is not None:
             raise RecipeError(f"the target's data is at schema {s}, and this release declares "
@@ -804,10 +851,16 @@ def run_migrate(platform: Platform, st: S.Store, project: Project, t: Target, ap
            "HUTA_SCHEMA_FROM": str(mig["from"] or 0), "HUTA_SCHEMA_TO": str(mig["to"])}
     for n in t.migrate_secrets:
         env[n] = R.secret_value(platform, project.name, n)
+    # With the target's Postgres: only the migration network (it reaches the database and
+    # nothing else) and the migrate role; otherwise no network at all.
+    network = "none"
+    if _uses_pg(t, app):
+        network = PG.network(t, "m")
+        env["DATABASE_URL"] = PG.database_url(platform, project, t, "migrate")
     labels = {"run.huta.project": project.name, "run.huta.target": t.name,
               "run.huta.migrate": rel["id"], "run.huta.sha": rel["sha"]}
     sh(["docker", "rm", "-f", name], check=False)
-    argv = ["docker", "run", "--rm", *R.docker_run_args(platform, project, t, app, "none", env,
+    argv = ["docker", "run", "--rm", *R.docker_run_args(platform, project, t, app, network, env,
                                                        name, labels), image, *m["cmd"]]
     log(f"migrating the data: schema {mig['from'] if mig['from'] is not None else 'unversioned'} "
         f"→ {mig['to']} ({' '.join(m['cmd'])}, at most {m['timeout']})")
@@ -835,7 +888,7 @@ def restore_point(platform: Platform, st: S.Store, project: Project, t: Target, 
         raise RecipeError("a job of this target is running; restore when it has finished")
     _phase_set(platform, t, v=PHASE_VERSION, stage="restoring", rid=pid, idle=None,
                point=plan["point"], path=plan["path"], fingerprint=plan["fingerprint"],
-               schema=plan["schema"])
+               schema=plan["schema"], res=plan.get("res", "data"))
     _finish_restore(platform, st, project, t, _phase_get(platform, t), log)
 
 
@@ -849,8 +902,10 @@ def _finish_restore(platform, st, project, t, phase: dict, log) -> None:
             stop_container(c["id"])
         if slot_containers(t).get(slot, {}).get("running"):
             raise RecipeError(f"slot {slot} would not stop: not restoring")
-    D.restore_pin(platform, project, t, _P(phase["path"]), phase["fingerprint"], log)
-    st.set_resource_schema(t.project, t.name, "data", phase["schema"], phase["rid"])
+    _res_of(phase.get("res")).restore_pin(platform, project, t, _P(phase["path"]),
+                                         phase["fingerprint"], log)
+    st.set_resource_schema(t.project, t.name, phase.get("res") or "data", phase["schema"],
+                           phase["rid"])
     st.event("restored", f"data restored to restore point {phase['point']}; the target is "
              "stopped until a release starts it", phase["rid"], t.project, t.name)
     _phase_clear(platform, t)
@@ -875,8 +930,8 @@ def prune_restore_points(platform: Platform, st: S.Store, t: Target, log) -> Non
 def _reset_schema(st: S.Store, t: Target, phase: dict) -> None:
     """A migration that may have run is undone by a restore: the recorded schema goes back."""
     if phase.get("migrated") or phase.get("stage") in ("migrating", "migrated"):
-        st.set_resource_schema(t.project, t.name, "data", phase.get("schema_from"),
-                               phase.get("rid"))
+        st.set_resource_schema(t.project, t.name, phase.get("res") or "data",
+                               phase.get("schema_from"), phase.get("rid"))
 
 
 # ------------------------------------------------------------------ run
@@ -923,9 +978,12 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     health = SP.health(app)
     checks = app.get("smoke", [])
     check_images(st, rel, app, project.name)
-    has_data = bool(R.data_mount(app))
+    has_data = bool(R.data_mount(app)) or any(c.get("data") for c in app["components"].values())
     if has_data and not t.data:
         raise RecipeError("app.toml mounts data, but the host registry gives this target none")
+    if PG.wants(app) and not t.postgres:
+        raise RecipeError("app.toml asks for postgres, but the host registry gives this target none")
+    res = _res(app)
     live = st.live(project.name, t.name)
     port_of = dict(zip(SLOTS, t.slots))
     cur = None
@@ -958,18 +1016,25 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
         except D.DataError as e:
             st.set_state(rid, S.NOTHING_ACTIVATED, msg=f"data not ready, nothing changed: {e}")
             return S.NOTHING_ACTIVATED
+    if PG.wants(app):
+        try:
+            log(f"postgres: {PG.ensure(platform, st, project, t, log)}")
+        except (PG.PgError, D.DataError, RecipeError) as e:
+            st.set_state(rid, S.NOTHING_ACTIVATED, msg=f"postgres not ready, nothing changed: {e}")
+            return S.NOTHING_ACTIVATED
     write_compose(platform, t, compose_doc(platform, project, t, app, images))
 
     # 1. Start and verify the new slot. The vhost does not route to it, so no traffic yet.
     stopped_old = copied = migrated = False
     failing = "new slot failed before any traffic"
-    mig_rec = {"schema_from": mig["from"]} if migrating else {}
+    mig_rec = {"schema_from": mig["from"], "res": res.kind} if migrating else {}
     try:
         if (live and not concurrent) or migrating:
             if jobs_running(t):
                 raise RecipeError("a job of this target is running (one writer at a time); "
                                   "submit again when it has finished")
-            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=False, **mig_rec)
+            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=False,
+                       **{"res": res.kind, **mig_rec})
             if live:
                 log(f"one writer at a time: stopping slot {live_slot} first (the site answers "
                     "502 until the switch)")
@@ -978,15 +1043,16 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
                 st.event("stopped-old", f"slot {live_slot} stopped before starting {idle}", rid,
                          project.name, t.name)
             # Taken after the stop, so restoring it after a failed start loses nothing.
-            D.copy_consistent(platform, t, log, quiet=True)
+            res.copy(platform, t, log, quiet=True)
             copied = True
-            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=True, **mig_rec)
+            _phase_set(platform, t, rid=rid, old=live_slot, idle=idle, copied=True,
+                       **{"res": res.kind, **mig_rec})
         if migrating:
-            path, fp = D.pin_copy(platform, t, rid)
+            path, fp = res.pin(platform, t, rid)
             st.db.execute(
                 "INSERT INTO restore_points (id, project, target, kind, release_id, path,"
                 " fingerprint, schema, created, state) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (rid, project.name, t.name, "data", rid, str(path), fp, mig["from"],
+                (rid, project.name, t.name, res.kind, rid, str(path), fp, mig["from"],
                  time.time(), "kept"))
             st.event("restore-point", f"pinned before migrating (schema {mig['from']}): {rid}",
                      rid, project.name, t.name)
@@ -995,7 +1061,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
             migrated, failing = True, "the migration failed"
             run_migrate(platform, st, project, t, app, rel, mig, log)
             failing = "new slot failed before any traffic"
-            st.set_resource_schema(project.name, t.name, "data", mig["to"], rid)
+            st.set_resource_schema(project.name, t.name, res.kind, mig["to"], rid)
             _phase_set(platform, t, v=PHASE_VERSION, stage="migrated", rid=rid, old=live_slot,
                        idle=idle, copied=True, migrated=True, **mig_rec)
         compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", "--force-recreate",
@@ -1031,7 +1097,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     phase_rec = dict(rid=rid, stage="switching", idle=idle, old=live_slot,
                      prev=live["release_id"] if live else None, concurrent=concurrent,
                      stopped_old=stopped_old, copied=copied, adopting=adopting, undo=undo_pre,
-                     **({"migrated": True, **mig_rec} if migrated else {}))
+                     **{"res": res.kind, **({"migrated": True, **mig_rec} if migrated else {})})
     _phase_set(platform, t, **phase_rec)
     try:
         with edge.edge_lock(platform):
@@ -1047,7 +1113,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     st.make_live(rid, idle, live["release_id"] if live else None, f"live on slot {idle}")
     stopped_marker(platform, t).unlink(missing_ok=True)     # a release starts it again
     if mig and not mig["run"] and mig["from"] != mig["to"]:
-        st.set_resource_schema(project.name, t.name, "data", mig["to"], rid)   # starts versioning
+        st.set_resource_schema(project.name, t.name, res.kind, mig["to"], rid)   # starts versioning
     if migrating:
         prune_restore_points(platform, st, t, log)
     # Until its public checks have passed, the release is not finished (grok #2).
@@ -1290,8 +1356,7 @@ def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_
     if stopped_old or copied:
         try:
             if copied:
-                from . import data as D
-                D.restore_copy(platform, project, t, log)
+                _res(app).restore(platform, project, t, log)
                 ph = _phase_get(platform, t) or {}
                 if mig_rec is not None:
                     _reset_schema(st, t, {**ph, "migrated": True, **mig_rec, "rid": rid})

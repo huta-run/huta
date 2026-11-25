@@ -219,7 +219,10 @@ class FakeHost:
                 "stopped_by_user": False, "restart": spec.get("restart", "no"), "worker": worker,
                 "labels": {**spec["labels"], "com.docker.compose.project": project},
                 "port": int(spec["ports"][0].split(":")[1]) if spec.get("ports") else None,
-                "data": bool(spec.get("volumes"))}
+                # A container on the target's database network writes to the database: the
+                # model treats it like the data volume.
+                "data": bool(spec.get("volumes")) or any(
+                    str(n).startswith("pg") for n in (spec.get("networks") or []))}
             self._save("docker", d)
             if not dies:
                 self._started(cid)
@@ -422,7 +425,7 @@ class FakeHost:
     def schema(self, t):
         st = self.store()
         try:
-            r = st.resource(t.project, t.name, "data")
+            r = st.resource(t.project, t.name, "data") or st.resource(t.project, t.name, "postgres")
             return r["schema"] if r else None
         finally:
             st.db.close()
@@ -532,6 +535,16 @@ class FakeHost:
             patch(data, "fingerprint", self.fingerprint)
             patch(data, "restore_pin", self.restore_pin)
             patch(data, "drop_pin", lambda platform, t, rid: None)
+            from huta import pg as PG
+            patch(PG, "ensure", lambda platform, st, project, t, log: self._op("postgres ready")
+                  or "ready")
+            patch(PG, "copy", lambda platform, t, log, quiet=False:
+                  self.copy_consistent(platform, t, log, quiet))
+            patch(PG, "restore_copy", self.restore_copy)
+            patch(PG, "pin_copy", self.pin_copy)
+            patch(PG, "restore_pin", self.restore_pin)
+            patch(PG, "container", lambda t: "pg-" + t.name)
+            patch(PG, "running", lambda t: True)
             patch(recipe, "_docker_run", self.docker_run)
             patch(Cloudflare, "ip_ranges", staticmethod(self.ip_ranges))
             patch(Cloudflare, "ensure_host_strict", lambda _self, h: f"{h}: strict")

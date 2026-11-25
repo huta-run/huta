@@ -38,7 +38,8 @@ STATE_LINE = {
     "applied": "✅ applied",
     "failed": "🆘 failed, needs a human",
 }
-PLAN_TITLE = {"edge": "🌐 edge change", "restore": "♻️ DATA RESTORE"}
+PLAN_TITLE = {"edge": "🌐 edge change", "restore": "♻️ DATA RESTORE",
+              "postgres": "🐘 postgres upgrade"}
 
 
 def created(st: S.Store, rid: str) -> float:
@@ -235,7 +236,8 @@ def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
         a = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
         r = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
         plan = st.plan_row(rid)
-        yes = {"edge": "✅ Apply", "restore": "♻️ Restore (loses data)"}.get(
+        yes = {"edge": "✅ Apply", "restore": "♻️ Restore (loses data)",
+               "postgres": "✅ Upgrade (site down meanwhile)"}.get(
             plan["kind"], "✅ Apply") if plan else "✅ Deploy"
         expires = created(st, rid) + ttl
         _call(token, "editMessageReplyMarkup", {

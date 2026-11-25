@@ -1,0 +1,101 @@
+{
+  "name": "huta_ledger_prod_pg",
+  "networks": {
+    "pga": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "true",
+        "com.docker.network.bridge.name": "dp-a318511db4e0"
+      },
+      "internal": true,
+      "name": "huta_ledger_prod_pga"
+    },
+    "pgb": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "true",
+        "com.docker.network.bridge.name": "dp-66cdd1a95c48"
+      },
+      "internal": true,
+      "name": "huta_ledger_prod_pgb"
+    },
+    "pgm": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "true",
+        "com.docker.network.bridge.name": "dp-dd44f333ab52"
+      },
+      "internal": true,
+      "name": "huta_ledger_prod_pgm"
+    }
+  },
+  "services": {
+    "postgres": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 2.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "PGDATA": "/var/lib/postgresql/data/pgdata-17",
+        "POSTGRES_DB": "app",
+        "POSTGRES_PASSWORD": "‹secret›",
+        "POSTGRES_USER": "huta_owner"
+      },
+      "image": "postgres@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "labels": {
+        "run.huta.pg": "1",
+        "run.huta.project": "ledger",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "1g",
+      "networks": {
+        "pga": {
+          "aliases": [
+            "postgres"
+          ]
+        },
+        "pgb": {
+          "aliases": [
+            "postgres"
+          ]
+        },
+        "pgm": {
+          "aliases": [
+            "postgres"
+          ]
+        }
+      },
+      "pids_limit": 512,
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "shm_size": "256m",
+      "stop_grace_period": "60s",
+      "tmpfs": [
+        "/tmp:size=67108864,mode=1777",
+        "/var/run/postgresql:size=1m,mode=1777"
+      ],
+      "user": "29004:29004",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/ledger/prod-pg",
+          "target": "/var/lib/postgresql/data",
+          "type": "bind"
+        }
+      ]
+    }
+  }
+}

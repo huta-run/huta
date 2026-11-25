@@ -326,10 +326,14 @@ def upstream_var(name: str) -> str:
 
 
 def environment(platform: Platform, project: Project, t: Target, sha: str, slot: str,
-                with_secrets: bool) -> dict[str, str]:
+                with_secrets: bool, app: dict | None = None, pg_role: str = "app") -> dict[str, str]:
     """The container's environment. with_secrets=False puts a placeholder where each secret
-    goes (for plans: names only, never values)."""
+    goes (for plans: names only, never values). With a release that asks for the target's
+    Postgres: DATABASE_URL for the given role (DESIGN-v2 §4)."""
     env = dict(t.env)
+    if app is not None and t.postgres and (app.get("state") or {}).get("kind") == "postgres":
+        from .pg import database_url
+        env["DATABASE_URL"] = database_url(platform, project, t, pg_role, with_secrets)
     for name in t.secrets:
         env[name] = secret_value(platform, project.name, name) if with_secrets else SECRET_PLACEHOLDER
     if t.egress_allow:
@@ -351,11 +355,12 @@ def environment(platform: Platform, project: Project, t: Target, sha: str, slot:
 
 
 def component_environment(platform: Platform, project: Project, t: Target, sha: str, slot: str,
-                          cname: str, public: bool, with_secrets: bool) -> dict[str, str]:
+                          cname: str, public: bool, with_secrets: bool,
+                          app: dict | None = None) -> dict[str, str]:
     """A component's environment when a slot has several (DESIGN-v2 §3): the target's env and
     egress for all; the target's secrets only for the public component; the registry's
     per-component env and secrets on top."""
-    env = environment(platform, project, t, sha, slot, with_secrets)
+    env = environment(platform, project, t, sha, slot, with_secrets, app)
     if not public:
         for n in t.secrets:
             env.pop(n, None)

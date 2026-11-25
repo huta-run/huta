@@ -206,6 +206,7 @@ class Platform:
     # imports (the vhost itself stays world-readable; DESIGN-v2 §1).
     caddy_secrets: Path = Path("/etc/caddy/huta-secrets")
     caddy_group: str = "caddy"
+    postgres_images: dict = field(default_factory=dict)   # [postgres.images] version -> ref@digest
 
     def secret(self, name: str) -> str:
         return read_secret(self.secrets_dir / "_platform" / name)
@@ -243,6 +244,8 @@ class Target:
     # worker must stay up after the switch.
     components: dict = field(default_factory=dict)
     worker_liveness: int = 10
+    # Postgres of the target (DESIGN-v2 §4): {"version", "size", "bytes", "backup", "limits"}.
+    postgres: dict | None = None
     migrate_secrets: list = field(default_factory=list)   # the only secrets [migrate] gets
 
     @property
@@ -370,7 +373,41 @@ def load_platform(etc: Path = ETC) -> Platform:
         crashes=_crashes_host(d.get("crashes", {})),
         caddy_secrets=Path(p.get("caddy_secrets", "/etc/caddy/huta-secrets")),
         caddy_group=_caddy_group(p.get("caddy_group", "caddy")),
+        postgres_images=_postgres_images(d.get("postgres", {})),
     )
+
+
+def _postgres_images(v) -> dict:
+    """[postgres.images]: version name -> image pinned by digest. Only these run."""
+    if not isinstance(v, dict) or set(v) - {"images"}:
+        raise ConfigError("[postgres] accepts only images")
+    imgs = v.get("images", {})
+    if not isinstance(imgs, dict):
+        raise ConfigError("[postgres.images] maps a version name to an image@sha256:<digest>")
+    for name, ref in imgs.items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,30}", name) or not isinstance(ref, str) or \
+                not re.fullmatch(r"[a-z0-9][a-z0-9./_-]{0,200}@sha256:[0-9a-f]{64}", ref):
+            raise ConfigError(f"[postgres.images] {name!r}: an image pinned by digest, like "
+                              "postgres@sha256:<64 hex>")
+    return dict(imgs)
+
+
+def _postgres_cfg(v, where: str) -> dict | None:
+    if v is None:
+        return None
+    if not isinstance(v, dict) or set(v) - {"version", "size", "backup", "limits"} \
+            or "version" not in v or "size" not in v:
+        raise ConfigError(f"{where}: postgres = {{ version = \"17\", size = \"10g\", "
+                          "backup = \"hourly\" }")
+    nbytes = size_bytes(v["size"], f"{where} postgres.size", 256 << 20, 2 << 40)
+    backup = v.get("backup", "daily")
+    if backup not in ("hourly", "daily", "off") and not calendar_ok(backup):
+        raise ConfigError(f"{where}: postgres.backup must be hourly, daily, off or an OnCalendar")
+    limits = v.get("limits", {})
+    if not isinstance(limits, dict) or set(limits) - {"memory", "cpus", "pids", "tmp"}:
+        raise ConfigError(f"{where}: postgres.limits accepts memory, cpus, pids, tmp")
+    return {"version": str(v["version"]), "size": v["size"].lower(), "bytes": nbytes,
+            "backup": backup, "concurrent": False, "limits": dict(limits)}
 
 
 def _components_cfg(v, target_env: dict, where: str) -> dict:
@@ -772,7 +809,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
                             "require_ci", "keep_releases", "drain", "env", "secrets",
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
                             "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
-                            "components", "worker_liveness"}
+                            "components", "worker_liveness", "postgres"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -848,6 +885,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             migrate_secrets=_migrate_secrets(t.get("migrate_secrets", []), secrets, tw),
             components=_components_cfg(t.get("components", {}), env, tw),
             worker_liveness=_worker_liveness(t.get("worker_liveness", 10), tw),
+            postgres=_postgres_cfg(t.get("postgres"), tw),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -878,6 +916,14 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                 for u in t.upstreams:
                     if u not in platform.upstreams:
                         raise ConfigError(f"{p.name}/{t.name}: no [upstreams.{u}] in huta.toml")
+                if t.postgres:
+                    if t.postgres["version"] not in platform.postgres_images:
+                        raise ConfigError(f"{p.name}/{t.name}: postgres version "
+                                          f"{t.postgres['version']!r} is not in huta.toml "
+                                          "[postgres.images]")
+                    if not platform.backup:
+                        raise ConfigError(f"{p.name}/{t.name}: postgres needs [backup] in "
+                                          "huta.toml (its dumps live there)")
                 if t.data and not platform.backup:
                     # Even with backup = "off" (no schedule, no shipping): a one-writer release
                     # copies the data before the new code runs, to restore it if that fails
@@ -885,6 +931,11 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                     raise ConfigError(f"{p.name}/{t.name}: data needs [backup] in huta.toml "
                                       "(its dir holds the copies; backup = \"off\" only turns off "
                                       "the schedule and shipping)")
+    for p in projects.values():
+        for t in p.targets.values():
+            if t.postgres and f"{t.name}-pg" in p.targets:
+                raise ConfigError(f"{p.name}: target {t.name}-pg would share its database's "
+                                  "volume name; rename it")
     ports, hosts, uids = {}, {}, {}
     for p in projects.values():
         if p.uid and p.uid in uids:
@@ -952,8 +1003,8 @@ def parse_app_toml(text: str, project: str) -> dict:
         if d.get(key):
             raise ConfigError(f"app.toml: '{key}' is not supported by huta yet")
     st_kind = (d.get("state") or {}).get("kind", "none") if isinstance(d.get("state"), dict) else None
-    if st_kind not in ("none", "data"):
-        raise ConfigError("app.toml: state.kind must be \"none\" or \"data\"")
+    if st_kind not in ("none", "data", "postgres"):
+        raise ConfigError("app.toml: state.kind must be \"none\", \"data\" or \"postgres\"")
     for cname, c in comps.items():
         kind = c.get("kind", "http")
         if kind not in ("http", "worker"):
@@ -976,7 +1027,9 @@ def parse_app_toml(text: str, project: str) -> dict:
         data = c.get("data")
         if data is not None:
             if st_kind != "data":
-                raise ConfigError(f"app.toml: components.{cname}.data needs [state] kind = \"data\"")
+                raise ConfigError(f"app.toml: components.{cname}.data needs [state] kind = \"data\""
+                                  + (" (a target's database and a data volume together are "
+                                     "not supported yet)" if st_kind == "postgres" else ""))
             if not isinstance(data, str) or not re.fullmatch(r"/[a-z0-9][a-z0-9/_.-]{0,100}", data) \
                     or ".." in data or data.rstrip("/") in RESERVED_MOUNTS:
                 raise ConfigError(f"app.toml: components.{cname}.data must be an absolute path "
@@ -1041,8 +1094,9 @@ def _schema_cfg(st: dict) -> None:
         if "runs_on" in st:
             raise ConfigError("app.toml: [state] runs_on needs schema")
         return
-    if st.get("kind", "none") != "data":
-        raise ConfigError("app.toml: [state] schema needs kind = \"data\" (the data it describes)")
+    if st.get("kind", "none") not in ("data", "postgres"):
+        raise ConfigError("app.toml: [state] schema needs kind = \"data\" or \"postgres\" (what "
+                          "it describes)")
     m = st["schema"]
     if type(m) is not int or not 1 <= m <= 1_000_000:
         raise ConfigError("app.toml: [state] schema must be an integer 1..1000000")

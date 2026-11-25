@@ -211,6 +211,8 @@ def _approve_plan(platform, registry, st, pid: str, via: str, confirmed: bool = 
             raise ConfigError("plan expired; make it again")
         if r["kind"] == "restore":
             return _approve_restore(platform, st, project, t, pid, plan, via, confirmed)
+        if r["kind"] == "postgres":
+            return _approve_pg_upgrade(platform, st, project, t, pid, plan, via)
         if r["kind"] != "edge":
             raise ConfigError(f"plan {pid}: kind {r['kind']!r} is not handled by this huta")
         cf = Cloudflare(platform)
@@ -652,6 +654,65 @@ def _approve_restore(platform, st, project, t, pid, plan, via, confirmed) -> int
     return 0
 
 
+def cmd_postgres(a):
+    """huta postgres <p> <t> [status|upgrade]: the target's database (DESIGN-v2 §4)."""
+    from . import pg as PG
+    platform, project, st = ctx(a.project)
+    t = target_of(project, a.target)
+    if not t.postgres:
+        raise ConfigError(f"{project.name}/{t.name} has no postgres in the host registry")
+    change = PG.pending(platform, project, t)
+    if a.cmd == "status":
+        say(f"postgres {t.postgres['version']} ({platform.postgres_images[t.postgres['version']]})")
+        say(f"server: {'running' if PG.running(t) else 'not running' if PG.container(t) else 'not created yet'}")
+        say(f"schema: {recipe.schema_now(st, t, 'postgres')}")
+        say("upgrade pending: " + (f"{change['from_image']} → {change['to_image']}"
+                                   + (" (new cluster, restored from a dump)" if change["new_cluster"] else "")
+                                   if change else "no"))
+        return 0
+    if not change:
+        raise ConfigError("nothing to upgrade: the running definition is the registry's")
+    live = st.live(project.name, t.name)
+    lines = [f"⚠️ the site is down while postgres is upgraded: {change['from_image']} → "
+             f"{change['to_image']}",
+             "the app stops, the database is dumped and the dump pinned, the new server starts"
+             + (", as a new cluster restored from that dump (the old data directory stays)"
+                if change["new_cluster"] else ""),
+             "any failure puts the old server back and starts the app on it"]
+    pid = st.new_plan(project.name, t.name, "postgres", {
+        "lines": lines, "change": change,
+        "planned_against_live": live["release_id"] if live else None})
+    tell(platform, st, pid)
+    ask(platform, st, pid)
+    for line in lines:
+        say(line)
+    say(f"\npostgres upgrade plan {pid}; approve with: huta approve {pid}")
+    return 0
+
+
+def _approve_pg_upgrade(platform, st, project, t, pid, plan, via) -> int:
+    from . import pg as PG
+    if PG.pending(platform, project, t) != plan["change"]:
+        st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "the definition changed since planning")
+        tell(platform, st, pid)
+        raise ConfigError("the postgres definition changed since planning; plan again")
+    st.plan_transition(pid, S.PLANNED, S.APPROVED, f"approved {via}")
+    retire_buttons(platform, st, pid)
+    tell(platform, st, pid)
+    try:
+        PG.upgrade(platform, st, project, t, pid, say)
+    except Exception as e:  # noqa: BLE001 — every failure ends in a recorded outcome
+        st.plan_transition(pid, S.APPROVED, "failed", f"{type(e).__name__}: {e}")
+        tell(platform, st, pid)
+        recipe.reconcile(platform, st, project, t, say)     # the app comes back
+        raise
+    st.plan_transition(pid, S.APPROVED, "applied", "postgres upgraded")
+    tell(platform, st, pid)
+    recipe.reconcile(platform, st, project, t, say)         # the app starts again
+    say("outcome: applied")
+    return 0
+
+
 def cmd_approve(a):
     platform, registry, st = ctx()
     if st.plan_row(a.release):
@@ -1089,7 +1150,7 @@ def approve_minutes(r) -> int:
     """How long the approval unit may run: the release's own worst case (migration, health
     wait, drain, copy) plus margin, never less than 20 minutes (DESIGN-v2 §0)."""
     if "kind" in r.keys():                     # a plan, not a release
-        return 6 * 60 if r["kind"] == "restore" else 20
+        return 6 * 60 if r["kind"] in ("restore", "postgres") else 20
     try:
         plan = json.loads(r["plan"])
         eff = plan.get("effective") or {}
@@ -1413,9 +1474,13 @@ def cmd_backup(a):
     t = target_of(project, a.target)
     with st.lock(project.name, t.name, wait=1800):
         recipe.reconcile(platform, st, project, t, say)   # an interrupted release first
+        from . import pg as PG
         try:
-            say(f"backup: {D.backup(platform, t, st, say)}")
-        except D.DataError as e:
+            if t.data:
+                say(f"backup: {D.backup(platform, t, st, say)}")
+            if t.postgres and PG.container(t):
+                say(f"backup: {PG.backup(platform, t, st, say)}")
+        except (D.DataError, PG.PgError) as e:
             st.event("backup-fail", str(e), None, project.name, t.name)
             raise ConfigError(str(e))
     return 0
@@ -1612,6 +1677,9 @@ def main(argv=None) -> int:
     s.add_argument("--confirm-data-loss", action="store_true",
                    help="required to approve a restore plan on the CLI")
     s.set_defaults(f=cmd_approve)
+    s = sub.add_parser("postgres"); s.add_argument("project"); s.add_argument("target")
+    s.add_argument("cmd", choices=["status", "upgrade"], nargs="?", default="status")
+    s.set_defaults(f=cmd_postgres)
     s = sub.add_parser("restore"); s.add_argument("project"); s.add_argument("target")
     s.add_argument("--to", required=True, help="the release whose code the data goes back for")
     s.set_defaults(f=cmd_restore)

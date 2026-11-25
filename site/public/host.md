@@ -381,6 +381,20 @@ ship = ["/usr/local/sbin/huta-ship"]
 
 Without it, skip: projects without `data` don't need it.
 
+Targets with their own Postgres (`postgres = { … }` in the registry) need `[backup]` too (the
+dumps live there; `HUTA_TARGET` is then `<target>-pg`) and the images they may run, pinned by
+digest (get one with `docker pull postgres:17` and `docker image inspect --format
+'{{index .RepoDigests 0}}' postgres:17`):
+
+```toml
+[postgres.images]
+"17" = "postgres@sha256:<64 hex>"
+```
+
+Targets with several components need the firewall fragment's `huta_intra` set (in
+`systemd/nftables-huta-egress.nft.example`; load it again if yours predates it, then
+`sudo huta egress sync`).
+
 ## 10. Verify
 
 ```sh

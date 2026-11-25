@@ -1,0 +1,124 @@
+{
+  "name": "huta_ledger_prod",
+  "networks": {
+    "n2": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "false",
+        "com.docker.network.bridge.name": "dp-06e6c11885d7"
+      },
+      "name": "huta_ledger_prod_n2"
+    },
+    "pga": {
+      "external": true,
+      "name": "huta_ledger_prod_pga"
+    },
+    "pgb": {
+      "external": true,
+      "name": "huta_ledger_prod_pgb"
+    }
+  },
+  "services": {
+    "slot-a": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "DATABASE_URL": "postgresql://app:‹secret›@postgres:5432/app",
+        "HUTA_PROJECT": "ledger",
+        "HUTA_SLOT": "a",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.project": "ledger",
+        "run.huta.sha": "0123456789abcdef0123456789abcdef01234567",
+        "run.huta.slot": "a",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": [
+        "n2",
+        "pga"
+      ],
+      "pids_limit": 128,
+      "ports": [
+        "127.0.0.1:19140:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29004:29004"
+    },
+    "slot-b": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "DATABASE_URL": "postgresql://app:‹secret›@postgres:5432/app",
+        "HUTA_PROJECT": "ledger",
+        "HUTA_SLOT": "b",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "ffffffffffffffffffffffffffffffffffffffff"
+      },
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.project": "ledger",
+        "run.huta.sha": "ffffffffffffffffffffffffffffffffffffffff",
+        "run.huta.slot": "b",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": [
+        "n2",
+        "pgb"
+      ],
+      "pids_limit": 128,
+      "ports": [
+        "127.0.0.1:19141:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29004:29004"
+    }
+  }
+}

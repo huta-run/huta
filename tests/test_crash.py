@@ -218,6 +218,7 @@ def versioned(app, schema, migrate=False):
         return app
     app = json.loads(json.dumps(app))
     app["state"] = {**app["state"], "schema": schema, "runs_on": [schema]}
+    app.pop("migrate", None)
     if migrate:
         app["migrate"] = {"image": "web", "cmd": ["python", "/app/app.py", "migrate"],
                           "timeout": "5m", "timeout_s": 300}
@@ -430,6 +431,28 @@ class SeveralFromOne(Scenario, unittest.TestCase):
             return {**full, "order": ["web"], "components": {"web": web},
                     "images": {"web": full["images"]["web"]}}
         return full
+
+
+class PgMigrate(Scenario, unittest.TestCase):
+    """A target on its own Postgres: the migration dumps and pins, runs on the database's own
+    network, and any failure restores the dump."""
+    project_name, target_name = "ledger", "prod"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+
+
+class PgMigrateFails(Scenario, unittest.TestCase):
+    project_name, target_name = "ledger", "prod"
+    one_writer = True
+    schema_r1, schema_r2, migrate_r2 = 1, 2, True
+    faults = {"migrate_fail": True}
+    clean, allowed = NA, {NA}
+
+
+class PgRelease(Scenario, unittest.TestCase):
+    """No migration: both slots use the database at once (Postgres handles concurrent clients)."""
+    project_name, target_name = "ledger", "prod"
+    schema_r1, schema_r2 = 1, 1
 
 
 class PhaseRecords(unittest.TestCase):
