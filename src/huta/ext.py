@@ -85,10 +85,11 @@ class GitHub:
         return {"status": st, "ahead": a, "behind": b}
 
     def has_commit(self, repo: str, sha: str) -> bool:
-        """True if the repo has this commit; False only on a clear 404 or 422 from GitHub."""
+        """True if the repo has this commit; False only on a clear 404 or 422 from GitHub. Asks
+        for the sha alone (40 bytes), not the commit with its patches."""
+        h = dict(self._h, Accept="application/vnd.github.sha")
         try:
-            _req("GET", f"{self.API}/repos/{repo}/commits/{urllib.parse.quote(sha)}", self._h,
-                 raw=True)
+            _req("GET", f"{self.API}/repos/{repo}/commits/{urllib.parse.quote(sha)}", h, raw=True)
         except ExtError as e:
             if str(e).endswith(("HTTP 404", "HTTP 422")):
                 return False
