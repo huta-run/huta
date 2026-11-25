@@ -705,3 +705,50 @@ class PlanWithMonitoringDown(_EnsureBase):
             return real_open(path, *a, **k)
         with mock.patch.object(os, "open", no_lock):
             self.assertEqual(self.plan()["state"], "planned")
+
+
+class LookupEdges(StrictLookups):
+    def test_bugsink_page_without_next(self):
+        with self.answer("/projects/", {"previous": None, "results": []}):
+            res = self.ensure(kinds=("errors",))
+        self.assertNotEqual(res["errors"], "ok")
+        self.assertEqual(self.fm.creates("bugsink"), 0)
+
+    def test_found_by_name_whatever_its_tags(self):
+        self.fm.fault("hc", "lost-create")
+        self.ensure(kinds=("uptime",))
+        self.fm.fault("hc", None)
+        s = self.fm.state()
+        c = next(iter(s["hc"]["checks"].values()))
+        c["channels"], c["tags"] = "pager", "renamed"
+        self.fm._save(s)
+        self.assertEqual(self.ensure(kinds=("uptime",)), {"uptime": "ok"})
+        self.assertEqual(next(iter(self.fm.state()["hc"]["checks"].values()))["channels"], "pager")
+
+
+class ReleaseWithMonitoringDown(unittest.TestCase):
+    """The milestone 1 gate in tests: a monitored target with every service down plans (above)
+    and its release goes live, since nothing after planning calls a monitoring service."""
+
+    def test_goes_live(self):
+        from tests.fakehost import FakeHost
+        from tests._util import app_toml
+        from huta import monitor as M, store as S
+
+        def down(*a, **k):
+            raise FM.Down("connection refused")
+        host = FakeHost()
+        try:
+            host.platform = dataclasses.replace(host.platform, monitoring={
+                "prefix": "huta", "healthchecks": {"url": "http://127.0.0.1:1",
+                                                   "ping": "https://hc.example.org/ping",
+                                                   "host": "", "channels": "*", "self": False},
+                "bugsink": None, "matomo": None})
+            project = host.registry["hello"]
+            t = dataclasses.replace(project.targets["prod"], monitor={"uptime": True})
+            project.targets["prod"] = t
+            with mock.patch.object(M, "transport", down):
+                rid = host.plan(project, t, app_toml("hello"), "1" * 40)
+                self.assertEqual(host.release(project, t, rid), S.LIVE)
+        finally:
+            host.close()

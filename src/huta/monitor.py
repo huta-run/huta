@@ -186,11 +186,13 @@ def hc_upsert(platform: Platform, spec: dict, deadline: float) -> dict:
 HC_STATES = ("new", "up", "grace", "down", "paused", "started")
 
 
-def hc_find(platform: Platform, check_name: str, tag: str, deadline: float) -> str | None:
-    """The uuid of the check called check_name among those tagged `tag`, or None."""
+def hc_find(platform: Platform, check_name: str, deadline: float) -> str | None:
+    """The uuid of the check called check_name, or None. All the key's checks are listed, as
+    the upsert matches by name across all of them (a tag filter could miss one whose tags the
+    operator changed)."""
     hc = platform.monitoring["healthchecks"]
-    _s, d = _call("GET", f"{hc['url']}/api/v3/checks/?{urllib.parse.urlencode({'tag': tag})}",
-                  _hc_headers(platform), None, deadline, ok=(200,))
+    _s, d = _call("GET", f"{hc['url']}/api/v3/checks/", _hc_headers(platform), None, deadline,
+                  ok=(200,))
     if not isinstance(d, dict) or not isinstance(d.get("checks"), list):
         raise MonitorError("healthchecks answered with no check list")
     found = []
@@ -265,7 +267,8 @@ def bs_find(platform: Platform, pname: str, deadline: float) -> dict | None:
     for _ in range(20):
         _s, page = _bs(platform, "GET", "projects/", deadline,
                        {"cursor": cursor} if cursor else None)
-        if not isinstance(page, dict) or not isinstance(page.get("results"), list):
+        if not isinstance(page, dict) or not isinstance(page.get("results"), list) \
+                or "next" not in page:
             raise MonitorError("Bugsink answered with no project list")
         for p in page["results"]:
             q = _project_of(p)
@@ -493,7 +496,7 @@ def _ensure_uptime(platform, st, project, t, deadline) -> None:
         return
     # channels only when the check is new remotely, not merely new to huta: after a create whose
     # answer was lost, the operator may have changed them since (codex review of milestone 1, #4).
-    exists = row is not None or hc_find(platform, n, platform.monitoring["prefix"], deadline)
+    exists = row is not None or hc_find(platform, n, deadline)
     first = {} if exists else {"channels": platform.monitoring["healthchecks"]["channels"]}
     c = hc_upsert(platform, {**spec, **first}, deadline)
     remember_capability(platform, c["uuid"])
