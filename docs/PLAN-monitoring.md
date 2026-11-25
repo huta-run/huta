@@ -2,8 +2,8 @@
 
 Order among the post-v2 plans: 1 of 4 (monitoring → snapshot → unattended → plain TLS).
 
-Status: **plan**, nothing built. Everything below is *planned*. To be reviewed by three
-independent reviewers before any code (see "How to build this").
+Status: **plan, reviewed** (codex, grok, agy; findings folded in below). Nothing is built;
+everything below is *planned*.
 
 ## Goal
 
@@ -15,8 +15,9 @@ healthchecks (job and uptime checks), Bugsink (errors, Sentry protocol) and Mato
 - Injected env: `SENTRY_DSN`, `SENTRY_RELEASE=<sha>`, `SENTRY_ENVIRONMENT=<target>`,
   `MATOMO_SITE_ID`.
 - huta pings a check of its own.
-- A **watch window** after each release: error rates and failed checks compared with before the
-  switch, a verdict recorded, a ↩️ button in Telegram. Unattended releases (plan 3) build on it.
+- A **watch window** after each release: errors, checks, probes and local container signals
+  compared with before the switch, a verdict recorded, a ↩️ button in Telegram. Unattended
+  releases (plan 3) build on it.
 - Every integration is optional. A monitoring API that fails never fails a release.
 
 ## Non-goals
@@ -26,7 +27,61 @@ healthchecks (job and uptime checks), Bugsink (errors, Sentry protocol) and Mato
 - No automatic rollback. `on_degraded = "rollback"` is a reserved value, refused by name.
 - No unattended approval here; only the interface it needs.
 - No deleting of remote checks, projects or sites, ever (a removed job's check is paused).
-- Gateways get no monitoring in this plan.
+- Gateways get no monitoring in this plan. Backup timers get no check in this plan.
+- A quiet watch proves only that the configured sources saw nothing; it doesn't prove the app's
+  SDK works. `ok` is evidence, not a guarantee.
+
+## API survey (milestone 0)
+
+Read from the source of the versions an operator runs today: healthchecks v4.2, Bugsink 2.2,
+Matomo 5.14. Milestone 0 repeats each call with the real tokens on a test host and records the
+answers (field names only) in `tests/fixtures/monitor/shapes.json`, which the fake services in
+`tests/fakemon.py` must match. Checked against running services so far: Bugsink's project and
+team lists with a real token (fields, the DSN form with a 32-hex key) and Matomo's redirect
+without `X-Forwarded-Proto` and its 401 error body. Still to check with real tokens: healthchecks
+create/pause/flips and Matomo find/add (they need a healthchecks API key and a Matomo token),
+and the Bugsink create (it writes, so it waits for a test project name).
+
+**healthchecks** (API v3, header `X-Api-Key`; a key belongs to one healthchecks project, so every
+huta check lands in that project):
+- `POST /api/v3/checks/` with `unique: ["name"]` is find-or-create (an upsert): 201 when made,
+  200 when a check of that name existed, which is then updated with the fields sent. 403 when the
+  healthchecks project has no checks left.
+- A check made through the API has **no notification channels** unless the call sends
+  `channels` (`"*"` = every channel of the project). huta sends `channels` (default `"*"`) only
+  on the first call for a check; later calls send only the fields huta owns (name, timeout or
+  schedule+tz, grace, tags, desc), so changes made in the healthchecks UI stay.
+- The answer carries `uuid` and `ping_url`. huta keeps only the uuid (matched by regex) and
+  builds ping URLs itself from the configured ping base; a returned URL is never requested.
+- `schedule` accepts cron or systemd `OnCalendar` expressions (with `tz`); `timeout` is the
+  simple alternative. Both `timeout` and `grace` must be 60 s..365 d.
+- `POST /api/v3/checks/<uuid>/pause`; a ping resumes a paused check. `GET .../<uuid>` → status
+  (new, up, grace, down, paused, started); `GET .../<uuid>/flips/?start=<unix>` → the changes of
+  state since a time (used for "down after the switch" and "already down at the switch").
+- Pings: `<base>/<uuid>`, `/start`, `/fail`, `/<code>` with code 0..255; `?rid=<uuid>` pairs a
+  start with its end.
+
+**Bugsink** (`/api/canonical/0/`, `Authorization: Bearer`; a token is global and made by a
+superuser, so the token that reads crashes can also create projects):
+- `GET projects/` (cursor pages of 250, by name; soft-deleted hidden): `id` (int), `name`
+  (unique), `dsn`, `team`. `POST projects/` with `{"team": <uuid>, "name"}` creates; its answer
+  has no `dsn`, so huta lists again by name. A second create of the same name fails; huta then
+  finds it by name. A project needs a team: `[monitoring.bugsink] team`.
+- The DSN is `https://<key>@<BASE_URL host>/<id>`: huta checks all of it (below).
+- Issues: `GET issues/?project=<id>&sort=last_seen&order=desc` (`first_seen`, `last_seen`).
+- Events: only per issue, `GET events/?issue=<uuid>&order=desc`, with `timestamp`; the release
+  is only in an event's detail. So the event signal counts by time, per issue seen in the window,
+  with caps (see the watch). Newer Bugsink versions add hourly counts; not used.
+
+**Matomo** (POST `/index.php`, form body `module=API&format=json&method=…&token_auth=…`; the
+token never goes in a query string):
+- `SitesManager.getSitesIdFromSiteUrl` (`url=https://<host>`) → `[{"idsite": "N"}]`, zero, one or
+  several; `SitesManager.addSite` (`siteName`, `urls[0..]` = the target's hosts) → `{"value": N}`.
+  `addSite` needs a superuser token.
+- With `force_ssl` Matomo redirects plain-HTTP calls; huta's loopback call sends
+  `X-Forwarded-Proto: https` (read when Matomo lists it in `proxy_scheme_headers`, the usual
+  setup behind a proxy). A 3xx is an error that says this.
+- Errors arrive as HTTP 200 or 401 with `{"result": "error", "message": …}`.
 
 ## Contract (all *planned*)
 
@@ -34,26 +89,43 @@ healthchecks (job and uptime checks), Bugsink (errors, Sentry protocol) and Mato
 
 ```toml
 [monitoring]
-prefix = "huta"                    # remote names: <prefix>-<project>-<target>[-<job>]
+prefix = "huta"                    # remote names: <prefix>_<project>_<target>[_<job>]
+                                   # (over 100 chars: cut, plus 8 hex of its sha256)
 [monitoring.healthchecks]
-url = "https://hc.example.org"     # management API and ping base; token: HEALTHCHECKS_API_KEY
-self = true                        # huta pings its own check, <prefix>-self-<platform.host>
+url = "http://127.0.0.1:8000"      # management API; token: HEALTHCHECKS_API_KEY
+ping = "https://hc.example.org/ping"   # ping base (hosted services use another host)
+host = "hc.example.org"            # Host header for a loopback url (optional)
+channels = "*"                     # sent only when a check is created
+self = true                        # huta pings its own check, <prefix>_self_<platform.host>
 [monitoring.bugsink]               # API address and Host come from [crashes]; token: BUGSINK_TOKEN
 dsn_host = "bugs.example.org"      # where containers send events (granted as egress, :443)
+team = "00000000-0000-0000-0000-000000000000"   # Bugsink team new projects belong to
 [monitoring.matomo]
 url = "http://127.0.0.1:8081"      # token: MATOMO_TOKEN
 host = "stats.example.org"         # Host header, as [crashes] host
 [monitoring.watch]
-window = "15m"                     # default for targets; 1m..2h
+window = "15m"                     # default for targets; 5m..2h
+button_ttl = "2h"                  # how long ↩️ stays after the window
 ```
 
-URLs are `http://` on loopback or `https://` to a hostname. Calls: no proxy, no redirects,
-10 s, 8 MiB, as `observe._bugsink` today.
+URLs are `http://` on loopback or `https://` to a hostname. Calls: no proxy, no redirects, 10 s
+per call with a wall-clock read deadline, 8 MiB (read max+1, refuse more). `dsn_host` must
+resolve only to public addresses (the egress daemon refuses anything else, so a Bugsink on the
+same host is reached through its public name, e.g. behind a CDN); `huta check` resolves it and
+says so.
 
-**Platform secrets** (`secrets/_platform/`, set with `huta secret set _platform <NAME>`):
-`HEALTHCHECKS_API_KEY`, `BUGSINK_TOKEN` (exists), `MATOMO_TOKEN`. Generated per target, stored
-as project secrets like the Postgres passwords: `HUTA_SENTRY_DSN_<TARGET>`. Ping URLs are
-capability URLs: kept in `huta.db` (root-only), added to the redaction needles, never printed.
+`prefix` is part of every remote name: changing it makes huta create new resources and leave the
+old ones. `huta check` warns.
+
+**Platform secrets** (`secrets/_platform/`): `HEALTHCHECKS_API_KEY`, `BUGSINK_TOKEN` (exists),
+`MATOMO_TOKEN`. `huta secret set _platform <NAME>` is new (today `huta secret` takes only a
+project). Platform tokens never reach a container.
+
+**Generated values.** The DSN is stored as a project secret, `HUTA_SENTRY_DSN_<TARGET>`, so the
+redactor and the secret machinery treat it as any secret. Check uuids (ping capabilities) are
+kept in `huta.db` and also in `<state_dir>/monitor/needles` (root-only, one per line, written
+atomically before the row); `cfg.redact` loads that file with the secrets, so every process
+redacts them, whole URL or bare uuid. Old values stay in the file after rotation.
 
 **Registry** (`projects.d/<p>.toml`, per target):
 
@@ -61,13 +133,21 @@ capability URLs: kept in `huta.db` (root-only), added to the redaction needles, 
 [targets.prod]
 monitor = { uptime = true, jobs = true, errors = true, analytics = true }
 watch = { window = "15m", new_issues = 1, events = 10, factor = 3.0, on_degraded = "notify" }
+matomo = 7                         # optional: adopt this Matomo site instead of creating one
+[targets.prod.components.api]
+monitor_env = true                 # this component also gets the Sentry variables
 ```
 
 - A key that is `true` while its host table is missing: `huta check` refuses it.
 - `crashes = <id>` stays. With `errors = true` huta adopts that Bugsink project, not a new one.
+  `matomo = <id>` does the same for Matomo (and is the way to use it without a superuser token).
 - A name the registry already sets (`SENTRY_DSN` in `env` or `secrets`) wins; huta injects
-  nothing over it and `huta check` says so.
-- `watch` needs at least one signal source (`uptime`, `jobs` or `errors`).
+  nothing over it, `huta check` says so, and the errors source counts as ready only if
+  `crashes` names the project that DSN reports to (huta can't check that; the operator says it).
+- `watch` needs at least one signal source (`uptime`, `jobs`, `errors`, or the local signals,
+  which every target has). `watch` changes are part of `effective`, so they show in plans.
+- Injection reaches the public component, components with `monitor_env = true`, and jobs that
+  run in one of those. Never a migration, never another component.
 
 **`app.toml`** (the repo asks for what changes its container):
 
@@ -76,187 +156,293 @@ watch = { window = "15m", new_issues = 1, events = 10, factor = 3.0, on_degraded
 env = ["sentry", "matomo"]
 ```
 
-Checks and the probe need no ask: they don't touch the container. Env is injected only when
-the repo asks **and** the registry grants. Until its milestone, `parse_app_toml` refuses
+Checks, probes and local signals need no ask: they don't touch the container. Env is injected
+only when the repo asks **and** the registry grants. The DSN egress is granted only then too: a
+target that doesn't send events needs no way out. Until its milestone, `parse_app_toml` refuses
 `[monitor]` by name. A release must not need these variables to start: they can be absent.
 
-**Store**: migration 4 adds `monitors` (project, target, kind, name, remote id, ping URL,
-state, updated; key project+target+kind+name) and `watches` (release id, project, target,
-opened, until, state, reasons, last tick, button hash, chat, message id, policy).
+**Store**: migration 4 adds
+- `monitors` (project, target, kind, name, remote id, spec JSON — period, grace, paused —,
+  state, updated; key project+target+kind+name). The spec lets the tick skip a call when
+  nothing changed.
+- `watches` (release id, since — the serving episode —, project, target, opened, until, state,
+  reasons, coverage JSON, signals JSON, last tick, policy, notified state, button hash, button
+  target, button expires, chat, message id, action, acked, acked by; key release id + since).
 
-**Commands**: `huta monitor status|ensure <p> <t>`, `huta monitor tick` (timer),
-`huta watch <release>`; the `status` op answers with the watch verdict of the live release.
+**Commands**: `huta monitor status|ensure <p> <t>`, `huta monitor tick` (timer), `huta watch
+<release> [--ack]`; `huta status <p> <t>` and the `status` op answer with the watch verdict of the
+live release, in the answer's text (the client prints only that).
 
 ## Design
 
-### 1. Clients (`monitor.py`, new)
+Two new modules: `monitor.py` (clients, `ensure`, job checks, probe, self-ping) and `watch.py`
+(rows, signals, verdicts, `blocks`, the ↩️ button). The Bugsink client moves from `observe.py`
+into `monitor.py` and both use it.
+
+### 1. Clients
 
 One small client per service, each with `find(name)` and `create(name, …)`. Every answer is
-untrusted: strict shapes, ids matched by regex.
+untrusted: strict shapes, ids matched by regex, sizes and time bounded. Matches must be exact:
+two remote resources with huta's name is an error (`monitor-fail`, "ambiguous"), never a guess.
 
-- healthchecks: `POST /api/v3/checks/` with `unique: ["name"]` is find-or-create in one call.
-- Bugsink: find the project by name, else create; read its DSN. Its host must equal `dsn_host`.
-- Matomo: find the site by its main URL, else `SitesManager.addSite` (POST, token in the body).
-
-Milestone 0 checks each call against the real API. Where one doesn't exist, the fallback is
-an id the operator puts in the registry.
+- healthchecks: the upsert above; the uuid is kept, the URL built.
+- Bugsink: find by name in the list, else create in `team`, then find again. The DSN must match
+  `^https://[0-9a-f]{32}@<dsn_host>/<id>$` with `<id>` the project's id; anything else refuses.
+- Matomo: `matomo = <id>` from the registry if set; else find by `https://<first host>`, else
+  `addSite`. Several matches: refuse.
 
 ### 2. `ensure`: remote resources, idempotent
 
-`monitor.ensure(platform, st, project, t, app)` runs in `cmd_approve`, under the target lock,
-after the checks and before `recipe.run`; also from `huta monitor ensure`. For each granted
-kind without a `monitors` row: find by name, else create, then write the row (and the DSN
-secret file). Budget: 30 s in all, so a hung API can't hold the lock.
+`monitor.ensure(platform, st, project, t, kinds)` creates what has no `monitors` row and repairs
+what a row says exists but whose local half is missing (the DSN secret, the needle). It runs
+under `<state_dir>/monitor-ensure.lock` (one ensure on the host at a time; not in `locks/`, so
+it doesn't block an install), with one 30 s budget for the whole call.
 
-Any failure is an event `monitor-fail` (kind and error class, redacted) and the release goes
-on. It is retried by the next release, by `ensure`, and by the tick (at most hourly).
+Where it runs, and what each place may touch:
 
-No phase file: nothing needs undoing. The remote name is deterministic, so a crash between
-"created remotely" and "row written" is healed by the next `find`.
+- **Planning** (`plan_release`, before `effective` is computed): `errors` and `analytics`, the
+  kinds that change the container. So the plan shows exactly what the release will get: either
+  the variables, or "not available yet (Bugsink: <reason>)" and no variable. Approval compares
+  `effective` as today; nothing between plan and approve creates these, so a valid plan is not
+  superseded by monitoring. Not under the secrets lock: the DSN secret is written with
+  `secret_set` (atomic), only when absent or different.
+- **The tick**: `uptime` and `jobs` checks (they don't touch the container).
+- **`huta monitor ensure`**: everything, for the operator.
+
+Any failure is an event `monitor-fail` (kind, error class, redacted) and the release goes on.
+
+No phase file: nothing needs undoing. A crash between "created remotely" and "row written" is
+healed by the next `find` (same name, exactly one match).
 
 ### 3. Env injection
 
-`runtime.environment` adds the four variables for components the grants reach (the public one,
-plus components whose registry entry names them). In plans `SENTRY_DSN` shows the secret
-placeholder. A DSN that isn't available yet is left out and the plan says "when available";
-it arrives with the next release, never by restarting a live slot.
+`runtime.environment` adds the variables for the components above, from what the plan recorded
+(`effective["monitor"]`: which variables, the DSN's secret name, the site id). In plans
+`SENTRY_DSN` shows the secret placeholder. `reconcile` and restarts rebuild the env from the
+release's recorded plan, so a live slot never gains or loses a variable outside a release.
+`effective` gains a `monitor` key only when the target has `monitor`, so v1 dicts are unchanged.
 
-With `errors = true`, `<dsn_host>:443` joins the target's egress allowlist; the plan shows it
-as a change. `effective` gains a `monitor` key only when the target has `monitor`, so v1
-dicts are unchanged.
+With the DSN injected, `<dsn_host>:443` joins the target's effective egress allowlist. One
+function computes it (`runtime.egress_allow(platform, t, app)`) and every reader uses it:
+`environment`, `needs_gateway`, `egress.build_policy`, `effective`, `runstate`. The plan shows
+the line as a change.
 
 ### 4. Job checks
 
-- `monitor.sync_jobs` runs beside `jobs.sync_units` (release step 5, `reconcile`, `huta units`):
-  a check per job of the live release, period from `cfg.calendar_gap`, grace from the job's
-  timeout. A removed job's check is paused.
-- `jobs.run_job` pings `/start` before the container and `/<exit code>` after, 5 s timeout each.
-  A failed ping never changes the job's outcome; an event is written only when pinging starts
-  or stops failing.
+- The tick converges job checks for every target with `jobs`: one check per job of the live
+  release, period from the schedule, grace from the job's timeout + 2 min (the timer's
+  `RandomizedDelaySec` and start-up). It calls the API only when the stored spec differs (new,
+  changed, removed → paused, re-added → resumed by the next ping). `reconcile` makes no network
+  call for this.
+- Period: healthchecks reads systemd `OnCalendar` expressions itself (its `schedule` field, with
+  `tz`). huta sends the job's schedule in systemd's normalized form (`systemd-analyze calendar`,
+  so `hourly` arrives as `*-*-* *:00:00`) and the host's time zone, so a weekday-only job doesn't
+  alert on weekends. If healthchecks refuses the expression (its parser covers less than
+  systemd's), huta falls back to `timeout` = the **longest** gap over 64 firings (not
+  `cfg.calendar_gap`, which returns the shortest of six), clamped to 60 s..365 d, and `huta
+  monitor status` says so.
+- `jobs.run_job` pings `/start?rid=<uuid>` right before the container starts and
+  `/<code>?rid=…` after (code 0..255; a negative return code — a signal — sends 128+n; the
+  timeout's 124 as is; an exception before the end sends `/fail`). 5 s each, in a thread with a
+  deadline. A failed ping never changes the job's outcome; an event is written only when pinging
+  starts or stops failing. A lost end ping makes the check go late: an alert that the evidence
+  is missing, which is true.
 
-### 5. The tick: probe, self-ping, watch
+### 5. The tick: probe, checks, self-ping, watch
 
-One host timer, `huta-monitor.timer` (every minute) → `huta monitor tick`, one at a time
-(`flock`), holding no target lock:
+`huta-monitor.timer` (every minute) → `huta monitor tick`, one at a time (`flock` on
+`<state_dir>/monitor.lock`), holding no target lock and taking none, with a 45 s budget for the
+whole tick; work left over waits for the next tick, targets in turn so none starves. Without
+`[monitoring]` the tick does nothing and exits 0.
 
-- **Probe.** For each target with `uptime` and a live release: `public_check` on each host
-  (expects the live sha). Success or `/fail` (short reason) is pinged to the uptime check.
-  Targets with a phase file, a stop marker or a held lock are skipped: a release is at work.
-  The last 60 results per target are kept in `<state_dir>/monitor/<p>/<t>.json`.
-- **Self.** Registry loaded and store opened → ping the self check.
+- **Probe.** For each target with `uptime` and a live release: one request per host to the
+  public health path, 5 s, `ok is true` and `sha` = the live sha (today's `public_check` checks
+  only the sha; the probe checks both, and `public_check` is fixed to do the same). Before and
+  after the request huta reads the live row (release id, since), the phase file and the stop
+  marker; if anything differs, or a release was at work (a phase file), the sample is dropped.
+  A held target lock alone is not a reason to skip: a backup or a one-writer job holds it for
+  hours while the site serves. Otherwise success or `/fail` (short reason) is pinged to the
+  uptime check, whose timeout is 5 min and grace 15 min: a release that keeps huta busy longer
+  than that makes the check alert, which for a one-writer target is true downtime. The last
+  60 samples (time, release, episode, result) go to `<state_dir>/monitor/<p>/<t>.json`
+  (tmp + rename, 0600; a missing or broken file is an empty one).
+- **Checks.** Job and uptime checks converge as in §4.
+- **Self.** Registry loaded, store opened, tick finished within budget → ping the self check.
+  Only that: needs-human already has its own Telegram message.
 - **Watch.** Below.
 
 ### 6. Watch window
 
 A watch is a row, not a process: nothing waits on it and no lock is held.
 
-- **Open.** The tick opens a watch for every live release with `watch`, no row yet and
-  `live.since` inside the window. `recipe.run` calls the same function when it returns `live`,
-  so the row usually exists at once. Opening twice is a no-op (primary key).
-- **Signals**, all computed from timestamps, so no baseline is captured at the switch:
-  - *errors*: Bugsink issues first seen since the switch (≥ `new_issues`); events since the
-    switch for this release against the equal window before it (≥ `events` and ≥ `factor` ×
-    before). Paging is capped.
-  - *checks*: a check of the target that is `down` and was up at the switch.
-  - *probe*: three failed probes in a row since the switch.
-- **States.** `watching` → `ok` (window over; no signal; every configured source answered at
-  least once in the last third of the window) | `degraded` (a signal fired; reasons kept) |
-  `unknown` (window over; a source never answered) | `closed` (the release stopped being live).
-  Events: `watch-open`, `watch-signal`, `watch-ok`, `watch-degraded`, `watch-unknown`,
-  `watch-closed`.
-- **Telegram.** The history message gains a line (`👀 watching until 14:32`, then `✓ quiet for
-  15 min` or `⚠️ <reasons>`). `degraded` and `unknown` also send a reply to it, because an edit
-  doesn't notify. As ever, a failed notification changes nothing.
-- **↩️ button.** While a watch is open, and for `button_ttl` (24 h) after, the live message
-  carries `↩️ Roll back` if an earlier release exists. `callback_data` `huta:b:<token>`, stored
-  hashed in the watch row, single use, checked like the approval buttons (owner, chat, own
-  message). A press starts `huta rollback <p> <t> --from <release> --via telegram` in a
-  transient unit: refused unless that release is still live; the rollback is planned as today
-  and, if the plan is code-only with no warning, approved by the same press. Otherwise the plan
-  waits with its normal buttons. A refusal (schema can't run the old code) edits the message
-  with the reason and the `huta restore` line.
+- **Episode.** A watch belongs to a serving episode: (release id, `live.since`). `make_live`
+  and `revert_live` start a new episode. `live.since` is written in the same transaction as the
+  switch is recorded, after the vhost switch; a recovery that records it later makes the
+  episode start later than the traffic, and the watch says "started at recovery".
+- **Open.** `recipe.run` opens the watch where it returns `live`, after all its steps (not at
+  `make_live`, which comes before the public checks). The tick opens one for every live episode
+  of a target with `watch` that has no row, when no phase file exists and the target lock is
+  free. An episode first seen after its window ended gets a row in state `unknown` ("not
+  watched: huta wasn't running"). Opening twice is a no-op (primary key).
+- **Close.** A watch whose episode is no longer live becomes `closed` (keeping its signals and
+  any verdict for `blocks`): in the tick, in `make_live`/`revert_live` (same transaction), and
+  on every return path of `reconcile`. `huta stop` closes it with reason "stopped".
+- **Signals** (sticky: once fired, kept), all from timestamps, so no baseline is captured at the
+  switch:
+  - *new issues*: Bugsink issues of the target's project with `first_seen` ≥ switch
+    (≥ `new_issues`).
+  - *event rate*: events since the switch against the `window` before it (served by the previous
+    release), as rates: fires when after ≥ `events` and rate after ≥ `factor` × rate before
+    (a before of zero counts as one event). Counted per issue with `last_seen` ≥ switch − window,
+    at most 20 issues and 500 events a tick; past a cap the "after" count is a lower bound (it may
+    still fire) and the tick's errors evidence is incomplete.
+  - *checks*: a flip to `down` of one of the target's checks after the switch. A check already
+    `down` at the switch makes the verdict at best `unknown` ("was already down"). Job checks are
+    weak evidence in a short window (a daily job rarely runs in it): they can fire a signal but
+    never count towards coverage.
+  - *probe*: three failed samples in a row of this episode, each within 150 s of the last.
+  - *local* (no network): a container of the live slot restarted (`RestartCount` up since the
+    switch), was OOM-killed (`OOMKilled`, cgroup `memory.events` `oom_kill`), or a worker exited.
+    Read through `runstate`.
+- **Coverage.** Per source (errors, checks, probe, local), the ticks that got a complete answer,
+  kept in the row. A source is covered when it answered in each third of the window.
+- **States.** `watching` → `degraded` (a signal fired; reasons kept) | `ok` (window over, no
+  signal, every configured source covered, nothing already down) | `unknown` (window over, no
+  signal, a source not covered or something already down) | `closed`. The final evaluation runs
+  once at `until` before any verdict. Verdict, reasons and event are written in one transaction,
+  conditional on the row still being `watching` for that episode. Events: `watch-open`,
+  `watch-signal`, `watch-ok`, `watch-degraded`, `watch-unknown`, `watch-closed`.
+- **Telegram.** Text from an API (an issue title, a Matomo message) is untrusted: cut, redacted
+  and HTML-escaped before it enters a message. The history message gains a line (`👀 watching until 14:32`, then `✓ quiet for
+  15 min` or `⚠️ <reasons>`). `degraded` and `unknown` also send a reply, because an edit doesn't
+  notify. Delivery is retried (the `notified` column trails the state), so a message may arrive
+  twice but is never lost silently. `notify.history` passes the live keyboard with every edit
+  (an edit without `reply_markup` removes it) and reads the watch row so later edits keep the
+  line.
+- **↩️ button.** While a watch is open, and for `button_ttl` after, the history message of the
+  live release carries `↩️ Roll back` if an earlier release exists. At the moment the button is
+  made, huta fixes the target of the rollback (the release `cmd_rollback` would pick) and stores
+  it with the token's hash, *before* posting the keyboard. `callback_data` `huta:b:<token>`.
+  `take_press` checks owner and chat before touching the database (a stranger can't burn it),
+  then consumes it in one transaction and checks message and expiry. A press starts
+  `huta rollback <p> <t> --press <watch>` in a transient unit, which under the target lock:
+  (`take_press` gets its own branch for `b`; `cmd_press` today treats any kind but `a` as
+  Reject, so a `b` press must never fall through to it.)
+  1. refuses unless that episode is still live and the fixed target is still a retired release
+     whose images are on the host;
+  2. records `action = rollback-planned:<id>` and plans the rollback of exactly that release,
+     then posts the plan with its normal buttons (so a unit that dies here leaves a plan the owner
+     can approve);
+  3. approves it at once only if the plan is **one-tap clean**: the target is concurrent-safe
+     (no one-writer data), class code-only, no migration, restore or schema warning, no staged
+     secrets, no external publishing, the history comparison known (`history_note` hides the
+     downgrade line for rollbacks, so the check reads the comparison itself, not the rendered
+     text), and nothing marked ⚠️. The
+     approval goes through `cmd_approve`'s checks unchanged, recorded as "approved with ↩️".
+     Otherwise the plan waits for its usual buttons.
+  A refusal (the old code can't run on today's schema) edits the message with the reason and
+  the `huta restore` line. The release rolled away from is recorded on the watch row, and
+  `cmd_rollback` never picks a release that was rolled away from by ↩️. No ↩️ is offered when
+  the live release is itself a rollback, so presses can't walk back through every retired
+  release.
+
+Known limit, as for approval buttons: the relay that delivers presses is trusted with the
+presser's id (`docs/ARCHITECTURE.md`); anything running as the relay user can forge a press while
+a button is out. `button_ttl` keeps that window short; one-tap only for clean, stateless plans
+bounds what a forged press can do (it rolls code back one release).
 
 ### 7. Interface for unattended releases (plan 3 uses, this plan builds)
 
-- `monitor.ready(platform, t) -> (bool, why)`: every source the target's `watch` needs is
-  configured and has its remote resource. Not ready → not eligible for unattended.
-- `watch.open(st, rid)`, `watch.verdict(st, rid) -> (state, reasons)`.
-- `watch.blocks(st, project, target) -> why | None`: a watch still `watching`, or a last
-  verdict `degraded`/`unknown` that nobody cleared (`huta watch <release> --ack`, or a newer
-  `ok`). Unattended refuses to start while it returns a reason.
+- `monitor.ready(platform, st, t) -> (bool, why)`: every source the target's `watch` needs is
+  configured, has its remote resource, and (errors) the live release got the DSN. Resource
+  existence is the minimum; plan 3 may add "an event was received".
+- `watch.open(st, rid, since)`, `watch.verdict(st, rid, since) -> (state, reasons)`.
+- `watch.blocks(st, project, target) -> why | None`, one rule: a watch still `watching`; a live
+  episode of a target with `watch` and no row; or any `degraded` or `unknown` verdict, or any
+  ↩️ press, not acknowledged with `huta watch <release> --ack` (root on the host only, never a
+  Telegram button or a box request; recorded with who and when). A newer `ok` does **not**
+  clear an older failure.
+- Reasons carry the kind of each signal (`new-issues`, `event-rate`, `check`, `probe`, `local`),
+  so plan 3 can choose which kinds may roll back (reviewers: a public probe alone can be the CDN,
+  one new issue can be a new code path).
+- A hook `watch.on_degraded(platform, st, row)` the tick calls when a watch turns `degraded` and
+  `action` is empty; it is retried every tick until `action` is set, while the episode is live.
+  Here it only records `action = notified`. The tick never waits on a target lock: plan 3's
+  hook starts a transient unit, as the ↩️ press does.
 - `on_degraded`: only `"notify"` is accepted; `"rollback"` is the seam for automatic rollback.
-- For `docs/PLAN-unattended.md` (built after this): also provide a hook the tick calls when a
-  watch turns `degraded`, and an `action` column on the watch row (what was done about it). Build
-  both here, unused, so the unattended plan only fills them in.
 - `unknown` is never treated as `ok`.
 
 ## Failure matrix
 
 | Step | Recorded first | Crash right after → reconcile / next run | Outcome |
 |---|---|---|---|
-| remote create (check, project, site) | nothing; the name is deterministic | next `ensure` finds it by name, writes the row; never a second one | release unaffected |
-| `monitors` row / DSN secret written | the remote resource exists | row and file are written again from `find` (same value) | release unaffected |
-| env injected (compose written) | row + secret | as any release: compose is rewritten by the next run | as today |
-| job checks synced | units synced | `reconcile` syncs units, then checks, for the live release | live |
-| job ping start / exit | job event | none; the check goes late and alerts, which is true | job's own |
-| watch opened | release live | the tick opens it from `live.since` | live |
-| tick evaluated, state changed | `watches` row, one transaction, then the notification | next tick sees the state; a lost message is resent once (`notified` flag) | live |
+| remote create (check, project, site) | nothing; the name is deterministic | next `ensure` finds exactly one by name and writes the row; two matches → `monitor-fail` ambiguous, nothing guessed | release unaffected |
+| needle written | — | row written by the next `ensure` | release unaffected |
+| `monitors` row written | needle, remote resource | the DSN secret is repaired from the row's remote id by the next `ensure` | release unaffected |
+| DSN secret written | row | — | release unaffected |
+| plan made with or without the variables | the plan | as any plan | as today |
+| job checks converged | `monitors` spec | next tick compares spec and calls again | live |
+| job ping start / end | job event | none; the check goes late and alerts that evidence is missing | job's own |
+| probe sample | — | dropped if anything changed around it | live |
+| watch opened | release live | the tick opens it from `live.since`, or as `unknown` past the window | live, watched |
+| tick evaluated, state changed | `watches` row, one transaction | next tick sees the state; notification resent until `notified` matches (may duplicate) | live |
+| `on_degraded` hook | `degraded` row | `action` empty → hook runs again next tick | live |
+| ↩️ button made | hash and fixed target in the row | keyboard missing: posted again by the next history edit; a stale keyboard's token no longer matches | live |
 | ↩️ pressed | hash consumed + `button` event | the unit died before planning: nothing changed; the press is spent, `huta rollback` on the CLI works | live |
+| ↩️ planned | `action` + plan with its buttons | not approved: the plan waits (30 min) with its buttons | live |
 | ↩️ rollback running | an ordinary release (phase files) | exactly as a release: the existing matrix | live / nothing-activated |
 
-`reconcile` gains two things only: `sync_jobs` after `sync_units`, and closing watches whose
-release is no longer live. It makes no other network call and never fails on monitoring.
+`reconcile` gains only local work: closing watches whose episode is no longer live, on every
+return path. It makes no network call and never fails on monitoring.
 
 ## Milestones
 
 Each is one install; each leaves every target working. The rules of `BUILD-v2.md` apply.
 
-| # | What | Gate | Tests |
-|---|---|---|---|
-| 0 | API survey: the exact calls, written into this file; fake services in `tests/fakehost.py`; `[monitor]`, `monitor`, `watch` refused by name | all tests green; golden unchanged | `test_app_toml` (refusals), `test_monitor` (fake API shapes) |
-| 1 | Config, secrets, migration 4, `monitor.py` clients, `ensure`, `huta monitor status\|ensure` | `ensure` twice on a test target creates each thing once; with the API down a release still goes live | unit: parsing, URL rules, hostile answers (oversize, redirect, wrong shape); crash: `MonitorEnsure` (die after each create and each row), `MonitorApiDown`; golden: new case `notes-monitored`, old cases byte-identical |
-| 2 | Env injection, egress grant, `[monitor] env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: compose and effective for `notes-monitored`; unit: registry value wins, DSN missing → variable absent; crash: `MonitoredRelease` (full scenario with monitoring on) |
-| 3 | Job checks and pings | a job run turns its check up; a failing job turns it down; removing a job pauses it | unit: period and grace; ping failure doesn't change the exit; crash: die after `sync_jobs` |
-| 4 | Tick: timer, probe, self-ping | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip rules, result ring; `test_monitor_tick` |
-| 5 | Watch: rows, signals, verdicts, history lines, `huta watch`, `status` op | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, stateless re-evaluation; crash: tick killed after each write, twice (`WatchTick`) |
-| 6 | ↩️ button and the rollback press; `ready`, `blocks`, `--ack` | one press rolls a stateless test target back; a forged, reused or foreign press is refused; a schema-bound target gets the reason | `test_press` (as the approval-button tests); crash: `WatchRollback` (press unit dies before and after planning) |
+| # | What | Gate | Tests | Status |
+|---|---|---|---|---|
+| 0 | API survey checked with real tokens on a test host, shapes kept as fixtures; fake services in `tests/fakehost.py`; `[monitor]`, `monitor`, `watch`, `matomo`, `monitor_env` refused by name | all tests green; golden unchanged | `test_app_toml` (refusals), `test_monitor` (fake API shapes) | built; real-token checks of the writing calls pending |
+| 1 | Config, `huta secret set _platform`, migration 4, clients, `ensure`, needles in the redactor, `huta monitor status\|ensure` | `ensure` twice on a test target creates each thing once; with the API down a release still goes live | unit: parsing, URL rules, hostile answers (oversize, redirect, wrong shape, two matches, bad DSN); redaction of a bare uuid; crash: `MonitorEnsure` (die after each create, needle and row), `MonitorApiDown`; golden: new case `notes-monitored`, old cases byte-identical | |
+| 2 | Env injection from the plan, one effective egress list, `[monitor] env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: compose and effective for `notes-monitored`; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: `MonitoredRelease` | |
+| 3 | Job checks (tick convergence, OnCalendar schedules) and pings | a job run turns its check up; a failing job turns it down; removing a job pauses it | unit: schedule, fallback period and grace (weekday schedule), exit code mapping; ping failure doesn't change the exit; crash: tick killed after a convergence call | |
+| 4 | Tick: timer, budget, probe, self-ping; `public_check` requires `ok` | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip and revalidation rules, sample ring, budget; `test_monitor_tick` | |
+| 5 | Watch: episodes, signals (local included), coverage, verdicts, history lines, `huta watch`, `status` | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, coverage thirds, re-evaluation from rows; crash: tick killed after each write, twice (`WatchTick`) | |
+| 6 | ↩️ button and the press; `ready`, `blocks`, `--ack`, the `on_degraded` hook | one press rolls a stateless test target back; a forged, reused, foreign or expired press is refused; a one-writer target gets a plan with buttons, not a rollback | `test_press` (as the approval-button tests); crash: `WatchRollback` (unit dies before planning, after planning, after approval) | |
 
-New durable steps become fake-host steps by wrapping `monitor.ensure`'s writes, `sync_jobs`,
-`watch.open` and the tick's row update, so both crash tests cover them. The fake services keep
-their state in files and count creates.
+New durable steps become fake-host steps by wrapping `monitor.ensure`'s writes, the tick's
+convergence and row updates, `watch.open` and the press unit's steps, so both crash tests cover
+them. The fake services keep their state in files and count creates.
 
 ## Docs to update (same commit as the behavior)
 
 - `docs/ARCHITECTURE.md`: contract blocks (huta.toml, registry, app.toml), "What huta
-  generates" (timer, env), a "Monitoring" section, crash safety, commands; "Not yet" loses
-  monitoring hooks.
-- `README.md`: status paragraph and layout (`monitor.py`).
+  generates" (timer, env), a "Monitoring" section, crash safety, commands, the relay limit for ↩️;
+  "Not yet" loses monitoring hooks.
+- `README.md`: status paragraph and layout (`monitor.py`, `watch.py`).
 - `site/public/docs/contract.md` (keys), `runtime.md` (the variables), `commands.md`
   (`monitor`, `watch`, the status answer), `approval.md` (↩️ button, watch lines), `faq.md`,
   `rules.md`, `start.md`; `site/public/host.md` (tokens, tables, the timer).
 - Their copies in `site/public/llms-full.txt` and `llms-full.md`, and the index lines in
   `llms.txt` / `llms.md` (`tests/test_site_docs.py` checks the twins).
 - `systemd/huta-monitor.{service,timer}`; `install.sh` installs them.
-- This file's status line and a status column for the milestones.
+- This file's status line and the milestones' status column.
 
-## Open questions for the owner
+## Decided
 
-1. **One tap or two for ↩️?** Proposed: one tap when the rollback plan is code-only and clean,
-   otherwise the plan waits with its usual buttons.
-2. **Does the repo have to ask** (`[monitor] env`) for the variables, or is the registry grant
-   enough? Proposed: both, as every other feature.
-3. **Egress for the DSN** added by huta when `errors = true`, or listed by hand in `egress`?
-   Proposed: added, and shown in the plan.
-4. **Watch defaults**: 15 min, 1 new issue, 10 events and ×3. Should a watch be on for every
-   target with `monitor`, or only where `watch` is set? Proposed: only where set.
-5. **`unknown`**: alert the owner, or only record? Proposed: alert, since unattended treats it
-   as "not ok".
-6. **Self check**: only "the tick ran", or `/fail` while any target is `needs-human`?
-7. **Staging**: its own Bugsink project and Matomo site per target (proposed), or one per
-   project split by `SENTRY_ENVIRONMENT`?
-8. **`MATOMO_URL`** as a fifth variable? Server-side tracking would also need egress; not
-   proposed.
-9. **Local signals** in the watch (container restarts, OOM kills from `runstate`): now or later?
+The owner decided the open questions on 2026-11-25, each as proposed:
+
+1. **↩️** is one tap only for a one-tap-clean plan; otherwise the plan waits with its usual
+   buttons. `button_ttl` default 2 h after the window.
+2. **The repo asks** (`[monitor] env`) **and** the registry grants, as every other feature.
+3. **DSN egress** is added by huta when the DSN is injected, and shown in the plan.
+4. **Watch defaults** 15 min, 1 new issue, 10 events, ×3; a watch only where `watch` is set.
+5. **`unknown`** alerts the owner (a reply in Telegram).
+6. **Self check** says only that the tick ran.
+7. **Staging** gets its own Bugsink project and Matomo site, per target.
+8. **No `MATOMO_URL`**; the registry's `env` can carry a public tracking URL.
+9. **Local signals** (restarts, OOM kills, worker exits) are in the watch now, milestone 5.
+10. **Matomo sites** are created when `MATOMO_TOKEN` is set; `matomo = <id>` adopts one without
+    it.
 
 ## How to build this
 
