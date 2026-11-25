@@ -73,7 +73,10 @@ def run(platform: Platform, st, project: Project, t: Target, name: str, who: str
         if d is None:
             names = ", ".join(x["name"] for x in app.get("diag", [])) or "none"
             raise ConfigError(f"the live release has no diag {name!r} (it has: {names})")
-        check_image(rel["image_id"], rel["sha"], project.name)
+        from . import spec as SP
+        comp = app["components"][d.get("component") or SP.public_name(app)]
+        image = st.images(rel).get(comp["image"], rel["image_id"])
+        check_image(image, rel["sha"], project.name)
         h = R.hardening(project, t)
         env = {**t.env, "RELEASE_SHA": rel["sha"], "HUTA_PROJECT": project.name,
                "HUTA_TARGET": t.name, "HUTA_DIAG": name}
@@ -84,7 +87,7 @@ def run(platform: Platform, st, project: Project, t: Target, name: str, who: str
                 "--tmpfs", h["tmpfs"][0], "--pull", "never", "--log-driver", "none",
                 "--label", f"run.huta.project={project.name}", "--label", f"run.huta.target={t.name}",
                 "--label", f"run.huta.diag={name}"]
-        mnt = R.data_mount(app)
+        mnt = comp.get("data")
         note = ""
         if mnt:
             from .data import backup_dir
@@ -104,7 +107,7 @@ def run(platform: Platform, st, project: Project, t: Target, name: str, who: str
                 args += ["--mount", f"type=bind,source={snap},target={mnt},readonly"]
         for k in env:
             args += ["--env", k]
-        args += [rel["image_id"], *d["cmd"]]
+        args += [image, *d["cmd"]]
         st.event("diag-start", f"{name} by {who}", rel["id"], project.name, t.name)
         t0 = time.monotonic()
         proc = subprocess.Popen(args, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", **env},

@@ -1119,10 +1119,10 @@ def parse_app_toml(text: str, project: str) -> dict:
                           "(not needed when there is only one)")
     d["smoke"] = _smoke(d.get("smoke", []))
     d["jobs"] = _jobs(d.get("jobs", []))
-    for j in d["jobs"]:
-        if "component" in j and j["component"] not in comps:
-            raise ConfigError(f"app.toml: job {j['name']}: no component {j['component']!r}")
     d["diag"] = _diag(d.get("diag", []))
+    for j in d["jobs"] + d["diag"]:
+        if "component" in j and j["component"] not in comps:
+            raise ConfigError(f"app.toml: {j['name']}: no component {j['component']!r}")
     # Nested tables are strict too (site review: [images.*], [state], [build] were unchecked).
     imgs = d.get("images", {})
     if not isinstance(imgs, dict) or not 1 <= len(imgs) <= MAX_COMPONENTS:
@@ -1322,8 +1322,10 @@ def _diag(items) -> list[dict]:
     out, names = [], set()
     for i, j in enumerate(items):
         w = f"app.toml: diag[{i}]"
-        if not isinstance(j, dict) or set(j) - {"name", "cmd", "timeout"}:
-            raise ConfigError(f"{w}: keys are name, cmd, timeout")
+        if not isinstance(j, dict) or set(j) - {"name", "cmd", "timeout", "component"}:
+            raise ConfigError(f"{w}: keys are name, cmd, timeout, component")
+        if "component" in j and not (isinstance(j["component"], str) and NAME_RE.match(j["component"])):
+            raise ConfigError(f"{w}: component must be a component name")
         name = j.get("name")
         if not isinstance(name, str) or not NAME_RE.match(name) or name in names:
             raise ConfigError(f"{w}: name must be a unique lowercase name")
@@ -1332,8 +1334,11 @@ def _diag(items) -> list[dict]:
         if not isinstance(cmd, list) or not 1 <= len(cmd) <= 64 or not all(
                 isinstance(a, str) and len(a) <= 1024 and "\0" not in a for a in cmd):
             raise ConfigError(f"{w}: cmd must be an argv list of strings")
-        out.append({"name": name, "cmd": list(cmd),
-                    "timeout": duration_s(j.get("timeout", "1m"), f"{w}.timeout", 300)})
+        d = {"name": name, "cmd": list(cmd),
+             "timeout": duration_s(j.get("timeout", "1m"), f"{w}.timeout", 300)}
+        if "component" in j:
+            d["component"] = j["component"]       # only when set: v1 plans stay equal
+        out.append(d)
     return out
 
 
