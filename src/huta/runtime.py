@@ -336,6 +336,9 @@ def environment(platform: Platform, project: Project, t: Target, sha: str, slot:
         env["DATABASE_URL"] = database_url(platform, project, t, pg_role, with_secrets)
     for name in t.secrets:
         env[name] = secret_value(platform, project.name, name) if with_secrets else SECRET_PLACEHOLDER
+    if t.monitor and app is not None and app.get("monitor"):
+        from . import monitor as M        # docs/PLAN-monitoring.md §3
+        env.update(M.env_for(platform, project, t, app, sha, with_secrets)[0])
     if t.egress_allow:
         proxy = f"http://{EGRESS_HOST}:{platform.egress_port}"
         # Both cases, and ALL_PROXY cleared, so a variable baked into the image can't pick
@@ -361,10 +364,15 @@ def component_environment(platform: Platform, project: Project, t: Target, sha: 
     egress for all; the target's secrets only for the public component; the registry's
     per-component env and secrets on top."""
     env = environment(platform, project, t, sha, slot, with_secrets, app)
+    c = t.components.get(cname, {})
     if not public:
         for n in t.secrets:
             env.pop(n, None)
-    c = t.components.get(cname, {})
+        if not c.get("monitor_env"):
+            from .monitor import MONITOR_VARS
+            for n in MONITOR_VARS:
+                if n not in t.env:
+                    env.pop(n, None)
     env.update(c.get("env", {}))
     for n in c.get("secrets", []):
         env[n] = secret_value(platform, project.name, n) if with_secrets else SECRET_PLACEHOLDER

@@ -1,0 +1,272 @@
+{
+  "access_log": true,
+  "adopt": "",
+  "cloudflare": "orange",
+  "compose": {
+    "name": "huta_notes_prod",
+    "networks": {
+      "n2": {
+        "driver_opts": {
+          "com.docker.network.bridge.enable_icc": "false",
+          "com.docker.network.bridge.name": "dp-f7b5042cbaf5"
+        },
+        "name": "huta_notes_prod_n2"
+      }
+    },
+    "services": {
+      "slot-a": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": 2.0,
+        "dns": [
+          "127.0.0.254"
+        ],
+        "environment": {
+          "ALL_PROXY": "",
+          "HTTPS_PROXY": "http://huta-egress:4880",
+          "HTTP_PROXY": "http://huta-egress:4880",
+          "HUTA_PROJECT": "notes",
+          "HUTA_SLOT": "a",
+          "HUTA_TARGET": "prod",
+          "HUTA_UPSTREAM_MAIL_RELAY": "huta-egress:4881",
+          "MATOMO_SITE_ID": "7",
+          "NODE_USE_ENV_PROXY": "1",
+          "NOTES_TITLE": "notes",
+          "NOTES_TOKEN": "‹secret›",
+          "NO_PROXY": "localhost,127.0.0.1,huta-egress",
+          "PRICE": "$$5",
+          "RELEASE_SHA": "<sha>",
+          "SENTRY_DSN": "‹secret›",
+          "SENTRY_ENVIRONMENT": "prod",
+          "SENTRY_RELEASE": "<sha>",
+          "all_proxy": "",
+          "http_proxy": "http://huta-egress:4880",
+          "https_proxy": "http://huta-egress:4880",
+          "no_proxy": "localhost,127.0.0.1,huta-egress"
+        },
+        "extra_hosts": [
+          "huta-egress:host-gateway"
+        ],
+        "image": "<image>",
+        "labels": {
+          "run.huta.project": "notes",
+          "run.huta.sha": "<sha>",
+          "run.huta.slot": "a",
+          "run.huta.target": "prod"
+        },
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "compress": "false",
+            "max-file": "3",
+            "max-size": "10m"
+          }
+        },
+        "mem_limit": "512m",
+        "networks": [
+          "n2"
+        ],
+        "pids_limit": 256,
+        "ports": [
+          "127.0.0.1:19110:8080"
+        ],
+        "pull_policy": "never",
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "stop_grace_period": "10s",
+        "tmpfs": [
+          "/tmp:size=67108864,mode=1777"
+        ],
+        "user": "29002:29002",
+        "volumes": [
+          {
+            "bind": {
+              "create_host_path": false
+            },
+            "source": "/var/lib/huta/data/notes/prod",
+            "target": "/data",
+            "type": "bind"
+          }
+        ]
+      },
+      "slot-b": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": 2.0,
+        "dns": [
+          "127.0.0.254"
+        ],
+        "environment": {
+          "ALL_PROXY": "",
+          "HTTPS_PROXY": "http://huta-egress:4880",
+          "HTTP_PROXY": "http://huta-egress:4880",
+          "HUTA_PROJECT": "notes",
+          "HUTA_SLOT": "b",
+          "HUTA_TARGET": "prod",
+          "HUTA_UPSTREAM_MAIL_RELAY": "huta-egress:4881",
+          "MATOMO_SITE_ID": "7",
+          "NODE_USE_ENV_PROXY": "1",
+          "NOTES_TITLE": "notes",
+          "NOTES_TOKEN": "‹secret›",
+          "NO_PROXY": "localhost,127.0.0.1,huta-egress",
+          "PRICE": "$$5",
+          "RELEASE_SHA": "<sha>",
+          "SENTRY_DSN": "‹secret›",
+          "SENTRY_ENVIRONMENT": "prod",
+          "SENTRY_RELEASE": "<sha>",
+          "all_proxy": "",
+          "http_proxy": "http://huta-egress:4880",
+          "https_proxy": "http://huta-egress:4880",
+          "no_proxy": "localhost,127.0.0.1,huta-egress"
+        },
+        "extra_hosts": [
+          "huta-egress:host-gateway"
+        ],
+        "image": "<image>",
+        "labels": {
+          "run.huta.project": "notes",
+          "run.huta.sha": "<sha>",
+          "run.huta.slot": "b",
+          "run.huta.target": "prod"
+        },
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "compress": "false",
+            "max-file": "3",
+            "max-size": "10m"
+          }
+        },
+        "mem_limit": "512m",
+        "networks": [
+          "n2"
+        ],
+        "pids_limit": 256,
+        "ports": [
+          "127.0.0.1:19111:8080"
+        ],
+        "pull_policy": "never",
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "stop_grace_period": "10s",
+        "tmpfs": [
+          "/tmp:size=67108864,mode=1777"
+        ],
+        "user": "29002:29002",
+        "volumes": [
+          {
+            "bind": {
+              "create_host_path": false
+            },
+            "source": "/var/lib/huta/data/notes/prod",
+            "target": "/data",
+            "type": "bind"
+          }
+        ]
+      }
+    }
+  },
+  "container_port": 8080,
+  "data": {
+    "backup": "hourly",
+    "bytes": 2147483648,
+    "concurrent": true,
+    "concurrent_safe": true,
+    "mount": "/data",
+    "size": "2g"
+  },
+  "diag": [],
+  "drain": 5,
+  "egress": [
+    "*.example.net:443",
+    "api.example.com:443"
+  ],
+  "env": {
+    "NOTES_TITLE": "notes",
+    "PRICE": "$5"
+  },
+  "health": "/healthz",
+  "hosts": [
+    "notes.example.org",
+    "www.notes.example.org"
+  ],
+  "job_secrets": {
+    "rotate": [
+      "ROTATE_KEY"
+    ]
+  },
+  "jobs": [
+    {
+      "cmd": [
+        "python",
+        "/app/app.py",
+        "rotate"
+      ],
+      "name": "rotate",
+      "schedule": "*-*-* 04:20:00",
+      "timeout": 300
+    }
+  ],
+  "limits": {
+    "cpus": 2,
+    "memory": "512m",
+    "pids": 256,
+    "tmp": "64m"
+  },
+  "monitor": {
+    "egress": [
+      "bugs.example.org:443"
+    ],
+    "env": [
+      "MATOMO_SITE_ID",
+      "SENTRY_DSN",
+      "SENTRY_ENVIRONMENT",
+      "SENTRY_RELEASE"
+    ],
+    "kinds": [
+      "analytics",
+      "errors"
+    ],
+    "missing": []
+  },
+  "secrets": [
+    "NOTES_TOKEN"
+  ],
+  "slots": [
+    19110,
+    19111
+  ],
+  "smoke": [
+    {
+      "contains": "<title>notes</title>",
+      "headers": {
+        "content-security-policy": "frame-ancestors 'none'"
+      },
+      "path": "/",
+      "request_headers": {},
+      "status": 200
+    },
+    {
+      "contains": "",
+      "headers": {},
+      "path": "/nope",
+      "request_headers": {},
+      "status": 404
+    }
+  ],
+  "uid": 29002,
+  "upstreams": {
+    "mail-relay": {
+      "port": 4881,
+      "to": "127.0.0.1:2525"
+    }
+  }
+}

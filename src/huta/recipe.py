@@ -165,7 +165,13 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
             **({"components": {n: t.components.get(n, {}) for n in app["order"]},
                 "worker_liveness": t.worker_liveness} if SP.several(app) else {}),
             **({"external": {n: {**t.external.get(n, {}), "kind": e["kind"]}
-                             for n, e in app["external"].items()}} if app.get("external") else {})}
+                             for n, e in app["external"].items()}} if app.get("external") else {}),
+            **({"monitor": _monitor_effective(platform, project, t, app)} if t.monitor else {})}
+
+
+def _monitor_effective(platform, project, t, app) -> dict:
+    from . import monitor as M
+    return M.effective(platform, project, t, app)
 
 
 def compose_doc(platform: Platform, project: Project, t: Target, app: dict,

@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import tomllib
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -256,10 +257,15 @@ class Target:
     # Monitoring hooks (docs/PLAN-monitoring.md): which kinds are on, and a Matomo site to adopt.
     monitor: dict = field(default_factory=dict)
     matomo: int | None = None
+    # Set by load_registry from the host's [monitoring]: <dsn_host>:443 when errors is on.
+    monitor_egress: list = field(default_factory=list)
 
     @property
     def egress_allow(self) -> list[str]:
-        return [] if self.egress == "none" else list(self.egress)
+        """Where the target may connect out: the registry's list, plus the Bugsink DSN host
+        when it reports errors (docs/PLAN-monitoring.md §3). The one list every reader uses."""
+        own = [] if self.egress == "none" else list(self.egress)
+        return own + [e for e in self.monitor_egress if e not in own]
 
 
 @dataclass
@@ -567,10 +573,9 @@ def _components_cfg(v, target_env: dict, where: str) -> dict:
     out = {}
     for name, c in v.items():
         w = f"{where} components.{name}"
-        if isinstance(c, dict) and "monitor_env" in c:
-            raise ConfigError(f"{w}: monitor_env is planned (docs/PLAN-monitoring.md), not built yet")
-        if not NAME_RE.match(name) or not isinstance(c, dict) or set(c) - {"limits", "env", "secrets"}:
-            raise ConfigError(f"{w}: accepts limits, env and secrets")
+        if not NAME_RE.match(name) or not isinstance(c, dict) \
+                or set(c) - {"limits", "env", "secrets", "monitor_env"}:
+            raise ConfigError(f"{w}: accepts limits, env, secrets and monitor_env")
         limits = c.get("limits", {})
         if not isinstance(limits, dict) or set(limits) - {"memory", "cpus", "pids", "tmp"}:
             raise ConfigError(f"{w}: limits accepts memory, cpus, pids, tmp")
@@ -590,7 +595,9 @@ def _components_cfg(v, target_env: dict, where: str) -> dict:
             _env_name(k, f"{w} secrets")
             if k in env or k in target_env:
                 raise ConfigError(f"{w}: {k} is both in env and secrets")
-        out[name] = {"limits": dict(limits), "env": dict(env), "secrets": list(secrets)}
+        out[name] = {"limits": dict(limits), "env": dict(env), "secrets": list(secrets),
+                     **({"monitor_env": True}
+                        if _bool(c.get("monitor_env", False), f"{w} monitor_env") else {})}
     return out
 
 
@@ -1096,12 +1103,20 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                         raise ConfigError(f"{p.name}/{t.name}: external needs [external] "
                                           "wrangler in huta.toml")
                 mon = platform.monitoring
-                need = {"uptime": "healthchecks", "jobs": "healthchecks", "errors": "bugsink",
-                        "analytics": "matomo"}
+                # uptime needs only [monitoring]: huta probes by itself; healthchecks, when
+                # configured, also gets the result. analytics may adopt matomo = <id> instead.
+                need = {"uptime": None, "jobs": "healthchecks", "errors": "bugsink",
+                        "analytics": None if t.matomo is not None else "matomo"}
                 for kind in t.monitor:
-                    if not (mon and mon.get(need[kind])):
+                    if not mon:
+                        raise ConfigError(f"{p.name}/{t.name}: monitor needs [monitoring] in "
+                                          "huta.toml")
+                    if need[kind] and not mon.get(need[kind]):
                         raise ConfigError(f"{p.name}/{t.name}: monitor.{kind} needs "
                                           f"[monitoring.{need[kind]}] in huta.toml")
+                if "errors" in t.monitor:
+                    p.targets[t.name] = t = dataclasses.replace(
+                        t, monitor_egress=[f"{mon['bugsink']['dsn_host']}:443"])
                 if t.matomo is not None and "analytics" not in t.monitor:
                     raise ConfigError(f"{p.name}/{t.name}: matomo = <id> needs monitor.analytics")
                 if t.data and not platform.backup:
@@ -1160,7 +1175,8 @@ def zone_for(host: str, platform: Platform) -> str:
 
 
 APP_KEYS = {"schema", "project", "order", "build", "images", "components", "state",
-            "preflight", "smoke", "jobs", "external", "diag", "migrate"}
+            "preflight", "smoke", "jobs", "external", "diag", "migrate", "monitor"}
+MONITOR_ENV = ("sentry", "matomo")
 COMPONENT_KEYS = {"image", "kind", "port", "health", "data", "concurrent_safe", "upstream_api",
                   "public", "cmd"}
 MAX_COMPONENTS = 8
@@ -1176,8 +1192,6 @@ def parse_app_toml(text: str, project: str) -> dict:
         raise ConfigError("app.toml: schema must be 1")
     if d.get("project") != project:
         raise ConfigError(f"app.toml: project must be {project!r}")
-    if "monitor" in d:
-        raise ConfigError("app.toml: [monitor] is planned (docs/PLAN-monitoring.md), not built yet")
     unknown = set(d) - APP_KEYS
     if unknown:
         raise ConfigError(f"app.toml: unknown top-level keys {sorted(unknown)}")
@@ -1242,6 +1256,8 @@ def parse_app_toml(text: str, project: str) -> dict:
     d["smoke"] = _smoke(d.get("smoke", []))
     d["jobs"] = _jobs(d.get("jobs", []))
     d["diag"] = _diag(d.get("diag", []))
+    if "monitor" in d:
+        d["monitor"] = _monitor_app(d["monitor"])
     for j in d["jobs"] + d["diag"]:
         if "component" in j and j["component"] not in comps:
             raise ConfigError(f"app.toml: {j['name']}: no component {j['component']!r}")
@@ -1434,6 +1450,17 @@ def duration_s(v, where: str, hi: int) -> int:
     if not 1 <= n <= hi:
         raise ConfigError(f"{where}: {v} is out of range")
     return n
+
+
+def _monitor_app(v) -> dict:
+    """[monitor] env = ["sentry", "matomo"]: the variables the repo asks for (the host grants
+    them with the target's monitor; docs/PLAN-monitoring.md)."""
+    if not isinstance(v, dict) or set(v) - {"env"}:
+        raise ConfigError("app.toml: [monitor] accepts env")
+    env = v.get("env", [])
+    if not isinstance(env, list) or len(set(env)) != len(env) or set(env) - set(MONITOR_ENV):
+        raise ConfigError('app.toml: [monitor] env is a list of "sentry", "matomo"')
+    return {"env": sorted(env)}
 
 
 def _diag(items) -> list[dict]:

@@ -120,6 +120,7 @@ timeout = "10m"
 | `smoke` | array of tables | optional; at most 20 checks (below) |
 | `jobs` | array of tables | optional; at most 20 jobs (below) |
 | `diag` | array of tables | optional; at most 20 diagnostics (below) |
+| `monitor` | table | optional; `env`, the monitoring variables your app wants (below) |
 | `preflight` | array of tables | must be absent or empty (*planned*) |
 
 Any other top-level key: `app.toml: unknown top-level keys ['<key>']`.
@@ -354,6 +355,24 @@ cmd = ["node", "scripts/db-check.js"]   # integrity check, migration version, ro
 timeout = "2m"
 ```
 
+### `[monitor]`
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `env` | array of strings | `[]` | `"sentry"` (`SENTRY_DSN`, `SENTRY_RELEASE`, `SENTRY_ENVIRONMENT`), `"matomo"` (`MATOMO_SITE_ID`) |
+
+Your app gets these only if the host also grants them (`monitor` on the target in the
+registry), and only once the host has made the Bugsink project or Matomo site: the plan says
+which are set and why any are not. Never require them to start; treat them as optional. With
+`"sentry"`, the host lets the target reach the Bugsink host on port 443 through the egress proxy
+(the SDK must honour `HTTPS_PROXY`; there is no DNS in the container). Details:
+[Runtime](runtime.md#monitoring).
+
+```toml
+[monitor]
+env = ["sentry"]
+```
+
 ## The image
 
 ### Enforced (the host refuses the release otherwise)
@@ -496,7 +515,10 @@ see each other: the box is the unit huta can tell apart.
 | `upstreams` | array | `[]` | names defined in `huta.toml` `[upstreams.<name>]` |
 | `data` | table | | `size` 64m..512g (required), `backup` `hourly`/`daily`/`off`/an OnCalendar (default `daily`), `concurrent` bool (default `false`). Needs `[backup]` in `huta.toml` (its directory holds the copies; `backup = "off"` only turns off the schedule and shipping) |
 | `access_log` | bool | `true` | |
-| `crashes` | int | | the target's Bugsink project id (`huta crashes`) |
+| `crashes` | int | | the target's Bugsink project id (`huta crashes`); with `monitor.errors` huta uses this project instead of making one |
+| `monitor` | table | | `{ uptime, jobs, errors, analytics }` booleans: what huta wires the target into (needs `[monitoring]` in `huta.toml`; `errors` needs `[monitoring.bugsink]`, `jobs` `[monitoring.healthchecks]`; `jobs` and the uptime probe are *planned*). `errors` also lets the target reach the Bugsink host on 443 |
+| `matomo` | int | | a Matomo site id to use instead of making one (needs `monitor.analytics`) |
+| `components.<name>.monitor_env` | bool | `false` | this component also gets the monitoring variables (the public one always does) |
 | `legacy.<name>` | table | | project level: `unit` (`*.service`), `env_file` (absolute; required), `crashes` (optional); the name may not also be a target |
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |

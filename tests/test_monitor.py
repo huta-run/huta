@@ -46,10 +46,6 @@ class PlannedKeysRefused(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "watch is planned"):
             load(self.etc)
 
-    def test_component_key(self):
-        f = self.etc / "projects.d" / "hello.toml"
-        self.refused(f, "\n[targets.prod.components.web]\nmonitor_env = true\n",
-                     "monitor_env is planned")
 
 
 class FakeShapes(unittest.TestCase):
@@ -226,6 +222,11 @@ class Config(unittest.TestCase):
 
     def registry(self, platform):
         from huta import cfg
+        # The fixture's data and Postgres targets need a [backup] once the registry is checked
+        # against the platform.
+        platform = dataclasses.replace(platform, backup={"dir": Path("/nonexistent"),
+                                                         "ship": ["/bin/true"]},
+                                       wrangler_image="w@sha256:" + "0" * 64)
         with mock.patch.object(cfg, "assert_root_dir", lambda _p: None):
             return cfg.load_registry(self.etc, platform)
 
@@ -783,3 +784,160 @@ class ReleaseWithMonitoringDown(unittest.TestCase):
                 self.assertEqual(host.release(project, t, rid), S.LIVE)
         finally:
             host.close()
+
+
+# ------------------------------------------------------------------ milestone 2
+
+class Env(unittest.TestCase):
+    """What a container gets: only what the repo asks and the registry grants."""
+
+    def setUp(self):
+        from huta import runtime
+        self.etc = etc_copy()
+        self.platform, self.registry = load(self.etc)
+        self.platform = dataclasses.replace(self.platform, secrets_dir=self.etc / "secrets",
+                                            state_dir=Path(tempfile.mkdtemp(prefix="huta-st-")),
+                                            monitoring={"prefix": "huta"})
+        self.p = runtime.secret_dir(self.platform, "notes")
+        self.p.mkdir(parents=True, exist_ok=True)
+        self.patch = mock.patch.object(runtime, "secret_value",
+                                       lambda pl, pr, n: f"value-of-{n}")
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        shutil.rmtree(self.etc, ignore_errors=True)
+        shutil.rmtree(self.platform.state_dir, ignore_errors=True)
+
+    def env(self, t, app, project="notes"):
+        from huta import runtime as R
+        return R.environment(self.platform, self.registry[project], t, "a" * 40, "a", True, app)
+
+    def target(self, **k):
+        t = self.registry["notes"].targets["prod"]
+        return dataclasses.replace(t, monitor={"errors": True, "analytics": True},
+                                   monitor_egress=["bugs.example.org:443"], **k)
+
+    def app(self, ask):
+        from tests._util import app_toml
+        a = app_toml("notes")
+        if ask:
+            a["monitor"] = {"env": ask}
+        return a
+
+    def test_asked_and_granted(self):
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        env = self.env(self.target(matomo=7), self.app(["matomo", "sentry"]))
+        self.assertEqual(env["SENTRY_DSN"], "value-of-HUTA_SENTRY_DSN_PROD")
+        self.assertEqual(env["SENTRY_RELEASE"], "a" * 40)
+        self.assertEqual(env["SENTRY_ENVIRONMENT"], "prod")
+        self.assertEqual(env["MATOMO_SITE_ID"], "7")
+        self.assertIn("HTTPS_PROXY", env)            # the DSN host goes through the egress proxy
+
+    def test_not_asked_nothing(self):
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        env = self.env(self.target(matomo=7), self.app(None))
+        self.assertFalse({"SENTRY_DSN", "MATOMO_SITE_ID"} & set(env))
+
+    def test_not_granted_nothing(self):
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        t = dataclasses.replace(self.target(), monitor={"uptime": True})
+        self.assertNotIn("SENTRY_DSN", self.env(t, self.app(["sentry"])))
+
+    def test_dsn_missing_means_absent_and_said(self):
+        from huta import monitor as M
+        t, app = self.target(), self.app(["sentry"])
+        self.assertNotIn("SENTRY_DSN", self.env(t, app))
+        eff = M.effective(self.platform, self.registry["notes"], t, app)
+        self.assertEqual(eff["env"], [])
+        self.assertIn("no Bugsink DSN yet", eff["missing"][0])
+
+    def test_registry_value_wins(self):
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        t = self.target(env={**self.target().env, "SENTRY_DSN": "https://k@elsewhere.example.org/1"})
+        env = self.env(t, self.app(["sentry"]))
+        self.assertEqual(env["SENTRY_DSN"], "https://k@elsewhere.example.org/1")
+
+    def test_matomo_site_from_ensure(self):
+        from huta import monitor as M
+        t = self.target()
+        M._write_site(self.platform, t, 12)
+        self.assertEqual(self.env(t, self.app(["matomo"]))["MATOMO_SITE_ID"], "12")
+
+    def test_components(self):
+        from huta import runtime as R
+        from tests._util import app_toml
+        (R.secret_dir(self.platform, "shop")).mkdir(parents=True, exist_ok=True)
+        (R.secret_dir(self.platform, "shop") / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        shop = self.registry["shop"]
+        base = shop.targets["prod"]
+        app = app_toml("shop")
+        app["monitor"] = {"env": ["sentry"]}
+        for granted in (False, True):
+            comps = {**base.components, "api": {**base.components["api"],
+                                                **({"monitor_env": True} if granted else {})}}
+            t = dataclasses.replace(base, monitor={"errors": True}, components=comps,
+                                    monitor_egress=["bugs.example.org:443"])
+
+            def env(c, public=False):
+                return R.component_environment(self.platform, shop, t, "a" * 40, "a", c,
+                                               public, True, app)
+            with self.subTest(granted=granted):
+                self.assertIn("SENTRY_DSN", env("web", public=True))
+                self.assertEqual("SENTRY_DSN" in env("api"), granted)
+                self.assertNotIn("SENTRY_DSN", env("worker"))
+
+    def test_migrate_and_diag_never(self):
+        import inspect
+        from huta import diag, recipe
+        # Both build their own environment, never runtime.environment.
+        self.assertNotIn("environment(", inspect.getsource(recipe.run_migrate))
+        self.assertNotIn("R.environment(", inspect.getsource(diag))
+
+
+class Egress(Config):
+    """(Config's tests run here too.)"""
+
+    def test_dsn_host_granted(self):
+        self.set_target("monitor = { errors = true }")
+        reg = self.registry(self.platform(MONITORING))
+        t = reg["hello"].targets["prod"]
+        self.assertIn("bugs.example.org:443", t.egress_allow)
+        self.assertEqual(t.egress, "none")           # the registry's own value is unchanged
+
+    def test_uptime_needs_only_monitoring(self):
+        self.set_target("monitor = { uptime = true }")
+        bare = "\n[monitoring]\nprefix = \"huta\"\n"
+        self.registry(self.platform(bare))           # no healthchecks needed
+
+
+class MonitoredGolden(unittest.TestCase):
+    """The snapshot of a monitored target (`notes-monitored`): its compose and effective. The
+    v1 cases stay byte-identical (test_v1_golden)."""
+
+    def test_snapshot(self):
+        from tests._util import IMAGE, SHA, app_toml, check_golden
+        from huta import recipe, runtime as R
+        etc = etc_copy()
+        try:
+            platform, registry = load(etc)
+            platform = dataclasses.replace(platform, secrets_dir=etc / "secrets",
+                                           monitoring={"prefix": "huta"})
+            project = registry["notes"]
+            t = dataclasses.replace(project.targets["prod"],
+                                    monitor={"errors": True, "analytics": True}, matomo=7,
+                                    monitor_egress=["bugs.example.org:443"])
+            d = R.secret_dir(platform, "notes")
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "HUTA_SENTRY_DSN_PROD").write_text("x")
+            app = app_toml("notes")
+            app["monitor"] = {"env": ["matomo", "sentry"]}
+            with mock.patch.object(R, "secret_value", lambda *a: "never-used"):
+                check_golden(self, "effective/notes-monitored.json",
+                             recipe.effective(platform, project, t, app))
+                check_golden(self, "compose/notes-monitored.json",
+                             recipe.compose_doc(platform, project, t, app,
+                                                {"a": (IMAGE, SHA), "b": (IMAGE, "f" * 40)},
+                                                with_secrets=False))
+        finally:
+            shutil.rmtree(etc, ignore_errors=True)

@@ -110,9 +110,10 @@ logs = { days = 7, max = "200m", boxes = true, jobs = false }   # huta logs (the
 crashes = 11                   # Bugsink project id (huta crashes)
 adopt = "hello.example.org.caddy"   # moving a live site: its vhost file, replaced at the first release
 edge = { body = "1g", timeout = "10m" }   # v2: request body limit, upstream timeouts (unset: unchanged)
-# Monitoring hooks (docs/PLAN-monitoring.md; milestone 1 makes the remote resources only):
+# Monitoring hooks (docs/PLAN-monitoring.md; built: remote resources and the variables):
 monitor = { uptime = true, errors = true, analytics = true }   # jobs = true: planned
 matomo = 7                     # optional: adopt this Matomo site instead of creating one
+# [targets.prod.components.api] monitor_env = true   also gives that component the variables
 
 # v2: a gateway, a hostname for a service huta doesn't run (DESIGN-v2 §1). No slots, uid or repo.
 [targets.media]
@@ -313,8 +314,9 @@ content.
 
 ## Monitoring (`monitor.py`)
 
-Built so far (docs/PLAN-monitoring.md milestone 1): the remote resources. The rest of the plan
-(env injection, job checks, the probe timer, the watch window, the ↩️ button) is *planned*.
+Built so far (docs/PLAN-monitoring.md milestones 1 and 2): the remote resources and the
+variables they give containers. The rest of the plan (job checks, the probe timer, the watch
+window, the ↩️ button) is *planned*.
 
 - `ensure` makes what a target's `monitor` grants, once, and finds it again by name
   (`<prefix>_<project>_<target>`): a Bugsink project and its DSN (`errors`; `crashes = <id>`
@@ -333,6 +335,22 @@ Built so far (docs/PLAN-monitoring.md milestone 1): the remote resources. The re
   POST with the token in the body and `X-Forwarded-Proto: https` (Matomo with `force_ssl`
   redirects plain loopback calls otherwise).
 - A failure is an event `monitor-fail` (kind and a short reason) and never fails a release.
+- **Variables** (`runtime.environment`, via `monitor.env_for`): only when `app.toml` asks
+  (`[monitor] env = ["sentry", "matomo"]`) and the registry grants (`monitor.errors`,
+  `monitor.analytics`): `SENTRY_DSN` (the DSN secret), `SENTRY_RELEASE` (the sha),
+  `SENTRY_ENVIRONMENT` (the target), `MATOMO_SITE_ID` (`matomo = <id>`, else the site ensure
+  made, kept in `<state_dir>/monitor/<p>--<t>.json` since the environment is built without the
+  store). A name the registry sets wins. The public component gets them, other components only
+  with `monitor_env = true`, jobs as their component; migrations and diag never. A value that
+  doesn't exist yet is left out. They follow the state at the time a compose file is written
+  (a release, a revert, `huta start`), so a DSN made by `huta monitor ensure` appears in a live
+  slot only when its compose is next written.
+- `effective` gains `monitor` (kinds, the variable names, what is missing and why, the egress
+  added) only for targets with `monitor`; the plan says it as a `📈 monitoring:` line.
+- **Egress:** with `monitor.errors`, `<dsn_host>:443` joins the target's allowlist
+  (`Target.egress_allow`, which every reader uses: env, the egress policy, `runstate`). The
+  egress policy is built from the registry for all targets, not per release, so the grant
+  follows the registry, whether or not the release asks for the DSN.
 - Order and crashes: remote create → capability (check ids) → `monitors` row → DSN secret. A
   crash after a create is healed by the next `find` (same name); a row whose DSN secret is
   missing is repaired from the project id. A check is looked up by name before the upsert;

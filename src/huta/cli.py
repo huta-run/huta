@@ -364,6 +364,18 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
                       and old.get(k, dflt.get(k)) != eff.get(k, dflt.get(k)))
         if diff or old.get("compose") != eff.get("compose"):
             changes.append("changed: " + (", ".join(diff) if diff else "runtime config"))
+    mon = eff.get("monitor")
+    old_mon = (json.loads(live_rel["plan"]).get("effective") or {}).get("monitor") if live_rel else None
+    if mon and mon != old_mon:
+        # What monitoring changes in the container, said in words (docs/PLAN-monitoring.md §3).
+        parts = []
+        if mon["env"]:
+            parts.append("sets " + ", ".join(mon["env"]))
+        if mon["egress"] and (not old_mon or old_mon.get("egress") != mon["egress"]):
+            parts.append("egress adds " + ", ".join(mon["egress"]))
+        parts += [f"not set: {m}" for m in mon["missing"]]
+        changes.append("📈 monitoring: " + ("; ".join(parts) or "no variables (the repo asks "
+                                                             "for none)"))
     for name, when in R.staged_list(platform, project.name):
         if name in staged:
             # Secrets are per project: say what else the new value reaches (codex secrets #2).

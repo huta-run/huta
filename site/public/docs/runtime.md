@@ -52,6 +52,29 @@ declare needs, the operator grants them.
 registry). Values: send them yourself with `huta secret set` when you have them, or the
 operator sets them on the host. Never in chat, the repo or a commit.
 
+## Monitoring
+
+If the repo asks (`[monitor] env` in `app.toml`) and the host grants (`monitor` on the target),
+the public component (and components the registry marks `monitor_env`), and jobs that run in
+them, get:
+
+| Variable | Value |
+|---|---|
+| `SENTRY_DSN` | the target's own Bugsink project's DSN (a secret: redacted in logs) |
+| `SENTRY_RELEASE` | the release's sha |
+| `SENTRY_ENVIRONMENT` | the target's name (`prod`, `staging`) |
+| `MATOMO_SITE_ID` | the target's Matomo site id |
+
+- Each target has its own Bugsink project and Matomo site (staging never mixes with prod).
+- The host makes them when it plans a release. If that fails (the service is down), the plan
+  says which variables are not set and why, and the release goes ahead without them; they
+  arrive with a later release. Your app must start without them.
+- A value the host registry sets itself (`SENTRY_DSN` in `env` or `secrets`) wins.
+- Events go out through the egress proxy to the Bugsink host on 443 (`HTTPS_PROXY` is set; no
+  DNS). Most Sentry SDKs honour `HTTPS_PROXY`; check yours.
+- Migrations and diagnostics never get these variables.
+- Planned: per-release watch windows that read Bugsink, checks and probes after a release.
+
 ## Egress
 
 By default a target has **no way out**: no route to the internet, the LAN or the host, and no

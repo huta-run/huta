@@ -469,9 +469,41 @@ def _ensure_errors(platform, st, project, t, deadline) -> None:
     st.event("monitor", f"errors: Bugsink project {p['id']}", None, project.name, t.name)
 
 
+def site_file(platform: Platform, t: Target):
+    """The target's Matomo site id, for the container's environment, which is built without the
+    store (runtime.environment): <state_dir>/monitor/<p>--<t>.json."""
+    return platform.state_dir / "monitor" / f"{t.project}--{t.name}.json"
+
+
+def site_id(platform: Platform, t: Target) -> int | None:
+    try:
+        v = json.loads(site_file(platform, t).read_text()).get("matomo_site")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
+def _write_site(platform: Platform, t: Target, sid: int) -> None:
+    d = site_file(platform, t).parent
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = d / f".{t.project}--{t.name}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps({"matomo_site": sid}).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, site_file(platform, t))
+
+
 def _ensure_analytics(platform, st, project, t, deadline) -> None:
     n = name(platform, t)
-    if st.monitor(project.name, t.name, "analytics", n):
+    row = st.monitor(project.name, t.name, "analytics", n)
+    if row and site_id(platform, t) == int(row["remote_id"]) \
+            and (t.matomo is None or t.matomo == int(row["remote_id"])):
+        return
+    if row and (t.matomo is None or t.matomo == int(row["remote_id"])):
+        _write_site(platform, t, int(row["remote_id"]))    # the file went: repair it
         return
     if t.matomo is not None:
         sid = t.matomo
@@ -481,12 +513,13 @@ def _ensure_analytics(platform, st, project, t, deadline) -> None:
         urls = [f"https://{h}" for h in t.hosts]
         sid = mt_find(platform, urls[0], deadline) or mt_add(platform, n, urls, deadline)
     st.set_monitor(project.name, t.name, "analytics", n, str(sid), None)
+    _write_site(platform, t, sid)
     st.event("monitor", f"analytics: Matomo site {sid}", None, project.name, t.name)
 
 
 def _ensure_uptime(platform, st, project, t, deadline) -> None:
     if not platform.monitoring.get("healthchecks"):
-        raise MonitorError("no [monitoring.healthchecks] on this host")
+        return                    # huta probes by itself; there is just no check to feed
     n = name(platform, t)
     spec = {"name": n, "timeout": UPTIME_TIMEOUT, "grace": UPTIME_GRACE,
             "tags": f"{platform.monitoring['prefix']} {project.name} {t.name} uptime",
@@ -502,6 +535,58 @@ def _ensure_uptime(platform, st, project, t, deadline) -> None:
     remember_capability(platform, c["uuid"])
     st.set_monitor(project.name, t.name, "uptime", n, c["uuid"], spec)
     st.event("monitor", "uptime: healthchecks check made", None, project.name, t.name)
+
+
+# ------------------------------------------------------------------ env
+
+def env_for(platform: Platform, project: Project, t: Target, app: dict | None, sha: str,
+            with_secrets: bool) -> tuple[dict[str, str], list[str]]:
+    """The variables a container gets from monitoring, and why any it asked for are missing.
+    Only what the repo asks for ([monitor] env) and the registry grants (monitor.errors,
+    monitor.analytics); a name the registry already sets wins. The values come from what ensure
+    made at planning time; nothing here calls a service."""
+    asks = set(((app or {}).get("monitor") or {}).get("env", []))
+    env: dict[str, str] = {}
+    missing: list[str] = []
+    if not asks or not t.monitor:
+        return env, missing
+    taken = set(t.env) | set(t.secrets)
+    if "sentry" in asks:
+        if "errors" not in t.monitor:
+            missing.append("sentry: the host registry doesn't grant monitor.errors")
+        elif "SENTRY_DSN" in taken:
+            missing.append("sentry: SENTRY_DSN is set by the host registry; huta adds nothing")
+        elif not (R.secret_dir(platform, project.name) / dsn_secret(t)).is_file():
+            missing.append("sentry: no Bugsink DSN yet (it comes with the next release after "
+                           "huta monitor ensure succeeds)")
+        else:
+            env["SENTRY_DSN"] = (R.secret_value(platform, project.name, dsn_secret(t))
+                                 if with_secrets else R.SECRET_PLACEHOLDER)
+            for k, v in (("SENTRY_RELEASE", sha), ("SENTRY_ENVIRONMENT", t.name)):
+                if k not in taken:
+                    env[k] = v
+    if "matomo" in asks:
+        sid = t.matomo if t.matomo is not None else site_id(platform, t)
+        if "analytics" not in t.monitor:
+            missing.append("matomo: the host registry doesn't grant monitor.analytics")
+        elif "MATOMO_SITE_ID" in taken:
+            missing.append("matomo: MATOMO_SITE_ID is set by the host registry; huta adds nothing")
+        elif sid is None:
+            missing.append("matomo: no Matomo site yet")
+        else:
+            env["MATOMO_SITE_ID"] = str(sid)
+    return env, missing
+
+
+MONITOR_VARS = ("SENTRY_DSN", "SENTRY_RELEASE", "SENTRY_ENVIRONMENT", "MATOMO_SITE_ID")
+
+
+def effective(platform: Platform, project: Project, t: Target, app: dict) -> dict:
+    """The plan's view (`effective["monitor"]`): kinds, the variables injected (names only),
+    what is missing and why, the egress it adds."""
+    env, missing = env_for(platform, project, t, app, "<sha>", with_secrets=False)
+    return {"kinds": sorted(t.monitor), "env": sorted(env), "missing": missing,
+            "egress": list(t.monitor_egress)}
 
 
 # ------------------------------------------------------------------ status
@@ -530,4 +615,7 @@ def status_lines(platform: Platform, st, project: Project, t: Target) -> list[st
             out.append(f"analytics: Matomo site {r['remote_id']} ({r['name']})")
         else:
             out.append(f"{kind}: healthchecks check {r['name']} ({r['state']})")
+    if "uptime" in t.monitor and "uptime" not in rows and not platform.monitoring.get("healthchecks"):
+        out = [x for x in out if not x.startswith("uptime:")] + [
+            "uptime: probed by huta only (no [monitoring.healthchecks]; the probe is planned)"]
     return out

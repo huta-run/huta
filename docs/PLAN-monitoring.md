@@ -216,16 +216,20 @@ healed by the next `find` (same name, exactly one match).
 
 ### 3. Env injection
 
-`runtime.environment` adds the variables for the components above, from what the plan recorded
-(`effective["monitor"]`: which variables, the DSN's secret name, the site id). In plans
-`SENTRY_DSN` shows the secret placeholder. `reconcile` and restarts rebuild the env from the
-release's recorded plan, so a live slot never gains or loses a variable outside a release.
+`runtime.environment` adds the variables for the components above. In plans `SENTRY_DSN` shows
+the secret placeholder, and `effective["monitor"]` lists the names, what is missing and why.
+As built: the variables follow the state when a compose file is written (a release, a revert,
+`huta start`); nothing between planning and approval creates the DSN or the site except the
+operator's `huta monitor ensure`, which then supersedes a waiting plan. A DSN made later reaches
+a live slot only when its compose is next written. The Matomo site id is kept in
+`<state_dir>/monitor/<p>--<t>.json`, as the environment is built without the store.
 `effective` gains a `monitor` key only when the target has `monitor`, so v1 dicts are unchanged.
 
-With the DSN injected, `<dsn_host>:443` joins the target's effective egress allowlist. One
-function computes it (`runtime.egress_allow(platform, t, app)`) and every reader uses it:
-`environment`, `needs_gateway`, `egress.build_policy`, `effective`, `runstate`. The plan shows
-the line as a change.
+With `monitor.errors`, `<dsn_host>:443` joins the target's egress allowlist. As built it follows
+the registry, not the release: the egress policy is built from the registry for every target at
+once, so it can't depend on what one release asks. `Target.egress_allow` includes it and every
+reader uses it (`environment`, `needs_gateway`, `egress.build_policy`, `runstate`); the plan
+shows it on its `📈 monitoring:` line.
 
 ### 4. Job checks
 
@@ -255,7 +259,10 @@ the line as a change.
 whole tick; work left over waits for the next tick, targets in turn so none starves. Without
 `[monitoring]` the tick does nothing and exits 0.
 
-- **Probe.** For each target with `uptime` and a live release: one request per host to the
+- **Probe.** huta probes by itself; healthchecks is optional (decision 11). `monitor.uptime` needs only `[monitoring]`; the samples live in
+  huta's ring file and feed the watch's probe signal; with `[monitoring.healthchecks]` each
+  result is also pinged to the target's uptime check. For each target with `uptime` and a live
+  release: one request per host to the
   public health path, 5 s, `ok is true` and `sha` = the live sha (today's `public_check` checks
   only the sha; the probe checks both, and `public_check` is fixed to do the same). Before and
   after the request huta reads the live row (release id, since), the phase file and the stop
@@ -403,7 +410,7 @@ Each is one install; each leaves every target working. The rules of `BUILD-v2.md
 |---|---|---|---|---|
 | 0 | API survey checked with real tokens on a test host, shapes kept as fixtures; fake services in `tests/fakehost.py`; `[monitor]`, `monitor`, `watch`, `matomo`, `monitor_env` refused by name | all tests green; golden unchanged | `test_app_toml` (refusals), `test_monitor` (fake API shapes) | built; real-token checks of the writing calls pending |
 | 1 | Config, `huta secret set _platform`, migration 4, clients, `ensure`, check ids in the redactor, `huta monitor status\|ensure` | `ensure` twice on a test target creates each thing once; with the API down a release still goes live | unit: parsing, URL rules, hostile answers (oversize, redirect, wrong shape, two matches, bad DSN); redaction of a bare uuid; crash: `MonitorEnsure` (die after each create, capability, row and the DSN secret), API down; old golden cases byte-identical (the plan's `effective` doesn't change until milestone 2) | built (tests); gate on a test host pending |
-| 2 | Env injection from the plan, one effective egress list, `[monitor] env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: new case `notes-monitored` (compose and effective), old cases byte-identical; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: `MonitoredRelease` | |
+| 2 | Env injection, one effective egress list, `[monitor] env` and `monitor_env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: new case `notes-monitored` (compose and effective), old cases byte-identical; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: a monitored release with every service down plans and goes live | built (tests); gate on a test host pending |
 | 3 | Job checks (tick convergence, OnCalendar schedules) and pings | a job run turns its check up; a failing job turns it down; removing a job pauses it | unit: schedule, fallback period and grace (weekday schedule), exit code mapping; ping failure doesn't change the exit; crash: tick killed after a convergence call | |
 | 4 | Tick: timer, budget, probe, self-ping; `public_check` requires `ok` | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip and revalidation rules, sample ring, budget; `test_monitor_tick` | |
 | 5 | Watch: episodes, signals (local included), coverage, verdicts, history lines, `huta watch`, `status` | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, coverage thirds, re-evaluation from rows; crash: tick killed after each write, twice (`WatchTick`) | |
@@ -443,6 +450,8 @@ The owner decided the open questions on 2026-11-25, each as proposed:
 9. **Local signals** (restarts, OOM kills, worker exits) are in the watch now, milestone 5.
 10. **Matomo sites** are created when `MATOMO_TOKEN` is set; `matomo = <id>` adopts one without
     it.
+11. **The uptime probe doesn't need healthchecks** (decided during milestone 2): huta keeps the
+    samples itself and pings a healthchecks check only when one is configured.
 
 ## How to build this
 

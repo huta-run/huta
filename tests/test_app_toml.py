@@ -206,6 +206,22 @@ class External(unittest.TestCase):
                 self.parse(extra)
 
 
+class Monitor(unittest.TestCase):
+    """[monitor] env (docs/PLAN-monitoring.md, milestone 2)."""
+
+    def test_accepted(self):
+        app = parse_app_toml(with_lines(HELLO, after='[monitor]\nenv = ["sentry", "matomo"]\n'),
+                             "hello")
+        self.assertEqual(app["monitor"], {"env": ["matomo", "sentry"]})
+        self.assertNotIn("monitor", parse_app_toml(HELLO, "hello"))
+
+    def test_refused(self):
+        for bad in ('[monitor]\nenv = ["sentry", "sentry"]\n', '[monitor]\nenv = ["datadog"]\n',
+                    '[monitor]\nenv = "sentry"\n', '[monitor]\nchecks = true\n'):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                parse_app_toml(with_lines(HELLO, after=bad), "hello")
+
+
 class PlannedFeaturesRefused(unittest.TestCase):
     """Today's refusals. A v2 step that builds a feature replaces its test here."""
 
@@ -216,10 +232,7 @@ class PlannedFeaturesRefused(unittest.TestCase):
     def test_schema_2(self):
         self.refused(HELLO.replace("schema = 1", "schema = 2"), "schema must be 1")
 
-    def test_monitor(self):
-        # docs/PLAN-monitoring.md, milestone 2 builds it.
-        self.refused(with_lines(HELLO, after='[monitor]\nenv = ["sentry"]\n'),
-                     r"\[monitor\] is planned")
+
 
 
 if __name__ == "__main__":
