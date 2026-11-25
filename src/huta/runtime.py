@@ -339,7 +339,7 @@ def environment(platform: Platform, project: Project, t: Target, sha: str, slot:
     if t.monitor and app is not None and app.get("monitor"):
         from . import monitor as M        # docs/PLAN-monitoring.md §3
         env.update(M.env_for(platform, project, t, app, sha, with_secrets)[0])
-    if t.egress_allow:
+    if egress_for(platform, project, t, app):
         proxy = f"http://{EGRESS_HOST}:{platform.egress_port}"
         # Both cases, and ALL_PROXY cleared, so a variable baked into the image can't pick
         # another route. Plain-HTTP requests reach the daemon too, which refuses them clearly.
@@ -430,8 +430,23 @@ def hardening(project: Project, t: Target, limits: dict | None = None) -> dict:
     }
 
 
-def needs_gateway(t: Target) -> bool:
-    return bool(t.egress_allow or t.upstreams)
+def egress_for(platform: Platform, project: Project, t: Target, app: dict | None) -> list[str]:
+    """Where a release's containers may connect out: the registry's allowlist, plus the Bugsink
+    DSN host when this release gets SENTRY_DSN (the repo asks, the registry grants, the DSN
+    exists; docs/PLAN-monitoring.md §3)."""
+    own = t.egress_allow
+    if t.monitor_egress and app is not None and app.get("monitor"):
+        from . import monitor as M
+        if "SENTRY_DSN" in M.env_for(platform, project, t, app, "", with_secrets=False)[0]:
+            own = own + [e for e in t.monitor_egress if e not in own]
+    return own
+
+
+def needs_gateway(t: Target, platform: Platform | None = None, project: Project | None = None,
+                  app: dict | None = None) -> bool:
+    if t.upstreams or t.egress_allow:
+        return True
+    return bool(platform and project and egress_for(platform, project, t, app))
 
 
 def docker_run_args(platform: Platform, project: Project, t: Target, app: dict, network: str,
@@ -452,7 +467,7 @@ def docker_run_args(platform: Platform, project: Project, t: Target, app: dict, 
             "--log-driver", "none"]
     for k, v in labels.items():
         args += ["--label", f"{k}={v}"]
-    if needs_gateway(t):
+    if needs_gateway(t, platform, project, app):
         args += ["--add-host", f"{EGRESS_HOST}:host-gateway"]
     mnt = comp.get("data")
     if mnt:

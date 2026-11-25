@@ -347,10 +347,13 @@ window, the ↩️ button) is *planned*.
   slot only when its compose is next written.
 - `effective` gains `monitor` (kinds, the variable names, what is missing and why, the egress
   added) only for targets with `monitor`; the plan says it as a `📈 monitoring:` line.
-- **Egress:** with `monitor.errors`, `<dsn_host>:443` joins the target's allowlist
-  (`Target.egress_allow`, which every reader uses: env, the egress policy, `runstate`). The
-  egress policy is built from the registry for all targets, not per release, so the grant
-  follows the registry, whether or not the release asks for the DSN.
+- **Egress:** `<dsn_host>:443` is added only for a release that gets `SENTRY_DSN` (the repo
+  asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and
+  compose (proxy variables, the egress host), and in the egress policy only while such a
+  release of the target is live, approved or running (`egress.monitor_grants`, read-only on
+  `huta.db`). `Target.egress_allow` stays the registry's own list.
+- The DSN is listed in the plan's `secret_versions`, so approval refuses a plan whose DSN
+  changed since; `ensure` writes it under the project's secrets lock.
 - Order and crashes: remote create → capability (check ids) → `monitors` row → DSN secret. A
   crash after a create is healed by the next `find` (same name); a row whose DSN secret is
   missing is repaired from the project id. A check is looked up by name before the upsert;

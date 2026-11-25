@@ -43,10 +43,14 @@ class Scenario:
     migrate_r2 = False
     online = False                 # r2 migrates online (r1 runs on both schemas; never restores)
     check_r2 = True                # with online: the repo's [migrate] check exists
+    monitored = False              # the target reports errors, the repo asks for SENTRY_DSN
 
     def app(self):
         """The manifest both releases use (scenarios with several components shape it)."""
-        return app_toml(self.project_name)
+        app = app_toml(self.project_name)
+        if self.monitored:
+            app["monitor"] = {"env": ["sentry"]}
+        return app
     clean: str = LIVE              # r2's outcome without a crash
     allowed: set = {LIVE, NA}      # r2's outcomes after a crash and reconcile
 
@@ -56,6 +60,18 @@ class Scenario:
         host = FakeHost()
         project = host.registry[self.project_name]
         t = project.targets[self.target_name]
+        if self.monitored:
+            import dataclasses
+            from huta import runtime
+            host.platform = dataclasses.replace(host.platform, monitoring={
+                "prefix": "huta", "healthchecks": None, "matomo": None,
+                "bugsink": {"dsn_host": "bugs.example.org", "team": "0" * 8 + "-0000-0000-0000-" + "0" * 12}})
+            t = dataclasses.replace(t, monitor={"errors": True},
+                                    monitor_egress=["bugs.example.org:443"])
+            project.targets[t.name] = t
+            d = runtime.secret_dir(host.platform, project.name)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "HUTA_SENTRY_DSN_PROD").write_text("https://k@bugs.example.org/1\n")
         app = self.app()
         r1 = None
         if self.adopt_file:
@@ -266,6 +282,13 @@ def versioned(app, schema, migrate=False):
 class StatelessRelease(Scenario, unittest.TestCase):
     """Both slots run during the swap; the vhost switch is the only cut-over."""
     project_name, target_name = "hello", "prod"
+
+
+class MonitoredRelease(Scenario, unittest.TestCase):
+    """A release that gets SENTRY_DSN and the Bugsink host in its egress
+    (docs/PLAN-monitoring.md milestone 2): recovery is as for any release."""
+    project_name, target_name = "notes", "prod"
+    monitored = True
 
 
 class StatelessFirstRelease(Scenario, unittest.TestCase):

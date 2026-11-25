@@ -200,7 +200,7 @@ def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
                        "run.huta.slot": slot, "run.huta.sha": sha},
             "networks": [f"n{NET_GEN}", *([f"pg{slot}"] if _uses_pg(t, app) else [])],
         }
-        if R.needs_gateway(t):
+        if R.needs_gateway(t, platform, project, app):
             svc["extra_hosts"] = [f"{R.EGRESS_HOST}:host-gateway"]
         if mount:
             _img, where = R.data_paths(platform, t)
@@ -269,7 +269,7 @@ def _compose_several(platform: Platform, project: Project, t: Target, app: dict,
                 svc["ports"] = [f"127.0.0.1:{port}:{int(c.get('port', 8080))}"]
             if c.get("cmd"):
                 svc["command"] = list(c["cmd"])
-            if R.needs_gateway(t):
+            if R.needs_gateway(t, platform, project, app):
                 svc["extra_hosts"] = [f"{R.EGRESS_HOST}:host-gateway"]
             if c.get("data"):
                 _img, where = R.data_paths(platform, t)

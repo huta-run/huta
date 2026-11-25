@@ -447,6 +447,8 @@ def _fail(st, t: Target, kind: str, e: Exception, log) -> str:
 
 
 def _ensure_errors(platform, st, project, t, deadline) -> None:
+    # Writes the DSN secret: callers hold the project's secrets lock (plan_release's callers
+    # do; huta monitor ensure takes it).
     if not platform.monitoring.get("bugsink"):
         raise MonitorError("no [monitoring.bugsink] on this host")
     n = name(platform, t)
@@ -586,7 +588,14 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
     what is missing and why, the egress it adds."""
     env, missing = env_for(platform, project, t, app, "<sha>", with_secrets=False)
     return {"kinds": sorted(t.monitor), "env": sorted(env), "missing": missing,
-            "egress": list(t.monitor_egress)}
+            "egress": list(t.monitor_egress) if "SENTRY_DSN" in env else []}
+
+
+def secret_names(platform: Platform, project: Project, t: Target, app: dict) -> list[str]:
+    """The generated secrets a release reads (the DSN), for the plan's secret_versions: approval
+    refuses a plan whose DSN changed since (codex review of milestone 2, #2)."""
+    env, _m = env_for(platform, project, t, app, "", with_secrets=False)
+    return [dsn_secret(t)] if "SENTRY_DSN" in env else []
 
 
 # ------------------------------------------------------------------ status

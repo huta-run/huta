@@ -40,12 +40,49 @@ log = logging.getLogger("huta-egress")
 
 # ------------------------------------------------------------------ policy (written by root)
 
+def monitor_grants(platform, registry) -> set[tuple[str, str]]:
+    """Targets whose Bugsink DSN host is allowed now: a release of the target that is live, or
+    approved or running (it is starting), gets SENTRY_DSN (docs/PLAN-monitoring.md §3). The
+    policy is one file for every target, so it follows those releases, not one plan. Read-only
+    on huta.db; any doubt grants nothing."""
+    import sqlite3
+    from . import runtime as R
+    want = {(p.name, t.name): (p, t) for p in registry.values() for t in p.targets.values()
+            if t.monitor_egress}
+    out: set = set()
+    db = platform.state_dir / "huta.db"
+    if not want or not db.exists():
+        return out
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT project, target, app_toml FROM releases WHERE state IN"
+                               " ('live', 'approved', 'running')").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return out
+    for p, tn, app_toml in rows:
+        if (p, tn) in want and (p, tn) not in out:
+            project, t = want[(p, tn)]
+            try:
+                app = json.loads(app_toml)
+            except ValueError:
+                continue
+            if set(R.egress_for(platform, project, t, app)) - set(t.egress_allow):
+                out.add((p, tn))
+    return out
+
+
 def build_policy(platform, registry, network_name) -> dict:
     """subnet → target, allowlist and upstreams, for every target that has a network."""
     targets = []
+    mon = monitor_grants(platform, registry)
     for project in registry.values():
         for t in project.targets.values():
-            if not (t.egress_allow or t.upstreams):
+            allow = t.egress_allow + ([e for e in t.monitor_egress if e not in t.egress_allow]
+                                      if (project.name, t.name) in mon else [])
+            if not (allow or t.upstreams):
                 continue
             subnets = []
             names = network_name(t)
@@ -59,7 +96,7 @@ def build_policy(platform, registry, network_name) -> dict:
             if not subnets:
                 continue   # no network yet: nothing of this target runs
             targets.append({"target": f"{project.name}/{t.name}", "subnets": subnets,
-                            "allow": t.egress_allow,
+                            "allow": allow,
                             "upstreams": {u: platform.upstreams[u]["port"] for u in t.upstreams}})
     # The publisher's own network (DESIGN-v2 §5): only Cloudflare's API.
     from .external import EGRESS, NETWORK

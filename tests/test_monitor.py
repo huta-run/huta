@@ -758,7 +758,8 @@ class ReleaseWithMonitoringDown(unittest.TestCase):
                 (pdir / n).write_text("token-0123456789")
             image = host.add_image("hello", SHA)
             gh = mock.Mock()
-            gh.read_file.return_value = (ROOT / "examples/hello/deploy/app.toml").read_text()
+            gh.read_file.return_value = ((ROOT / "examples/hello/deploy/app.toml").read_text()
+                                         + '\n[monitor]\nenv = ["sentry", "matomo"]\n')
             st = host.store()
             try:
                 with mock.patch.object(M, "transport", down), \
@@ -777,6 +778,14 @@ class ReleaseWithMonitoringDown(unittest.TestCase):
                 self.assertEqual(fails, ["analytics", "errors"])
                 self.assertTrue(all("no answer" in e["msg"] for e in st.events(limit=20)
                                     if e["kind"] == "monitor-fail"))
+                plan = json.loads(st.release(rid)["plan"])
+                mon = [c for c in plan["changes"] if c.startswith("📈 monitoring")]
+                self.assertEqual(len(mon), 1, plan["changes"])
+                self.assertIn("not set: sentry", mon[0])
+                # What cmd_approve recomputes still matches the plan.
+                app = json.loads(st.release(rid)["app_toml"])
+                self.assertEqual(recipe.effective(host.platform, project, t, app),
+                                 plan["effective"])
                 st.transition(rid, S.PLANNED, S.APPROVED)
             finally:
                 st.db.close()
@@ -902,8 +911,8 @@ class Egress(Config):
         self.set_target("monitor = { errors = true }")
         reg = self.registry(self.platform(MONITORING))
         t = reg["hello"].targets["prod"]
-        self.assertIn("bugs.example.org:443", t.egress_allow)
-        self.assertEqual(t.egress, "none")           # the registry's own value is unchanged
+        self.assertEqual(t.monitor_egress, ["bugs.example.org:443"])
+        self.assertEqual(t.egress_allow, [])         # a release adds it, only when it gets the DSN
 
     def test_uptime_needs_only_monitoring(self):
         self.set_target("monitor = { uptime = true }")
@@ -941,3 +950,88 @@ class MonitoredGolden(unittest.TestCase):
                                                 with_secrets=False))
         finally:
             shutil.rmtree(etc, ignore_errors=True)
+
+
+class EgressPerRelease(Env):
+    """The DSN host is reachable only from a release that gets SENTRY_DSN (codex review of
+    milestone 2, #1)."""
+
+    def egress(self, t, app):
+        from huta import runtime as R
+        return R.egress_for(self.platform, self.registry["notes"], t, app)
+
+    def test_only_with_the_dsn(self):
+        t = self.target()
+        self.assertNotIn("bugs.example.org:443", self.egress(t, self.app(["sentry"])))  # no DSN yet
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        self.assertIn("bugs.example.org:443", self.egress(t, self.app(["sentry"])))
+        self.assertNotIn("bugs.example.org:443", self.egress(t, self.app(None)))      # not asked
+        self.assertNotIn("bugs.example.org:443", self.egress(t, self.app(["matomo"])))
+
+    def test_no_gateway_without_it(self):
+        from huta import runtime as R
+        hello = self.registry["hello"]
+        t = dataclasses.replace(hello.targets["prod"], monitor={"errors": True},
+                                monitor_egress=["bugs.example.org:443"])
+        from tests._util import app_toml
+        app = app_toml("hello")
+        app["monitor"] = {"env": ["sentry"]}
+        self.assertFalse(R.needs_gateway(t, self.platform, hello, app))   # no DSN: no way out
+        env = R.environment(self.platform, hello, t, "a" * 40, "a", False, app)
+        self.assertNotIn("HTTPS_PROXY", env)
+
+    def test_policy_follows_releases(self):
+        from huta import egress as E, store as S
+        t = self.target()
+        reg = {"notes": dataclasses.replace(self.registry["notes"],
+                                            targets={**self.registry["notes"].targets, "prod": t})}
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        with mock.patch.object(S, "assert_root_dir", lambda _p: None):
+            st = S.Store(self.platform.state_dir)
+        try:
+            self.assertEqual(E.monitor_grants(self.platform, reg), set())
+            for ask, want in ((None, set()), (["sentry"], {("notes", "prod")})):
+                app = self.app(ask)
+                rid = st.new_release(project="notes", target="prod", sha="a" * 40, image_id="i",
+                                     image_tag="t", app_toml=json.dumps(app), plan={},
+                                     plan_hash="0", built_by="test")
+                self.assertEqual(E.monitor_grants(self.platform, reg), set())   # only planned
+                st.transition(rid, S.PLANNED, S.APPROVED)
+                self.assertEqual(E.monitor_grants(self.platform, reg), want, ask)
+                st.transition(rid, S.APPROVED, S.REJECTED)
+        finally:
+            st.db.close()
+
+
+class ApprovalSeesMonitoring(Env):
+    """What approval recomputes: effective, and the DSN among the secret versions."""
+
+    def test_dsn_change_is_seen(self):
+        from huta import cli, runtime as R
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("one")
+        t, app, project = self.target(), self.app(["sentry"]), self.registry["notes"]
+        names = cli._monitor_secrets(self.platform, project, t, app)
+        self.assertEqual(names, ["HUTA_SENTRY_DSN_PROD"])
+        with mock.patch.object(R, "_fingerprint", lambda p: p.read_text()):
+            before = R.live_versions(self.platform, "notes", names)
+            (self.p / "HUTA_SENTRY_DSN_PROD").write_text("two")
+            self.assertNotEqual(R.live_versions(self.platform, "notes", names), before)
+
+    def test_effective_stable_between_plan_and_approve(self):
+        from huta import recipe
+        (self.p / "HUTA_SENTRY_DSN_PROD").write_text("x")
+        t, app, project = self.target(matomo=3), self.app(["sentry", "matomo"]), self.registry["notes"]
+        self.assertEqual(recipe.effective(self.platform, project, t, app),
+                         recipe.effective(self.platform, project, t, app))
+        eff = recipe.effective(self.platform, project, t, app)
+        self.assertEqual(eff["monitor"]["egress"], ["bugs.example.org:443"])
+        self.assertEqual(eff["egress"], t.egress)       # the registry's own list, as before
+
+
+class MonitorTomlTypes(unittest.TestCase):
+    def test_nested_values_are_config_errors(self):
+        from tests.test_app_toml import HELLO, with_lines
+        from huta.cfg import parse_app_toml
+        for bad in ("[monitor]\nenv = [[]]\n", "[monitor]\nenv = [{}]\n", "[monitor]\nenv = [1]\n"):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                parse_app_toml(with_lines(HELLO, after=bad), "hello")

@@ -427,7 +427,8 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
         **({"external": externals} if externals else {}),   # name -> {hash, files, bytes, kind, key}
         "effective": eff, "built_by": "dev", "note": note, "history": history,
         "staged_secrets": staged,     # {name: fingerprint}: approval applies exactly these
-        "secret_versions": R.live_versions(platform, project.name, secret_names(t)),
+        "secret_versions": R.live_versions(platform, project.name, secret_names(t)
+                                           + _monitor_secrets(platform, project, t, app)),
     }
     if t.data:
         from .data import last_backup_text
@@ -438,6 +439,13 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
                           plan_hash=hashlib.sha256(blob.encode()).hexdigest(), built_by="dev",
                           images=images,
                           schema=(app.get("state") or {}).get("schema"))
+
+
+def _monitor_secrets(platform, project, t, app) -> list[str]:
+    if not t.monitor:
+        return []
+    from . import monitor as M
+    return M.secret_names(platform, project, t, app)
 
 
 def secret_names(t) -> list[str]:
@@ -1542,7 +1550,9 @@ def cmd_monitor(a):
     t = target_of(project, a.target)
     res: dict = {}
     if a.action == "ensure":
-        res = M.ensure(platform, st, project, t, log=say)
+        # The DSN is a project secret: written under the same lock as every other secret.
+        with st.lock(project.name, R.SECRETS_LOCK, wait=300):
+            res = M.ensure(platform, st, project, t, log=say)
         if not res:
             say("nothing to make (no monitor on this target, or monitoring is off)")
     for line in M.status_lines(platform, st, project, t):

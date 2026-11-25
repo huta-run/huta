@@ -225,11 +225,12 @@ a live slot only when its compose is next written. The Matomo site id is kept in
 `<state_dir>/monitor/<p>--<t>.json`, as the environment is built without the store.
 `effective` gains a `monitor` key only when the target has `monitor`, so v1 dicts are unchanged.
 
-With `monitor.errors`, `<dsn_host>:443` joins the target's egress allowlist. As built it follows
-the registry, not the release: the egress policy is built from the registry for every target at
-once, so it can't depend on what one release asks. `Target.egress_allow` includes it and every
-reader uses it (`environment`, `needs_gateway`, `egress.build_policy`, `runstate`); the plan
-shows it on its `📈 monitoring:` line.
+`<dsn_host>:443` joins the egress of a release that gets `SENTRY_DSN`, and only then
+(decision 3): `runtime.egress_for` gives a release's env and compose their list; the egress
+policy, one file for every target, grants it while such a release of the target is live,
+approved or running (`egress.monitor_grants`). The plan shows it on its `📈 monitoring:` line.
+The DSN is in the plan's `secret_versions`, so a DSN replaced between plan and approval
+supersedes the plan.
 
 ### 4. Job checks
 

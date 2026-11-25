@@ -262,10 +262,9 @@ class Target:
 
     @property
     def egress_allow(self) -> list[str]:
-        """Where the target may connect out: the registry's list, plus the Bugsink DSN host
-        when it reports errors (docs/PLAN-monitoring.md §3). The one list every reader uses."""
-        own = [] if self.egress == "none" else list(self.egress)
-        return own + [e for e in self.monitor_egress if e not in own]
+        """The registry's own allowlist. A release may add the Bugsink DSN host
+        (runtime.egress_for, docs/PLAN-monitoring.md §3)."""
+        return [] if self.egress == "none" else list(self.egress)
 
 
 @dataclass
@@ -1458,7 +1457,8 @@ def _monitor_app(v) -> dict:
     if not isinstance(v, dict) or set(v) - {"env"}:
         raise ConfigError("app.toml: [monitor] accepts env")
     env = v.get("env", [])
-    if not isinstance(env, list) or len(set(env)) != len(env) or set(env) - set(MONITOR_ENV):
+    if not isinstance(env, list) or not all(isinstance(x, str) for x in env) \
+            or len(set(env)) != len(env) or set(env) - set(MONITOR_ENV):
         raise ConfigError('app.toml: [monitor] env is a list of "sentry", "matomo"')
     return {"env": sorted(env)}
 
