@@ -47,7 +47,7 @@ from .ext import Cloudflare, ExtError, GitHub
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # Errors huta raises on purpose to turn something down: "refused", not "huta broke".
 REFUSALS = (ConfigError, ExtError, recipe.RecipeError, edge.EdgeError, RuntimeError, KeyError,
-            OSError, DataError)
+            OSError, DataError, S.StoreError)
 ETC_REGISTRY_HTPASSWD = Path("/etc/huta/registry/htpasswd")
 PLAN_TTL = 30 * 60
 

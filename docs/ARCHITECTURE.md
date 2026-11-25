@@ -272,6 +272,9 @@ content.
   to as the truth: it repairs the live pointer, marks interrupted releases `nothing-activated`
   and stops slots nothing routes to.
 - Every host helper command (docker, incus, git) runs with a deadline.
+- `huta.db` carries its own version (`PRAGMA user_version`); migrations run forward, one
+  transaction each, and a huta that finds a newer database refuses to run. `install.sh`
+  refuses while a phase file, a running or approved release, or a held target lock exists.
 - The log collector writes the lines, then its cursor (atomic rename): a crash between the two
   stores at most one run's lines twice; it never loses or exposes any.
 

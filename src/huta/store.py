@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS live (
 );
 """
 
+# The database's own version (PRAGMA user_version). Migrations run forward only, each in one
+# transaction; a database newer than this code is refused, never misread (DESIGN-v2 §0).
+# 0 = a database from before versioning, which is version 1's tables.
+SCHEMA_VERSION = 1
+MIGRATIONS: dict[int, str] = {1: SCHEMA}
+
+
+class StoreError(Exception):
+    pass
+
+
 # Release states. Terminal outcomes are the three of DESIGN.md §3 plus rejected/superseded.
 PLANNED, APPROVED, RUNNING, LIVE = "planned", "approved", "running", "live"
 NOTHING_ACTIVATED, ROLLED_BACK, NEEDS_HUMAN = "nothing-activated", "rolled-back", "needs-human"
@@ -61,13 +72,37 @@ class Store:
             self.db = sqlite3.connect(self.dir / "huta.db", isolation_level=None)
             self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.executescript(SCHEMA)
+            self._migrate()
         finally:
             os.umask(old_umask)
         for suffix in ("", "-wal", "-shm"):
             p = self.dir / f"huta.db{suffix}"
             if p.exists():
                 os.chmod(p, 0o600)
+
+    def version(self) -> int:
+        return self.db.execute("PRAGMA user_version").fetchone()[0]
+
+    def _migrate(self) -> None:
+        seen = self.version()
+        if seen > SCHEMA_VERSION:
+            self.db.close()
+            raise StoreError(
+                f"huta.db is version {seen}, and this huta knows up to "
+                f"{SCHEMA_VERSION}: it was written by a newer huta. Install that huta again, or "
+                "restore the database copy taken before the upgrade.")
+        for n in range(seen + 1, SCHEMA_VERSION + 1):
+            # One writer at a time; another huta may have migrated while this one waited.
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if self.version() < n:
+                    for stmt in _statements(MIGRATIONS[n]):
+                        self.db.execute(stmt)
+                    self.db.execute(f"PRAGMA user_version = {n}")
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
 
     def event(self, kind: str, msg: str, release_id=None, project=None, target=None):
         self.db.execute(
@@ -224,3 +259,40 @@ class Store:
             yield
         finally:
             os.close(fd)
+
+
+def _statements(script: str) -> list[str]:
+    """A migration's statements, run one by one inside the caller's transaction
+    (executescript would commit it)."""
+    return [s.strip() for s in script.split(";") if s.strip()]
+
+
+def busy(state_dir) -> list[str]:
+    """What an install must not interrupt: a release or recovery in progress. Used by
+    install.sh before it replaces the code (DESIGN-v2 §0). Reads only."""
+    d = Path(state_dir)
+    out = []
+    phases = d / "phases"
+    if phases.is_dir():
+        out += [f"phase file {p.name}: a release or recovery was interrupted (run huta reconcile)"
+                for p in sorted(phases.glob("*.json"))]
+    db = d / "huta.db"
+    if db.exists():
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            for r in con.execute("SELECT id, project, target, state FROM releases"
+                                 " WHERE state IN (?, ?)", (APPROVED, RUNNING)):
+                out.append(f"release {r[0]} of {r[1]}/{r[2]} is {r[3]}")
+        finally:
+            con.close()
+    locks = d / "locks"
+    if locks.is_dir():
+        for p in sorted(locks.glob("*.lock")):
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                out.append(f"{p.stem.replace('--', '/')} is locked: an action is running")
+            finally:
+                os.close(fd)
+    return out

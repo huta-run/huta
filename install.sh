@@ -6,6 +6,17 @@ cd "$(dirname "$0")"
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
 DEST=/opt/huta
+
+# Never replace the code under a release or recovery in progress: the new code would inherit a
+# half-done phase it may read differently (DESIGN-v2 §0). HUTA_INSTALL_BUSY_OK=1 overrides.
+if [[ -d /var/lib/huta && "${HUTA_INSTALL_BUSY_OK:-}" != 1 ]]; then
+  busy=$(python3 -I -B -c 'import sys; sys.path.insert(0, "src"); from huta.store import busy
+print("\n".join(busy("/var/lib/huta")))') || { echo "could not check whether huta is busy" >&2; exit 1; }
+  if [[ -n "$busy" ]]; then
+    printf 'huta is busy, not installing:\n%s\n' "$busy" >&2
+    exit 1
+  fi
+fi
 rev=$(git rev-parse HEAD)
 dirty=$(git status --porcelain -- src/huta | wc -l)
 

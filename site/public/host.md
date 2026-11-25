@@ -416,8 +416,10 @@ Say what is installed and running, the huta revision, the zones, and what's left
 - **Each project:** an entry in `projects.d` naming its boxes, then `huta edge`; the project's
   agent follows [start.md](https://huta.run/docs/start.md).
 - **Approving:** `sudo huta approve <release>` on this server (or Telegram buttons, later).
-- **Updating huta:** `git pull` in the checkout, review the diff, `sudo bash install.sh`. Boxes'
-  clients follow by themselves.
+- **Updating huta:** `git pull` in the checkout, review the diff, `sudo bash install.sh`. It
+  refuses while a release or recovery is in progress (finish or `huta reconcile` first). Boxes'
+  clients follow by themselves. A huta older than the one that last wrote `huta.db` refuses to
+  start; to go back, restore the database copy from before the upgrade.
 - Anything from step 1 they should fix (password ssh login, low memory, no loop devices).
 
 ## Troubleshooting

@@ -22,7 +22,7 @@ Rules for every milestone:
 |---|---|---|
 | T | Test harness: v1 snapshots, fake host, crash tests | built |
 | T+ | Recovery fixes the crash tests found (phase left, retire race, revert needs cert) | built |
-| 0a | Database version, refuse a newer one; install guard | planned |
+| 0a | Database version, refuse a newer one; install guard | built |
 | 0b | One release description for every manifest; `order[0]` sites read it | planned |
 | 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | planned |
 | 1 | Gateways, `edge` knobs on every vhost | planned |
@@ -41,7 +41,7 @@ Rules for every milestone:
   every step (and recovery killed after each of its own); invariants after recovery, after a
   second recovery and after a reboot.
 
-## 0a: database version and install guard
+## 0a: database version and install guard (built)
 
 - `store.py`: `PRAGMA user_version`; migration 1 is today's schema. A newer version: refuse.
 - `install.sh`: refuse while a phase file, a running/approved release or a held lock exists.
