@@ -8,3 +8,9 @@ uid = 29001
 [targets.prod]
 hosts = ["hello.example.org"]
 slots = [19100, 19101]
+
+# A target whose first release replaces a hand-written vhost (adopt).
+[targets.legacy]
+hosts = ["legacy.example.org"]
+slots = [19102, 19103]
+adopt = "legacy-site.caddy"

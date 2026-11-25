@@ -42,4 +42,7 @@ It lives at https://github.com/huta-run/huta, and every commit and commit messag
   contract: a target that uses no new feature must run exactly as before. Rewrite them
   (`HUTA_UPDATE_GOLDEN=1`) only for an intended change, and say why in the commit. Test
   fixtures use made-up values only, like everything else here.
+- `tests/test_crash.py` kills a release after every step (a forked child, `os._exit`) on the
+  fake host in `tests/fakehost.py`, runs `reconcile` and checks the invariants. A new durable
+  step in a release gets recorded there as a step, so it is crashed after too.
 - Commits: small, present-tense subject, why in the body.
