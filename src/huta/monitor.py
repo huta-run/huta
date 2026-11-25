@@ -717,9 +717,15 @@ def probe_host(host: str, path: str, sha: str, timeout: float = PROBE_TIMEOUT) -
     return None
 
 
-def probe_target(platform: Platform, st, project: Project, t: Target, log=lambda _m: None):
-    """Probe every host of the target once. Returns the sample, or None when it was skipped
-    (nothing live, a release at work, stopped, or any of that changed during the probe)."""
+_NO_TIME = "\0no time"
+
+
+def probe_target(platform: Platform, st, project: Project, t: Target, log=lambda _m: None,
+                 end: float | None = None):
+    """Probe every host of the target once, within `end` (monotonic). Returns the sample, or
+    None when it was skipped (nothing live, a release at work, stopped, any of that changed
+    during the probe, or not every host could be asked in time)."""
+    end = time.monotonic() + TICK_BUDGET if end is None else end
     from . import spec as SP
     before = _snapshot(platform, st, t)
     if before is None:
@@ -730,8 +736,13 @@ def probe_target(platform: Platform, st, project: Project, t: Target, log=lambda
     # Every host at once: a target's probe takes one PROBE_TIMEOUT whatever its number of
     # hosts, so no target can outgrow the tick (codex review of milestone 4, #1).
     from concurrent.futures import ThreadPoolExecutor
+    def one(h):
+        left = min(PROBE_TIMEOUT, end - time.monotonic())    # a queued host gets what's left
+        return _NO_TIME if left < 1 else probe_host(h, path, rel["sha"], left)
     with ThreadPoolExecutor(max_workers=min(8, len(t.hosts))) as pool:
-        got = list(pool.map(lambda h: probe_host(h, path, rel["sha"]), t.hosts))
+        got = list(pool.map(one, t.hosts))
+    if _NO_TIME in got:
+        return None                              # incomplete: not a sample
     whys = [f"{h}: {w}" for h, w in zip(t.hosts, got) if w]
     if _snapshot(platform, st, t) != before:
         return None                              # a release started or ended meanwhile
@@ -808,7 +819,7 @@ def tick(platform: Platform, registry: dict, st, log=lambda _m: None) -> dict:
                 state["cursor"] = int(state.get("cursor", 0)) + max(i, 1)
                 break
             try:
-                s = probe_target(platform, st, project, t, log)
+                s = probe_target(platform, st, project, t, log, end)
                 out["probed" if s else "skipped"] += 1
                 if s and hc:
                     row = st.monitor(project.name, t.name, "uptime", name(platform, t))

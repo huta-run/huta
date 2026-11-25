@@ -1271,7 +1271,7 @@ class TickLimits(Tick):
     """(Tick's tests run here too.) Codex's review of milestone 4."""
 
     def test_many_hosts_dont_starve_others(self):
-        big = dataclasses.replace(self.t, name="a-big", hosts=[f"h{i}.example.org" for i in range(9)])
+        big = dataclasses.replace(self.t, name="a-big", hosts=[f"h{i}.example.org" for i in range(73)])
         small = dataclasses.replace(self.t, name="b-small", hosts=["small.example.org"])
         for t in (big, small):
             self.st.set_live("hello", t.name, self.rid, "a")
@@ -1280,15 +1280,18 @@ class TickLimits(Tick):
         import threading
         lock = threading.Lock()
 
-        def slow(*a, **k):
-            with lock:
-                clock[0] += 0.5            # requests overlap; each adds a little
-            return self.transport(*a, **k)
-        with mock.patch.object(self.M, "transport", slow), \
+        def hang(method, url, headers, body, timeout=10):
+            with lock:                     # worst case: the requests' timeouts add up
+                clock[0] += timeout
+            raise TimeoutError("no answer")
+        with mock.patch.object(self.M, "transport", hang), \
                 mock.patch.object(self.M.time, "monotonic", lambda: clock[0]):
-            res = self.M.tick(self.platform, reg, self.st)
-        self.assertEqual((res["probed"], res["left"]), (2, 0))
-        self.assertTrue(self.M.samples(self.platform, small))
+            for n in range(3):
+                start = clock[0]
+                self.M.tick(self.platform, reg, self.st)
+                self.assertLessEqual(clock[0] - start, self.M.TICK_BUDGET, f"tick {n}")
+                clock[0] += 60
+        self.assertTrue(self.M.samples(self.platform, small))     # served within a few ticks
 
     def test_oversized_health_fails(self):
         self.health = None
