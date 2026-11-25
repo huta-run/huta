@@ -316,6 +316,11 @@ host and repo both allowing concurrency) stop the old slot, copy the data, start
 (failure before the switch: restore the copy, start the old slot, `nothing-activated`; after:
 `needs-human`). `reconcile` additionally thaws a frozen volume, starts the routed slot of the
 live release if a crash left it stopped, and finishes an interrupted revert as `rolled-back`.
+A switch back replays the vhost files Caddy served before the switch (kept in the phase record
+when the switch starts), so it needs no certificate check and no call to Cloudflare; if it
+can't be done, the release ends `needs-human` with the reason. `tests/test_crash.py` kills a
+release after every step, and `reconcile` after each of its own, on a fake host
+(`tests/fakehost.py`) and checks these rules.
 
 ## Transports: how dev asks
 

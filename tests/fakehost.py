@@ -91,6 +91,7 @@ class FakeHost:
         caddy_invalid=<port> validation refuses any config that routes to that port
         no_cert=True         the certificate check finds no usable pair (edge.cert_ok)
         no_cf=True           Cloudflare's IP-range list can't be fetched
+        old_phase=True       phase files lack the previous vhost (as an older huta wrote them)
         """
         f = self._load("faults")
         f.update(kw)
@@ -367,6 +368,8 @@ class FakeHost:
         real_atomic, real_transact = edge._atomic_write, edge.transact
 
         def phase_set(platform, t, **rec):
+            if self._faults().get("old_phase") and not rec.get("adopting"):
+                rec = {**rec, "undo": []}    # as written by huta before it kept the old vhost
             real_phase_set(platform, t, **rec)
             self._op(f"phase {rec.get('stage', 'one-writer')} copied={rec.get('copied')}")
 

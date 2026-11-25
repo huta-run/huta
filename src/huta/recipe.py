@@ -467,8 +467,6 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     elif phase and phase.get("stage") in ("switching", "checks") and phase.get("idle") == routed:
         # Died during the public checks: run them now, and revert or hand over as run() would.
         # The other slot is not touched before that (it may be what we go back to).
-        from .ext import Cloudflare
-        cert = edge.cert_ok(platform, t)
         log("reconcile: finishing the public checks of an interrupted release")
         if phase.get("stage") == "switching":
             # The switch went through but wasn't recorded: record it, then check.
@@ -476,11 +474,14 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             if not prev_live or prev_live["release_id"] != phase["rid"]:
                 st.make_live(phase["rid"], routed, phase.get("prev"),
                              f"live on slot {routed} (switch finished by reconcile)")
+            stopped_marker(platform, t).unlink(missing_ok=True)   # as run(): a release starts it
             _phase_set(platform, t, **{**phase, "stage": "checks", "copied": False})
-        out = after_switch(platform, st, project, t, cert, Cloudflare.ip_ranges(), log)
+        out = after_switch(platform, st, project, t, log)
         if out is not None:
             log(f"reconcile: {phase['rid']} ended {out}")
-            return
+            # The phase is gone: one more pass puts slots, policies and timers in line with
+            # whatever now serves (a revert moved the route; needs-human keeps it).
+            return reconcile(platform, st, project, t, log)
         cons = slot_containers(t)
         c = cons.get(routed)
     elif phase:
@@ -653,10 +654,14 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
                                     f"new slot failed before any traffic: {e}", log, copied)
 
     # 2. Switch traffic: one validated, graceful caddy reload (an adopted site's old file goes
-    #    in the same transaction). The intent is recorded first, with what puts an adopted
-    #    site back, so a crash at any point after this is finished by reconcile: by the route
-    #    actually installed (final reviews: codex #3, grok #2).
+    #    in the same transaction). The intent is recorded first, with what puts the previous
+    #    config back (the exact files Caddy served), so a crash at any point after this is
+    #    finished by reconcile: by the route actually installed (final reviews: codex #3,
+    #    grok #2). A revert replays those files: it needs no certificate check and no call to
+    #    Cloudflare (crash-harness reviews).
     undo_pre = []
+    if live and not adopting:
+        undo_pre = [[str(edge.vhost_path(platform, t)), edge.installed(platform, t)]]
     if adopting:
         vp, fp = edge.vhost_path(platform, t), edge.adopt_pending(platform, t)
         undo_pre = [[str(fp), fp.read_text()]]
@@ -691,7 +696,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
                 log(f"WARNING {h}: SSL strict rule not set: {e}")
 
     # 3. Public checks while the old slot can still take the traffic back.
-    outcome = after_switch(platform, st, project, t, cert, cf_ranges, log)
+    outcome = after_switch(platform, st, project, t, log)
     if outcome is not None:
         return outcome
 
@@ -716,7 +721,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     return S.LIVE
 
 
-def after_switch(platform, st, project, t, cert, cf_ranges, log) -> str | None:
+def after_switch(platform, st, project, t, log) -> str | None:
     """Public checks for the release recorded in the phase file (stage "checks"), and what a
     failure means. None: passed (the phase file is cleared). Otherwise the outcome. Used by
     run() and by reconcile after a crash in this step."""
@@ -751,7 +756,7 @@ def after_switch(platform, st, project, t, cert, cf_ranges, log) -> str | None:
         cur = st.release(prev) if prev else None
         undo = [(Path(p), txt) for p, txt in ph.get("undo", [])]
         out = _revert(platform, st, project, t, rid, live, cur, ph["idle"], ph.get("old"),
-                      ph.get("stopped_old"), undo, bool(ph.get("adopting")), cert, cf_ranges,
+                      ph.get("stopped_old"), undo, bool(ph.get("adopting")),
                       port_of, health, why, log)
         _phase_clear(platform, t)
         return out
@@ -810,8 +815,17 @@ def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_
     return S.NOTHING_ACTIVATED
 
 
+def _previous_vhost(platform, t, port: int) -> str:
+    """For a phase written before huta kept the previous vhost: the installed one, pointed back
+    at the old slot. Only that one line changes; anything unexpected is refused."""
+    cur = edge.installed(platform, t)
+    if not cur or len(edge.UPSTREAM_RE.findall(cur)) != 1:
+        raise RecipeError("can't tell what the previous vhost was")
+    return edge.UPSTREAM_RE.sub(f"reverse_proxy 127.0.0.1:{port}", cur)
+
+
 def _revert(platform, st, project, t, rid, live, cur, idle, live_slot, stopped_old, undo, adopting,
-            cert, cf_ranges, port_of, health, why, log) -> str:
+            port_of, health, why, log) -> str:
     """Post-switch checks failed: put the previous config back, stop the new slot."""
     log(f"public checks failed ({why}); reverting")
     try:
@@ -822,8 +836,12 @@ def _revert(platform, st, project, t, rid, live, cur, idle, live_slot, stopped_o
                 _stop_strict(platform, t, idle)
                 _bring_back(platform, t, live_slot, port_of[live_slot], health, cur["sha"], log)
             with edge.edge_lock(platform):
-                log(edge.change_vhost(platform, t, edge.render_vhost(
-                    platform, t, cf_ranges, cert, port_of[live_slot]))[0])
+                if undo:
+                    edge.transact(platform, undo)   # the files Caddy served before the switch
+                    log(f"vhost back on slot {live_slot}, caddy reloaded")
+                else:
+                    log(edge.change_vhost(platform, t,
+                                          _previous_vhost(platform, t, port_of[live_slot]))[0])
             st.revert_live(rid, live["release_id"], live_slot,
                            f"reverted to {live['release_id']} on slot {live_slot}: {why}")
         else:
@@ -831,8 +849,9 @@ def _revert(platform, st, project, t, rid, live, cur, idle, live_slot, stopped_o
                 edge.transact(platform, undo)
             log("adopted site's old config restored")
             st.revert_live(rid, None, None, f"reverted to the site's old config: {why}")
-    except (RecipeError, edge.EdgeError) as e:
-        st.set_state(rid, S.NEEDS_HUMAN, msg=f"checks failed ({why}) and the revert failed: {e}")
+    except Exception as e:  # noqa: BLE001 — whatever it was, the outcome is recorded
+        st.set_state(rid, S.NEEDS_HUMAN, msg=f"checks failed ({why}) and the revert failed: "
+                                              f"{type(e).__name__}: {e}")
         return S.NEEDS_HUMAN
     _stop_quietly(platform, t, idle)
     return S.ROLLED_BACK

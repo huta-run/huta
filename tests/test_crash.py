@@ -187,9 +187,6 @@ class Scenario:
 
 
 # ------------------------------------------------------------ scenarios
-# Known bugs found by these tests, each skipped until the commit that fixes it removes the mark.
-BUG_REVERT_NEEDS_CERT = ("known bug: reconcile's revert needs a usable newest certificate and "
-                         "Cloudflare's IP list; without them it raises and records nothing")
 
 
 class StatelessRelease(Scenario, unittest.TestCase):
@@ -209,7 +206,6 @@ class StatelessPublicFail(Scenario, unittest.TestCase):
     clean, allowed = RB, {NA, RB}
 
 
-@unittest.skip(BUG_REVERT_NEEDS_CERT)
 class PublicFailNoCert(Scenario, unittest.TestCase):
     """As StatelessPublicFail, but when reconcile finishes the checks the newest certificate
     pair is unusable (the vhost still names a working one). The revert must not depend on it."""
@@ -218,11 +214,18 @@ class PublicFailNoCert(Scenario, unittest.TestCase):
     clean, allowed = RB, {NA, RB, NH}
 
 
-@unittest.skip(BUG_REVERT_NEEDS_CERT)
 class PublicFailNoCloudflare(Scenario, unittest.TestCase):
     """As StatelessPublicFail, but Cloudflare can't be reached while reconcile recovers."""
     project_name, target_name = "hello", "prod"
     faults = {"public_fail": True, "no_cf": True}
+    clean, allowed = RB, {NA, RB, NH}
+
+
+class PublicFailOldPhase(Scenario, unittest.TestCase):
+    """A phase file from an older huta (no saved vhost) when reconcile must revert: it points
+    the installed vhost back at the old slot, still without a certificate check or Cloudflare."""
+    project_name, target_name = "hello", "prod"
+    faults = {"public_fail": True, "old_phase": True, "no_cert": True, "no_cf": True}
     clean, allowed = RB, {NA, RB, NH}
 
 
