@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .cfg import Platform, Project, Target
+from . import spec as SP
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
@@ -169,7 +170,7 @@ def runtime_text(platform: Platform, st, project: Project, t: Target) -> str:
         if role == "live" and s.get("Running"):
             rel = st.release(live["release_id"])
             app = json.loads(rel["app_toml"])
-            health = app["components"][app["order"][0]].get("health", "/healthz")
+            health = SP.health(app)
             port = t.slots[recipe.SLOTS.index(slot)]
             t0 = time.monotonic()
             try:

@@ -23,7 +23,7 @@ Rules for every milestone:
 | T | Test harness: v1 snapshots, fake host, crash tests | built |
 | T+ | Recovery fixes the crash tests found (phase left, retire race, revert needs cert) | built |
 | 0a | Database version, refuse a newer one; install guard | built |
-| 0b | One release description for every manifest; `order[0]` sites read it | planned |
+| 0b | One release description for every manifest; `order[0]` sites read it | built |
 | 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | planned |
 | 1 | Gateways, `edge` knobs on every vhost | planned |
 | 2 | Migrations, exclusive mode; `health_timeout`; restore plans | planned |
@@ -47,12 +47,14 @@ Rules for every milestone:
 - `install.sh`: refuse while a phase file, a running/approved release or a held lock exists.
 - Gate: v1 snapshots unchanged; one normal release and one rollback on a test target.
 
-## 0b: one release description
+## 0b: one release description (built)
 
-- `spec.py`: `normalize(app)` → components, images, public component, state, migrate.
-- Every `app["components"][app["order"][0]]` reads the spec's public component.
-- `slot_containers` returns members per slot; a container without a component label is the
-  public one.
+- `spec.py`: the public component of any manifest (marked `public`, else the only HTTP one,
+  else the first in `order`), its health path and port. Every place that read
+  `app["components"][app["order"][0]]` asks it. `concurrent_safe` checks every component that
+  mounts data.
+- Per-slot container sets (`slot_containers` by component) come with milestone 3, which is
+  the first to have more than one container per slot.
 - Gate: every golden file byte-identical.
 
 ## 0c: records, plans, phase v2

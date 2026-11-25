@@ -24,6 +24,7 @@ from . import runtime as R
 from . import store as S
 from .cfg import Platform, Project, Target
 from .ext import UA
+from . import spec as SP
 
 TAG_RE = re.compile(r"^huta/[a-z][a-z0-9-]*:[0-9a-f]{12}-[0-9a-f]{12}$")
 ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -108,7 +109,7 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
     """Everything the host config and manifest decide about how a release runs. Stored in the
     plan and recomputed at approval: if it differs, the plan is stale (codex #6). Secret
     values are never in it, only names."""
-    comp = app["components"][app["order"][0]]
+    comp = SP.public(app)
     return {"uid": project.uid, "slots": list(t.slots), "hosts": t.hosts, "egress": t.egress,
             "limits": t.limits, "cloudflare": t.cloudflare,
             "container_port": int(comp.get("port", 8080)),
@@ -129,7 +130,7 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
 def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
                 images: dict[str, tuple[str, str]], with_secrets: bool = True) -> dict:
     """images: slot -> (image id, sha). Generated from the schema; repo compose is never used."""
-    comp = app["components"][app["order"][0]]
+    comp = SP.public(app)
     mount = R.data_mount(app)
     services = {}
     for slot, port in zip(SLOTS, t.slots):
@@ -585,8 +586,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     from . import jobs as J
     rel = st.release(rid)
     app = json.loads(rel["app_toml"])
-    comp = app["components"][app["order"][0]]
-    health = comp.get("health", "/healthz")
+    health = SP.health(app)
     checks = app.get("smoke", [])
     check_image(rel["image_id"], rel["sha"], project.name)
     has_data = bool(R.data_mount(app))
@@ -729,7 +729,7 @@ def after_switch(platform, st, project, t, log) -> str | None:
     rid = ph["rid"]
     rel = st.release(rid)
     app = json.loads(rel["app_toml"])
-    health = app["components"][app["order"][0]].get("health", "/healthz")
+    health = SP.health(app)
     checks = app.get("smoke", [])
     problems = []
     for host in t.hosts:
@@ -794,7 +794,7 @@ def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_
         # The old slot runs with its own manifest (port, mount, health), not the failed one's
         # (codex code review #2).
         old_app = json.loads(cur["app_toml"])
-        health = old_app["components"][old_app["order"][0]].get("health", "/healthz")
+        health = SP.health(old_app)
         write_compose(platform, t, compose_doc(platform, project, t, old_app,
                                                {s: images[live_slot] for s in SLOTS}))
     if stopped_old:

@@ -11,6 +11,7 @@ import stat
 from pathlib import Path
 
 from .cfg import ENV_NAME_RE, ConfigError, Platform, Project, Target, read_secret, size_bytes
+from . import spec as SP
 
 EGRESS_HOST = "huta-egress"     # /etc/hosts name of the egress daemon inside containers
 # Docker's embedded resolver forwards external names from the host's namespace, a side channel
@@ -363,17 +364,18 @@ def data_paths(platform: Platform, t: Target) -> tuple[Path, Path]:
 
 
 def data_mount(app: dict) -> str | None:
-    comp = app["components"][app["order"][0]]
-    return comp.get("data")
+    """Where the public component mounts the data volume (v1: the only component)."""
+    return SP.public(app).get("data")
 
 
 def concurrent_safe(app: dict, t: Target | None = None) -> bool:
     """Two releases may run at once: no data, or both the repo (concurrent_safe) and the host
     (data.concurrent) say so."""
-    comp = app["components"][app["order"][0]]
-    if not comp.get("data"):
+    writers = [c for c in app["components"].values() if c.get("data")]
+    if not writers:
         return True
-    return bool(comp.get("concurrent_safe", False)) and bool(t and t.data and t.data.get("concurrent"))
+    return all(bool(c.get("concurrent_safe", False)) for c in writers) \
+        and bool(t and t.data and t.data.get("concurrent"))
 
 
 # ------------------------------------------------------------------ hardening (shared)

@@ -43,6 +43,7 @@ from .cfg import (ConfigError, load_platform, load_registry, parse_app_toml, rea
                   redact_obj,
                   zone_for)
 from .ext import Cloudflare, ExtError, GitHub
+from . import spec as SP
 
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # Errors huta raises on purpose to turn something down: "refused", not "huta broke".
@@ -1263,8 +1264,7 @@ def cmd_start(a):
         if a.cmd == "restart":
             args.append("--force-recreate")
         recipe.compose(platform, t, *args, recipe.service(live["slot"]))
-        comp = app["components"][app["order"][0]]
-        recipe.wait_health(t.slots[recipe.SLOTS.index(live["slot"])], comp.get("health", "/healthz"),
+        recipe.wait_health(t.slots[recipe.SLOTS.index(live["slot"])], SP.health(app),
                            rel["sha"], timeout=60)
         st.event("started", f"slot {live['slot']} {a.cmd}ed by the operator", live["release_id"],
                  project.name, t.name)
