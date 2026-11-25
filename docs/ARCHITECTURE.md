@@ -350,8 +350,10 @@ window, the ↩️ button) is *planned*.
 - **Probe** (`huta monitor tick`, `huta-monitor.timer` every minute; nothing without
   `[monitoring]`): one tick at a time (`<state_dir>/monitor.lock`), no target lock, 45 s for all
   of it, targets in turn so a slow one can't starve the rest. For each target with
-  `monitor.uptime` and a live release: one GET of `https://<host><health>` per host, 5 s,
-  passing only with `ok: true` and the live sha. Skipped while a phase file or the stop marker
+  `monitor.uptime` and a live release: one GET of `https://<host><health>` per host, all hosts
+  at once, 5 s, at most 64 KiB, passing only with `ok: true` and the live sha. Every call
+  (probe, ping, making a check) gets only the time left in the tick, with 2 s kept for writing
+  its state; the self check is made under ensure's lock, as every capability is. Skipped while a phase file or the stop marker
   exists, and dropped if the live release, its episode or those changed during the request (a
   held target lock alone isn't a reason: a backup holds it for hours while the site serves).
   The last 60 samples go to `<state_dir>/monitor/<p>--<t>.probe.json`; a change between ok and

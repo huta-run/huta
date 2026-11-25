@@ -651,6 +651,9 @@ def status_lines(platform: Platform, st, project: Project, t: Target) -> list[st
 
 TICK_BUDGET = 45
 PROBE_TIMEOUT = 5
+PING_TIMEOUT = 5
+RESERVE = 2                # seconds kept for writing the tick's state at the end
+HEALTH_MAX = 64 << 10      # bytes of a health answer (recipe.MAX_BODY)
 RING = 60
 ENSURE_RETRY = 3600        # seconds between tick attempts to make a missing check
 
@@ -701,6 +704,8 @@ def probe_host(host: str, path: str, sha: str, timeout: float = PROBE_TIMEOUT) -
         return f"no answer ({type(e).__name__})"
     if status != 200:
         return f"status {status}"
+    if len(raw) > HEALTH_MAX:
+        return "answer too large"
     try:
         body = json.loads(raw)
     except ValueError:
@@ -722,7 +727,12 @@ def probe_target(platform: Platform, st, project: Project, t: Target, log=lambda
     rel = st.release(before[0])
     app = json.loads(rel["app_toml"])
     path = SP.public(app).get("health", "/healthz")
-    whys = [f"{h}: {w}" for h in t.hosts if (w := probe_host(h, path, rel["sha"]))]
+    # Every host at once: a target's probe takes one PROBE_TIMEOUT whatever its number of
+    # hosts, so no target can outgrow the tick (codex review of milestone 4, #1).
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(t.hosts))) as pool:
+        got = list(pool.map(lambda h: probe_host(h, path, rel["sha"]), t.hosts))
+    whys = [f"{h}: {w}" for h, w in zip(t.hosts, got) if w]
     if _snapshot(platform, st, t) != before:
         return None                              # a release started or ended meanwhile
     sample = {"ts": time.time(), "release": before[0], "since": before[1], "ok": not whys,
@@ -738,9 +748,13 @@ def probe_target(platform: Platform, st, project: Project, t: Target, log=lambda
     return sample
 
 
-def _ping(platform: Platform, uuid: str, suffix: str) -> bool:
+def _ping(platform: Platform, uuid: str, suffix: str, end: float) -> bool:
+    """A ping, only if the tick has time for it."""
+    left = min(PING_TIMEOUT, end - time.monotonic())
+    if left < 1:
+        return False
     try:
-        status, _h, _b = transport("GET", ping_url(platform, uuid, suffix), {}, None, 5)
+        status, _h, _b = transport("GET", ping_url(platform, uuid, suffix), {}, None, left)
         return status == 200
     except Exception:  # noqa: BLE001
         return False
@@ -772,7 +786,7 @@ def tick(platform: Platform, registry: dict, st, log=lambda _m: None) -> dict:
         if not mine:
             out["busy"] = 1
             return out
-        end = time.monotonic() + TICK_BUDGET
+        end = time.monotonic() + TICK_BUDGET - RESERVE
         state_path = platform.state_dir / "monitor" / "tick.json"
         try:
             state = json.loads(state_path.read_text())
@@ -788,9 +802,10 @@ def tick(platform: Platform, registry: dict, st, log=lambda _m: None) -> dict:
             todo = todo[k:] + todo[:k]
         hc = platform.monitoring.get("healthchecks")
         for i, (project, t) in enumerate(todo):
-            if end - time.monotonic() < PROBE_TIMEOUT * len(t.hosts) + 1:
+            if end - time.monotonic() < PROBE_TIMEOUT + 1:
                 out["left"] = len(todo) - i
-                state["cursor"] = int(state.get("cursor", 0)) + i   # the rest go first next time
+                # The rest go first next time (at least one step, so nothing sticks).
+                state["cursor"] = int(state.get("cursor", 0)) + max(i, 1)
                 break
             try:
                 s = probe_target(platform, st, project, t, log)
@@ -800,12 +815,12 @@ def tick(platform: Platform, registry: dict, st, log=lambda _m: None) -> dict:
                     if row is None:
                         key = f"ensure:{project.name}/{t.name}"
                         if time.time() - float(state.get(key, 0)) > ENSURE_RETRY \
-                                and end - time.monotonic() > ENSURE_BUDGET:
+                                and end - time.monotonic() > ENSURE_BUDGET + PROBE_TIMEOUT:
                             state[key] = time.time()
                             ensure(platform, st, project, t, kinds=("uptime",), log=log)
                             row = st.monitor(project.name, t.name, "uptime", name(platform, t))
                     if row is not None:
-                        _ping(platform, row["remote_id"], "" if s["ok"] else "fail")
+                        _ping(platform, row["remote_id"], "" if s["ok"] else "fail", end)
             except Exception as e:  # noqa: BLE001 — one target never stops the others
                 log(f"{project.name}/{t.name}: probe failed: {type(e).__name__}")
         else:
@@ -831,13 +846,18 @@ def _self_ping(platform: Platform, st, state: dict, end: float, log) -> None:
                 or end - time.monotonic() < 15:
             return
         state["ensure:self"] = time.time()
-        deadline = time.monotonic() + min(15, end - time.monotonic())
+        budget = min(15, end - time.monotonic() - PING_TIMEOUT)
+        deadline = time.monotonic() + budget
         spec = {"name": n, "timeout": 300, "grace": 600, "tags": platform.monitoring["prefix"],
                 "desc": f"huta's monitor tick on {platform.host}"}
-        exists = hc_find(platform, n, deadline)
-        first = {} if exists else {"channels": platform.monitoring["healthchecks"]["channels"]}
-        c = hc_upsert(platform, {**spec, **first}, deadline)
-        remember_capability(platform, c["uuid"])
-        st.set_monitor(SELF_PROJECT, SELF_TARGET, "self", n, c["uuid"], spec)
-        row = st.monitor(SELF_PROJECT, SELF_TARGET, "self", n)
-    _ping(platform, row["remote_id"], "")
+        # Under ensure's lock, as every capability write is (codex review of milestone 4, #2).
+        with _ensure_lock(platform, wait=max(0.5, budget / 2)):
+            row = st.monitor(SELF_PROJECT, SELF_TARGET, "self", n)
+            if row is None:
+                exists = hc_find(platform, n, deadline)
+                first = {} if exists else {"channels": platform.monitoring["healthchecks"]["channels"]}
+                c = hc_upsert(platform, {**spec, **first}, deadline)
+                remember_capability(platform, c["uuid"])
+                st.set_monitor(SELF_PROJECT, SELF_TARGET, "self", n, c["uuid"], spec)
+                row = st.monitor(SELF_PROJECT, SELF_TARGET, "self", n)
+    _ping(platform, row["remote_id"], "", end)

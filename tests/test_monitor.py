@@ -1192,9 +1192,13 @@ class Tick(unittest.TestCase):
         real = self.transport
 
         def switch(*a, **k):
-            from huta import store as S
+            import sqlite3
             out = real(*a, **k)
-            self.st.set_live("hello", "prod", self.rid, "b")     # a new episode
+            # A release switches meanwhile (another process: its own connection).
+            con = sqlite3.connect(self.platform.state_dir / "huta.db")
+            con.execute("UPDATE live SET slot='b', since=since+1 WHERE project='hello'")
+            con.commit()
+            con.close()
             return out
         with mock.patch.object(self.M, "transport", switch):
             res = self.M.tick(self.platform, self.registry, self.st)
@@ -1230,7 +1234,7 @@ class Tick(unittest.TestCase):
             return self.transport(*a, **k)
         with mock.patch.object(self.M, "transport", slow), \
                 mock.patch.object(self.M.time, "monotonic", lambda: clock[0]), \
-                mock.patch.object(self.M, "TICK_BUDGET", 7):
+                mock.patch.object(self.M, "TICK_BUDGET", 15):
             first = self.M.tick(self.platform, reg, self.st)
             self.assertGreater(first["left"], 0)
             seen = [c.split("/")[2] for c in self.calls]
@@ -1261,3 +1265,92 @@ class Tick(unittest.TestCase):
         self.tick()
         self.assertIn("fail", [p["action"] for p in self.fm.state()["hc"]["pings"]])
         self.assertEqual(self.fm.creates("hc"), 2)
+
+
+class TickLimits(Tick):
+    """(Tick's tests run here too.) Codex's review of milestone 4."""
+
+    def test_many_hosts_dont_starve_others(self):
+        big = dataclasses.replace(self.t, name="a-big", hosts=[f"h{i}.example.org" for i in range(9)])
+        small = dataclasses.replace(self.t, name="b-small", hosts=["small.example.org"])
+        for t in (big, small):
+            self.st.set_live("hello", t.name, self.rid, "a")
+        reg = {"hello": dataclasses.replace(self.project, targets={big.name: big, small.name: small})}
+        clock = [0.0]
+        import threading
+        lock = threading.Lock()
+
+        def slow(*a, **k):
+            with lock:
+                clock[0] += 0.5            # requests overlap; each adds a little
+            return self.transport(*a, **k)
+        with mock.patch.object(self.M, "transport", slow), \
+                mock.patch.object(self.M.time, "monotonic", lambda: clock[0]):
+            res = self.M.tick(self.platform, reg, self.st)
+        self.assertEqual((res["probed"], res["left"]), (2, 0))
+        self.assertTrue(self.M.samples(self.platform, small))
+
+    def test_oversized_health_fails(self):
+        self.health = None
+        real = self.transport
+
+        def big(*a, **k):
+            if "/healthz" in a[1]:
+                return 200, {}, json.dumps({"ok": True, "sha": "a" * 40}).encode() + b" " * (70 << 10)
+            return real(*a, **k)
+        with mock.patch.object(self.M, "transport", big):
+            self.M.tick(self.platform, self.registry, self.st)
+        self.assertIn("too large", self.M.samples(self.platform, self.t)[-1]["why"])
+
+    def test_slow_healthchecks_stays_in_budget(self):
+        pdir = self.etc / "secrets" / "_platform"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "HEALTHCHECKS_API_KEY").write_text(FM.HC_KEY)
+        self.platform.monitoring["healthchecks"] = {
+            "url": "http://127.0.0.1:8000", "ping": "https://hc.example.org/ping", "host": "",
+            "channels": "*", "self": True}
+        clock = [0.0]
+        timeouts = []
+
+        def slow(method, url, headers, body, timeout=10):
+            timeouts.append((clock[0], timeout))
+            clock[0] += timeout                       # every call takes all the time it's given
+            return self.transport(method, url, headers, body, timeout)
+        with mock.patch.object(self.M, "transport", slow), \
+                mock.patch.object(self.M.time, "monotonic", lambda: clock[0]):
+            self.M.tick(self.platform, self.registry, self.st)
+        self.assertLessEqual(clock[0], self.M.TICK_BUDGET)
+        self.assertTrue(all(start + t <= self.M.TICK_BUDGET for start, t in timeouts), timeouts)
+
+    def test_self_check_waits_for_the_ensure_lock(self):
+        pdir = self.etc / "secrets" / "_platform"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "HEALTHCHECKS_API_KEY").write_text(FM.HC_KEY)
+        self.platform.monitoring["healthchecks"] = {
+            "url": "http://127.0.0.1:8000", "ping": "https://hc.example.org/ping", "host": "",
+            "channels": "*", "self": True}
+        self.t = dataclasses.replace(self.t, monitor={})       # only the self check this time
+        self.registry["hello"].targets["prod"] = self.t
+        with self.M._ensure_lock(self.platform):
+            with mock.patch.object(self.M.time, "sleep", lambda s: None):
+                self.tick()                                    # lock held: nothing made
+        self.assertEqual(self.fm.creates("hc"), 0)
+
+
+class PublicCheck(unittest.TestCase):
+    """recipe.public_check (after a switch) requires ok: true and the sha."""
+
+    def test_ok_required(self):
+        from huta import recipe
+        for body, passes in (({"ok": True, "sha": "a" * 40}, True),
+                             ({"ok": False, "sha": "a" * 40}, False),
+                             ({"sha": "a" * 40}, False),
+                             ({"ok": True, "sha": "b" * 40}, False)):
+            with self.subTest(body=body), \
+                    mock.patch.object(recipe, "_get_json", lambda *a, **k: body), \
+                    mock.patch.object(recipe.time, "sleep", lambda s: None):
+                if passes:
+                    recipe.public_check("x.example.org", "/healthz", "a" * 40, timeout=0.2)
+                else:
+                    with self.assertRaises(recipe.RecipeError):
+                        recipe.public_check("x.example.org", "/healthz", "a" * 40, timeout=0.2)
