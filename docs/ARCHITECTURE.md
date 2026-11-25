@@ -541,6 +541,10 @@ The CLI `huta approve` remains the fallback.
 
 ## Not yet
 
-Unattended releases, plain (non-Cloudflare) TLS, several components per project, the `pg`,
-`gateway` and `external` recipes, migrations with schema versions, read-only debug access for
-agents beyond what exists (`snapshot`), monitoring hooks, plain-HTTP egress.
+Unattended releases, plain (non-Cloudflare) TLS, read-only debug access for agents beyond what
+exists (`snapshot`), monitoring hooks, plain-HTTP egress.
+
+Planned for v2 (`DESIGN-v2.md`, built in the order of `BUILD-v2.md`): several containers per
+target, Postgres per target, migrations with schema versions (exclusive, then online),
+gateways (a hostname for a service huta doesn't run), and publishing to Cloudflare Pages and
+Workers. Targets that use none of it keep running exactly as now.
