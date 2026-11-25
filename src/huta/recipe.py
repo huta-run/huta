@@ -365,11 +365,37 @@ def _phase_set(platform: Platform, t: Target, **rec) -> None:
     edge._atomic_write(_phase_file(platform, t), json.dumps(rec) + "\n", 0o600)
 
 
+# Phase records: v1 ones have no "v" and a stage of None (one writer, before the switch),
+# "switching" or "checks". A record this huta can't resolve is never cleared: a human looks
+# (DESIGN-v2 §0). Later milestones add their stages here together with what reconcile does.
+PHASE_VERSION = 2
+KNOWN_STAGES = {None, "switching", "checks"}
+
+
 def _phase_get(platform: Platform, t: Target) -> dict | None:
+    f = _phase_file(platform, t)
     try:
-        return json.loads(_phase_file(platform, t).read_text())
-    except (OSError, ValueError):
+        text = f.read_text()
+    except FileNotFoundError:
         return None
+    try:
+        rec = json.loads(text)
+        if not isinstance(rec, dict):
+            raise ValueError("not an object")
+    except ValueError as e:
+        raise RecipeError(f"{f} is unreadable ({e}): needs a human") from None
+    return rec
+
+
+def _phase_unresolvable(phase: dict | None) -> str | None:
+    if not phase:
+        return None
+    v = phase.get("v", 1)
+    if not isinstance(v, int) or v > PHASE_VERSION:
+        return f"phase record version {v!r} is newer than this huta"
+    if phase.get("stage") not in KNOWN_STAGES:
+        return f"phase stage {phase.get('stage')!r} is unknown to this huta"
+    return None
 
 
 def _phase_clear(platform: Platform, t: Target) -> None:
@@ -413,6 +439,13 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     if import_marker(platform, t).exists():
         raise RecipeError("a data import was interrupted: run huta data import again (nothing "
                           "of this target starts until it completes)")
+    try:
+        why_not = _phase_unresolvable(_phase_get(platform, t))
+    except RecipeError as e:
+        why_not = str(e)
+    if why_not:
+        st.event("needs-human", f"reconcile stopped: {why_not}", None, project.name, t.name)
+        raise RecipeError(f"{why_not}; the phase file is kept: needs a human")
 
     if routed is None:
         if live and edge.adopt_pending(platform, t) is not None:
@@ -432,7 +465,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             st.event("needs-human", "store has a live release but the vhost routes nowhere",
                      live["release_id"], project.name, t.name)
             raise RecipeError("a release is live but the vhost routes nowhere: needs a human "
-                              "(huta edge --apply re-routes it)")
+                              "(huta edge --apply, approved, re-routes it)")
         for slot, c in cons.items():
             if c["running"] and not live:
                 stop_container(c["id"])
@@ -485,7 +518,7 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             return reconcile(platform, st, project, t, log)
         cons = slot_containers(t)
         c = cons.get(routed)
-    elif phase:
+    elif phase and phase.get("stage") is None:
         _phase_clear(platform, t)            # it switched; the new slot is the routed one
     stopped = stopped_marker(platform, t).exists()   # `huta stop`: leave the slot stopped
     if not stopped and c and not c["running"] and live and live["slot"] == routed:

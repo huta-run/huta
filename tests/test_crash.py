@@ -288,3 +288,37 @@ class ConcurrentData(Scenario, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhaseRecords(unittest.TestCase):
+    """A phase record reconcile can't resolve is kept and reported, never cleared."""
+
+    def run_with_phase(self, text):
+        host = FakeHost()
+        try:
+            project = host.registry["hello"]
+            t = project.targets["prod"]
+            r1 = host.plan(project, t, app_toml("hello"), SHA1)
+            self.assertEqual(host.release(project, t, r1), LIVE)
+            f = recipe._phase_file(host.platform, t)
+            f.write_text(text)
+            with self.assertRaisesRegex(recipe.RecipeError, "needs a human"):
+                host.reconcile(project, t)
+            self.assertEqual(f.read_text(), text, "the phase file was changed")
+            st = host.store()
+            try:
+                ev = st.db.execute("SELECT msg FROM events WHERE kind='needs-human'").fetchall()
+            finally:
+                st.db.close()
+            self.assertTrue(ev, "no needs-human event recorded")
+        finally:
+            host.close()
+
+    def test_unreadable(self):
+        self.run_with_phase("{not json")
+
+    def test_unknown_stage(self):
+        self.run_with_phase(json.dumps({"v": 2, "rid": "x", "stage": "teleporting", "idle": "b"}))
+
+    def test_newer_version(self):
+        self.run_with_phase(json.dumps({"v": 99, "rid": "x", "stage": "checks", "idle": "b"}))

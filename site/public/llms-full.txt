@@ -435,7 +435,8 @@ Pick a uid from 20001 up and two free loopback ports (for example 18300/18301), 
 ```sh
 sudo huta check
 sudo huta edge <project> prod            # dry run: what it would create
-sudo huta edge <project> prod --apply    # CONFIRM: Origin CA certificate, vhost (503 "not released yet"), SSL rule, DNS record
+sudo huta edge <project> prod --apply    # plans: Origin CA certificate, vhost (503 "not released yet"), SSL rule, DNS record
+sudo huta approve <id>                   # CONFIRM: applies that plan (or `huta edge … --now` at once)
 ```
 
 The site now answers 503 `not released yet` until its first approved release.
@@ -460,7 +461,7 @@ Say what is installed and running, the huta revision, the zones, and what's left
 | You see | Meaning | Do |
 |---|---|---|
 | `huta check`: `… must be …` | a key in `huta.toml` has the wrong form | fix that key; the message names it |
-| `caddy validate` fails on a huta vhost | a cert file missing or unreadable by the `caddy` group | `sudo huta edge <p> <t> --apply` again |
+| `caddy validate` fails on a huta vhost | a cert file missing or unreadable by the `caddy` group | `sudo huta edge <p> <t> --now` again |
 | Cloudflare `Authentication error` | a permission row or a zone is missing from the token, or the IP filter lacks the address it calls from | edit the token (the value stays the same) |
 | registry `curl` gives `000` or a TLS error | `tailscale serve` not running, or HTTPS certificates off in the tailnet | `tailscale serve status`; turn HTTPS on in the admin console |
 | `huta enroll` fails restarting the registry | no single `registry` container in project `huta-registry` | `cd /opt/huta-registry && sudo docker compose up -d` |
@@ -1211,7 +1212,7 @@ see each other: the box is the unit huta can tell apart.
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
 
-Before the first release the operator runs `huta edge <project> <target> --apply`
+Before the first release the operator runs `huta edge <project> <target> --apply` (and approves the plan)
 (certificate, vhost answering 503 `not released yet`, Cloudflare per-host SSL rule; with
 `adopt`, only the certificate: the old site keeps serving). If a host has no address record (A,
 AAAA or CNAME; MX, TXT and the like don't count) and no covering wildcard, `--apply` creates a
@@ -1521,7 +1522,7 @@ the old pieces to retire.
 2. **Secrets:** `sudo huta secret import <project> NAME… --from /path/to/old/.env`, or
    `sudo huta secret set <project> NAME` for each (unless the agent already sent them from its
    box: `sudo huta secret list <project>` shows them as staged).
-3. **Edge:** `sudo huta edge <project> <target> --apply`. With `adopt` it only gets the
+3. **Edge:** `sudo huta edge <project> <target> --apply`, then `sudo huta approve <id>`. With `adopt` it only gets the
    certificate: the old file keeps serving and the SSL mode is left alone.
 4. **Data:** stop the old app's writes (stop its service and timers), then
    `sudo huta data import <project> <target> /old/data/dir`. That creates the volume, copies the
@@ -2100,7 +2101,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | Command | Does |
 |---|---|
 | `huta check` | validate `/etc/huta/huta.toml` and every `projects.d/*.toml` (no shared uids, ports or hosts) |
-| `huta edge <project> <target> [--apply]` | certificate, vhost, Cloudflare per-host SSL rule, and a proxied A record for hosts with no address record (A/AAAA/CNAME); dry run without `--apply` |
+| `huta edge <project> <target> [--apply\|--now]` | certificate, vhost, Cloudflare per-host SSL rule, and a proxied A record for hosts with no address record (A/AAAA/CNAME); dry run by default. `--apply` makes an edge plan, applied by `huta approve <id>`; `--now` applies at once (for the console; recorded) |
 | `huta import-dev <project> <ref>` | import `huta-build/<project>:<sha12>` from the dev box by hand |
 | `huta submit <project> <target> <sha> <image>` | verify and plan by hand |
 | `huta show <release>` | print a plan |

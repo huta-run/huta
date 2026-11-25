@@ -1,11 +1,12 @@
 """huta command line (root on the host). Approve with `huta approve`, or with one tap in the chat when [telegram] buttons are on.
 
   huta check                                   validate the whole host registry
-  huta edge <project> <target> [--apply]       certificate, vhost, Cloudflare per-host rule
+  huta edge <project> <target> [--apply|--now] certificate, vhost, Cloudflare per-host rule
+                                               (--apply plans it for approval; --now applies)
   huta import-dev <project> <dev-image-ref>    v0 transport: image built on dev → local docker
   huta submit <project> <target> <sha> <image-id-or-tag>   verify and plan
-  huta show <release>                          print a plan
-  huta approve <release> | reject <release>
+  huta show <id>                               print a plan (release or edge)
+  huta approve <id> | reject <id>
   huta rollback <project> <target>             plan a release of the previous image
   huta reconcile <project> <target>            repair state after an interruption
   huta status [project [target]] | log [release]   with a target: its containers now
@@ -96,53 +97,109 @@ def cmd_check(a):
     return 0
 
 
-def cmd_edge(a):
-    platform, project, st = ctx(a.project)
-    t = target_of(project, a.target)
-    cf = Cloudflare(platform)
-    missing = []
+def _edge_survey(platform, project, t, cf) -> dict:
+    """What `huta edge` would change for a target, read-only. Its "inputs" bind an edge plan:
+    if they differ at approval, the plan is stale."""
+    missing, lines = [], []
     for h in t.hosts:
         dns = cf.dns_covers(h)
-        say(f"{h}: zone {zone_for(h, platform)} (ssl {cf.zone_ssl(h)}), dns {dns or 'missing'}")
+        lines.append(f"{h}: zone {zone_for(h, platform)} (ssl {cf.zone_ssl(h)}), dns {dns or 'missing'}")
         if not dns:
             missing.append(h)
     if missing and not platform.public_ipv4:
         raise ExtError(f"{', '.join(missing)}: no DNS record, and no platform.public_ipv4 to create one")
     if missing:
-        say(f"would create proxied A record(s) → {platform.public_ipv4}: {', '.join(missing)}")
+        lines.append(f"would create proxied A record(s) → {platform.public_ipv4}: {', '.join(missing)}")
     have = edge.cert_ok(platform, t)
-    say(f"certificate: {'ok ' + have[0].name if have else 'missing or not covering all hosts'}")
-    if not a.apply:
-        say("dry run; add --apply to make these changes")
+    lines.append(f"certificate: {'ok ' + have[0].name if have else 'missing or not covering all hosts (a new one is made)'}")
+    inputs = {"hosts": list(t.hosts), "cloudflare": t.cloudflare, "access_log": t.access_log,
+              "missing_dns": missing, "cert": have[0].name if have else None,
+              "vhost": edge.installed(platform, t) or ""}
+    return {"lines": lines, "missing": missing, "inputs": inputs}
+
+
+def _edge_apply(platform, project, st, t, cf, missing, how: str) -> None:
+    """Make the edge changes. Hold the target lock."""
+    for h in missing:
+        say(f"{h}: {cf.create_proxied_a(h, platform.public_ipv4)}")
+    msg, cert = edge.ensure_cert(platform, cf, t)
+    say(msg)
+    live = st.live(project.name, t.name)
+    # Keep whatever the vhost routes to now; never re-point traffic from the database
+    # (grok #9). A first edge has no route yet: the 503 form.
+    port = edge.routed_port(platform, t) if edge.installed(platform, t) else None
+    if port is None and live:
+        port = dict(zip(recipe.SLOTS, t.slots))[live["slot"]]
+    with edge.edge_lock(platform):
+        for m in edge.recover(platform):
+            say(m)
+        foreign = edge.adopt_pending(platform, t)
+        if foreign is not None and not edge.installed(platform, t):
+            say(f"adopt: {foreign} keeps serving; the first release replaces it")
+        else:
+            say(edge.change_vhost(platform, t, edge.render_vhost(
+                platform, t, Cloudflare.ip_ranges(), cert, port))[0])
+    edge.prune_certs(platform, t, cert)
+    for h in t.hosts:
+        if edge.adopt_pending(platform, t) is not None:
+            say(f"{h}: SSL mode left as it is while the old site serves; the first release "
+                "sets the per-host strict rule")
+        elif cf.zone_ssl(h) != "strict":
+            say(f"{h}: {cf.ensure_host_strict(h)}")
+    st.event("edge", f"edge applied for {', '.join(t.hosts)} ({how})", None, project.name, t.name)
+
+
+def cmd_edge(a):
+    """Dry run by default. --apply makes an edge plan the owner approves (huta approve <id>);
+    --now applies at once, for an operator at the console, and is recorded (DESIGN-v2 §0)."""
+    platform, project, st = ctx(a.project)
+    t = target_of(project, a.target)
+    cf = Cloudflare(platform)
+    survey = _edge_survey(platform, project, t, cf)
+    for line in survey["lines"]:
+        say(line)
+    if a.now:
+        with st.lock(project.name, t.name):
+            _edge_apply(platform, project, st, t, cf, survey["missing"],
+                        "--now, at the console without a plan")
         return 0
-    with st.lock(project.name, t.name):
-        for h in missing:
-            say(f"{h}: {cf.create_proxied_a(h, platform.public_ipv4)}")
-        msg, cert = edge.ensure_cert(platform, cf, t)
-        say(msg)
-        live = st.live(project.name, t.name)
-        # Keep whatever the vhost routes to now; never re-point traffic from the database
-        # (grok #9). A first edge has no route yet: the 503 form.
-        port = edge.routed_port(platform, t) if edge.installed(platform, t) else None
-        if port is None and live:
-            port = dict(zip(recipe.SLOTS, t.slots))[live["slot"]]
-        with edge.edge_lock(platform):
-            for m in edge.recover(platform):
-                say(m)
-            foreign = edge.adopt_pending(platform, t)
-            if foreign is not None and not edge.installed(platform, t):
-                say(f"adopt: {foreign} keeps serving; the first release replaces it")
-            else:
-                say(edge.change_vhost(platform, t, edge.render_vhost(
-                    platform, t, Cloudflare.ip_ranges(), cert, port))[0])
-        edge.prune_certs(platform, t, cert)
-        for h in t.hosts:
-            if edge.adopt_pending(platform, t) is not None:
-                say(f"{h}: SSL mode left as it is while the old site serves; the first release "
-                    "sets the per-host strict rule")
-            elif cf.zone_ssl(h) != "strict":
-                say(f"{h}: {cf.ensure_host_strict(h)}")
-        st.event("edge", f"edge applied for {', '.join(t.hosts)}", None, project.name, t.name)
+    if not a.apply:
+        say("dry run; --apply plans these changes for approval (--now applies them at once)")
+        return 0
+    pid = st.new_plan(project.name, t.name, "edge", {
+        "lines": survey["lines"], "inputs": survey["inputs"]})
+    say(f"\nedge plan {pid}; approve with: huta approve {pid}")
+    return 0
+
+
+def _approve_plan(platform, registry, st, pid: str, via: str) -> int:
+    """Approve and apply a plan that is not a release (DESIGN-v2 §0: infra plans)."""
+    r = st.plan_row(pid)
+    project = registry[r["project"]]
+    t = target_of(project, r["target"])
+    with st.lock(project.name, t.name, wait=300):
+        r = st.plan_row(pid)
+        if r["state"] != S.PLANNED:
+            raise ConfigError(f"plan {pid} is {r['state']}, not planned")
+        plan = json.loads(r["plan"])
+        if time.time() - r["created"] > PLAN_TTL:
+            st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "approval expired (30 min)")
+            raise ConfigError("plan expired; make it again")
+        if r["kind"] != "edge":
+            raise ConfigError(f"plan {pid}: kind {r['kind']!r} is not handled by this huta")
+        cf = Cloudflare(platform)
+        survey = _edge_survey(platform, project, t, cf)
+        if survey["inputs"] != plan["inputs"]:
+            st.plan_transition(pid, S.PLANNED, S.SUPERSEDED, "the edge changed since planning")
+            raise ConfigError("the edge or its config changed since this plan was made; plan again")
+        st.plan_transition(pid, S.PLANNED, S.APPROVED, f"approved {via}")
+        try:
+            _edge_apply(platform, project, st, t, cf, survey["missing"], f"plan {pid}")
+        except Exception as e:  # noqa: BLE001 — every failure ends in a recorded outcome
+            st.plan_transition(pid, S.APPROVED, "failed", f"{type(e).__name__}: {e}")
+            raise
+        st.plan_transition(pid, S.APPROVED, "applied", "edge applied")
+    say("outcome: applied")
     return 0
 
 
@@ -255,7 +312,9 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
     blob = json.dumps(plan, sort_keys=True)
     return st.new_release(project=project.name, target=t.name, sha=sha, image_id=image_id,
                           image_tag=tag, app_toml=json.dumps(app), plan=plan,
-                          plan_hash=hashlib.sha256(blob.encode()).hexdigest(), built_by="dev")
+                          plan_hash=hashlib.sha256(blob.encode()).hexdigest(), built_by="dev",
+                          images={next(iter(app["images"])): image_id},
+                          schema=(app.get("state") or {}).get("schema"))
 
 
 def secret_names(t) -> list[str]:
@@ -415,12 +474,22 @@ def settle_journal(platform, st, project) -> None:
 
 def cmd_show(a):
     st = S.Store(load_platform().state_dir)
+    p = st.plan_row(a.release)
+    if p:
+        plan = json.loads(p["plan"])
+        say(f"{p['kind']} plan {p['id']} for {p['project']}/{p['target']}: {p['state']}")
+        for line in plan.get("lines", []):
+            say(f"  {line}")
+        return 0
     print_plan(st, a.release)
     return 0
 
 
 def cmd_approve(a):
     platform, registry, st = ctx()
+    if st.plan_row(a.release):
+        return _approve_plan(platform, registry, st, a.release,
+                             "with the Telegram button" if a.via == "telegram" else "on the host")
     r = st.release(a.release)
     project = registry[r["project"]]
     t = target_of(project, r["target"])
@@ -506,6 +575,12 @@ def cmd_approve(a):
 
 def cmd_reject(a):
     platform, registry, st = ctx()
+    p = st.plan_row(a.release)
+    if p:
+        with st.lock(p["project"], p["target"]):
+            st.plan_transition(a.release, S.PLANNED, S.REJECTED, "rejected on the CLI")
+        say("rejected")
+        return 0
     r = st.release(a.release)
     with st.lock(r["project"], r["target"]):
         st.transition(a.release, S.PLANNED, S.REJECTED, "rejected on the CLI")
@@ -810,6 +885,19 @@ def cmd_push_request(a):
     return 1 if crashed else 0
 
 
+def approve_minutes(r) -> int:
+    """How long the approval unit may run: the release's own worst case (migration, health
+    wait, drain, copy) plus margin, never less than 20 minutes (DESIGN-v2 §0)."""
+    try:
+        plan = json.loads(r["plan"])
+        eff = plan.get("effective") or {}
+        secs = (int(eff.get("migrate_timeout") or 0) + int(eff.get("health_timeout") or 30)
+                + int(eff.get("drain") or 0) + 15 * 60)
+    except (ValueError, TypeError, KeyError):
+        return 20
+    return max(20, -(-secs // 60))
+
+
 def cmd_press(a):
     """A Telegram button press relayed by the OpenClaw plugin (huta-press.socket; stdin is the
     connection). Only the configured relay user may connect, and the press itself must come from
@@ -841,8 +929,9 @@ def cmd_press(a):
         if kind == "a":
             st.event("button", "Deploy pressed in Telegram", rid, r["project"], r["target"])
             subprocess.run(["systemd-run", f"--unit=huta-approve-{rid}", "--collect", "--quiet",
-                            "--property=TimeoutStartSec=20min", "/usr/local/sbin/huta", "approve",
-                            rid, "--via", "telegram"], check=True, capture_output=True, timeout=20)
+                            f"--property=TimeoutStartSec={approve_minutes(r)}min",
+                            "/usr/local/sbin/huta", "approve", rid, "--via", "telegram"],
+                           check=True, capture_output=True, timeout=20)
             toast, ok = f"Deploying {name}…", True
         else:
             with st.lock(r["project"], r["target"]):
@@ -1293,7 +1382,9 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", metavar="<command>")
     s = sub.add_parser("check"); s.set_defaults(f=cmd_check)
     s = sub.add_parser("edge"); s.add_argument("project"); s.add_argument("target")
-    s.add_argument("--apply", action="store_true"); s.set_defaults(f=cmd_edge)
+    s.add_argument("--apply", action="store_true", help="plan the changes for approval")
+    s.add_argument("--now", action="store_true", help="apply at once (console; recorded)")
+    s.set_defaults(f=cmd_edge)
     s = sub.add_parser("import-dev"); s.add_argument("project"); s.add_argument("ref")
     s.set_defaults(f=cmd_import_dev)
     s = sub.add_parser("submit"); s.add_argument("project"); s.add_argument("target")

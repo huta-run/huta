@@ -272,6 +272,12 @@ content.
   to as the truth: it repairs the live pointer, marks interrupted releases `nothing-activated`
   and stops slots nothing routes to.
 - Every host helper command (docker, incus, git) runs with a deadline.
+- Edge changes outside a release are plans too: `huta edge --apply` records an edge plan bound
+  to what it surveyed (hosts, DNS, certificate, the installed vhost); `huta approve <id>`
+  applies it if nothing changed, else it is superseded. `--now` applies at once and is recorded.
+  Telegram buttons for these plans are planned (DESIGN-v2 milestone 2).
+- Phase records this huta can't read, or with a stage or version it doesn't know, stop
+  `reconcile` with `needs-human`; the record is kept, never cleared.
 - `huta.db` carries its own version (`PRAGMA user_version`); migrations run forward, one
   transaction each, and a huta that finds a newer database refuses to run. `install.sh`
   refuses while a phase file, a running or approved release, or a held target lock exists.
@@ -282,7 +288,8 @@ content.
 
 ```
 huta check                               validate the whole registry
-huta edge <project> <target> [--apply]   certificate, vhost, Cloudflare rule, A record if no A/AAAA/CNAME
+huta edge <project> <target> [--apply|--now]   certificate, vhost, Cloudflare rule, A record if no
+                                         A/AAAA/CNAME; --apply plans it (huta approve <id>), --now applies
 huta import-dev <project> <ref>          import huta-build/<project>:<sha12> from the dev box
 huta submit <project> <target> <sha> <image>
 huta show <release> | reject <release>

@@ -24,7 +24,7 @@ Rules for every milestone:
 | T+ | Recovery fixes the crash tests found (phase left, retire race, revert needs cert) | built |
 | 0a | Database version, refuse a newer one; install guard | built |
 | 0b | One release description for every manifest; `order[0]` sites read it | built |
-| 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | planned |
+| 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | built |
 | 1 | Gateways, `edge` knobs on every vhost | planned |
 | 2 | Migrations, exclusive mode; `health_timeout`; restore plans | planned |
 | 3 | Several containers per target; images map | planned |
@@ -57,12 +57,17 @@ Rules for every milestone:
   the first to have more than one container per slot.
 - Gate: every golden file byte-identical.
 
-## 0c: records, plans, phase v2
+## 0c: records, plans, phase v2 (built)
 
 - Migration 2: release `images` and `schema`; `resources`, `restore_points`, `plans` tables.
-- Phase records with `"v": 2`; reconcile stops with needs-human on one it can't read.
-- `huta edge --apply` plans and asks; `--now` for the console, recorded.
-- Approval unit limit from the plan.
+  New releases record their image map.
+- Phase records: unreadable, newer, or an unknown stage → reconcile stops with needs-human
+  and keeps the record. Each later milestone adds its stages with their recovery.
+- `huta edge --apply` makes an edge plan bound to what it surveyed; `huta approve <id>` applies
+  it or supersedes it if the edge changed; `huta reject`/`show` take plan ids; `--now` applies
+  at once and is recorded.
+- The Telegram approval unit's limit comes from the release (health wait, migration, drain).
+- Telegram buttons for non-release plans: with milestone 2 (restore plans need them).
 
 ## 1–6
 

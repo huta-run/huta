@@ -41,7 +41,7 @@ the old pieces to retire.
 2. **Secrets:** `sudo huta secret import <project> NAME… --from /path/to/old/.env`, or
    `sudo huta secret set <project> NAME` for each (unless the agent already sent them from its
    box: `sudo huta secret list <project>` shows them as staged).
-3. **Edge:** `sudo huta edge <project> <target> --apply`. With `adopt` it only gets the
+3. **Edge:** `sudo huta edge <project> <target> --apply`, then `sudo huta approve <id>`. With `adopt` it only gets the
    certificate: the old file keeps serving and the SSL mode is left alone.
 4. **Data:** stop the old app's writes (stop its service and timers), then
    `sudo huta data import <project> <target> /old/data/dir`. That creates the volume, copies the

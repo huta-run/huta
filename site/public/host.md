@@ -402,7 +402,8 @@ Pick a uid from 20001 up and two free loopback ports (for example 18300/18301), 
 ```sh
 sudo huta check
 sudo huta edge <project> prod            # dry run: what it would create
-sudo huta edge <project> prod --apply    # CONFIRM: Origin CA certificate, vhost (503 "not released yet"), SSL rule, DNS record
+sudo huta edge <project> prod --apply    # plans: Origin CA certificate, vhost (503 "not released yet"), SSL rule, DNS record
+sudo huta approve <id>                   # CONFIRM: applies that plan (or `huta edge … --now` at once)
 ```
 
 The site now answers 503 `not released yet` until its first approved release.
@@ -427,7 +428,7 @@ Say what is installed and running, the huta revision, the zones, and what's left
 | You see | Meaning | Do |
 |---|---|---|
 | `huta check`: `… must be …` | a key in `huta.toml` has the wrong form | fix that key; the message names it |
-| `caddy validate` fails on a huta vhost | a cert file missing or unreadable by the `caddy` group | `sudo huta edge <p> <t> --apply` again |
+| `caddy validate` fails on a huta vhost | a cert file missing or unreadable by the `caddy` group | `sudo huta edge <p> <t> --now` again |
 | Cloudflare `Authentication error` | a permission row or a zone is missing from the token, or the IP filter lacks the address it calls from | edit the token (the value stays the same) |
 | registry `curl` gives `000` or a TLS error | `tailscale serve` not running, or HTTPS certificates off in the tailnet | `tailscale serve status`; turn HTTPS on in the admin console |
 | `huta enroll` fails restarting the registry | no single `registry` container in project `huta-registry` | `cd /opt/huta-registry && sudo docker compose up -d` |

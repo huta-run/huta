@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -46,8 +47,29 @@ CREATE TABLE IF NOT EXISTS live (
 # The database's own version (PRAGMA user_version). Migrations run forward only, each in one
 # transaction; a database newer than this code is refused, never misread (DESIGN-v2 §0).
 # 0 = a database from before versioning, which is version 1's tables.
-SCHEMA_VERSION = 1
-MIGRATIONS: dict[int, str] = {1: SCHEMA}
+SCHEMA_VERSION = 2
+MIGRATIONS: dict[int, str] = {1: SCHEMA, 2: """
+ALTER TABLE releases ADD COLUMN images TEXT;
+ALTER TABLE releases ADD COLUMN schema INTEGER;
+CREATE TABLE resources (
+  project TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
+  schema INTEGER, release_id TEXT, updated REAL NOT NULL,
+  PRIMARY KEY (project, target, kind)
+);
+CREATE TABLE restore_points (
+  id TEXT PRIMARY KEY, project TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
+  release_id TEXT NOT NULL, path TEXT NOT NULL, fingerprint TEXT NOT NULL, schema INTEGER,
+  created REAL NOT NULL, state TEXT NOT NULL
+);
+CREATE TABLE plans (
+  id TEXT PRIMARY KEY, project TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
+  plan TEXT NOT NULL, plan_hash TEXT NOT NULL, state TEXT NOT NULL,
+  created REAL NOT NULL, updated REAL NOT NULL
+)
+"""}
+# What each version added: 1, the v1 tables; 2, release image maps and schemas, resources
+# (a target's data volume or database, with its schema), restore points pinned per release,
+# and plans that are not releases (infra: edge, gateways, Postgres; restore).
 
 
 class StoreError(Exception):
@@ -188,18 +210,72 @@ class Store:
             " ORDER BY created", (project, target, *states)).fetchall()
 
     def new_release(self, **f) -> str:
-        rid = secrets.token_hex(4)
+        rid = self.new_id()
         now = time.time()
         self.db.execute(
             "INSERT INTO releases (id, project, target, sha, image_id, image_tag, app_toml, plan,"
-            " plan_hash, built_by, state, slot, created, updated)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " plan_hash, built_by, state, slot, created, updated, images, schema)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (rid, f["project"], f["target"], f["sha"], f["image_id"], f["image_tag"],
              f["app_toml"], json.dumps(f["plan"]), f["plan_hash"], f["built_by"],
-             PLANNED, None, now, now))
+             PLANNED, None, now, now,
+             json.dumps(f["images"]) if f.get("images") else None, f.get("schema")))
         self.event("planned", f"{f['project']}/{f['target']} {f['sha'][:12]}", rid,
                    f["project"], f["target"])
         return rid
+
+    def new_id(self) -> str:
+        """8 hex, unused by any release or plan (both are approved by id)."""
+        while True:
+            i = secrets.token_hex(4)
+            if not self.db.execute("SELECT 1 FROM releases WHERE id=? UNION ALL"
+                                   " SELECT 1 FROM plans WHERE id=?", (i, i)).fetchone():
+                return i
+
+    def images(self, r) -> dict:
+        """A release's image map (name → id). Rows from before maps: the only image."""
+        if r["images"]:
+            return json.loads(r["images"])
+        names = list(json.loads(r["app_toml"]).get("images", {})) or ["web"]
+        return {names[0]: r["image_id"]}
+
+    # ---------------------------------------------------------------- plans (not releases)
+
+    def new_plan(self, project: str, target: str, kind: str, plan: dict) -> str:
+        pid = self.new_id()
+        now = time.time()
+        blob = json.dumps(plan, sort_keys=True)
+        self.db.execute("INSERT INTO plans (id, project, target, kind, plan, plan_hash, state,"
+                        " created, updated) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (pid, project, target, kind, blob,
+                         hashlib.sha256(blob.encode()).hexdigest(), PLANNED, now, now))
+        self.event("planned", f"{kind} plan for {project}/{target}", pid, project, target)
+        return pid
+
+    def plan_row(self, pid: str):
+        return self.db.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
+
+    def plan_transition(self, pid: str, frm: str, to: str, msg: str = "") -> None:
+        cur = self.db.execute("UPDATE plans SET state=?, updated=? WHERE id=? AND state=?",
+                              (to, time.time(), pid, frm))
+        if cur.rowcount != 1:
+            now = self.plan_row(pid)
+            raise RuntimeError(f"plan {pid} is {now['state'] if now else 'unknown'}, not {frm}")
+        r = self.plan_row(pid)
+        self.event(to, msg or to, pid, r["project"], r["target"])
+
+    # ---------------------------------------------------------------- resources
+
+    def resource(self, project: str, target: str, kind: str):
+        return self.db.execute("SELECT * FROM resources WHERE project=? AND target=? AND kind=?",
+                               (project, target, kind)).fetchone()
+
+    def set_resource_schema(self, project: str, target: str, kind: str, schema, rid) -> None:
+        self.db.execute(
+            "INSERT INTO resources (project, target, kind, schema, release_id, updated)"
+            " VALUES (?,?,?,?,?,?) ON CONFLICT(project, target, kind) DO UPDATE SET"
+            " schema=excluded.schema, release_id=excluded.release_id, updated=excluded.updated",
+            (project, target, kind, schema, rid, time.time()))
 
     def release(self, rid: str):
         r = self.db.execute("SELECT * FROM releases WHERE id=?", (rid,)).fetchone()

@@ -354,7 +354,7 @@ see each other: the box is the unit huta can tell apart.
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
 
-Before the first release the operator runs `huta edge <project> <target> --apply`
+Before the first release the operator runs `huta edge <project> <target> --apply` (and approves the plan)
 (certificate, vhost answering 503 `not released yet`, Cloudflare per-host SSL rule; with
 `adopt`, only the certificate: the old site keeps serving). If a host has no address record (A,
 AAAA or CNAME; MX, TXT and the like don't count) and no covering wildcard, `--apply` creates a

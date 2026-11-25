@@ -352,7 +352,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | Command | Does |
 |---|---|
 | `huta check` | validate `/etc/huta/huta.toml` and every `projects.d/*.toml` (no shared uids, ports or hosts) |
-| `huta edge <project> <target> [--apply]` | certificate, vhost, Cloudflare per-host SSL rule, and a proxied A record for hosts with no address record (A/AAAA/CNAME); dry run without `--apply` |
+| `huta edge <project> <target> [--apply\|--now]` | certificate, vhost, Cloudflare per-host SSL rule, and a proxied A record for hosts with no address record (A/AAAA/CNAME); dry run by default. `--apply` makes an edge plan, applied by `huta approve <id>`; `--now` applies at once (for the console; recorded) |
 | `huta import-dev <project> <ref>` | import `huta-build/<project>:<sha12>` from the dev box by hand |
 | `huta submit <project> <target> <sha> <image>` | verify and plan by hand |
 | `huta show <release>` | print a plan |
