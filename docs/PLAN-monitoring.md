@@ -96,7 +96,7 @@ url = "http://127.0.0.1:8000"      # management API; token: HEALTHCHECKS_API_KEY
 ping = "https://hc.example.org/ping"   # ping base (hosted services use another host)
 host = "hc.example.org"            # Host header for a loopback url (optional)
 channels = "*"                     # sent only when a check is created
-self = true                        # huta pings its own check, <prefix>_self_<platform.host>
+self = true                        # huta pings its own check, <prefix>__self_<platform.host>
 [monitoring.bugsink]               # API address and Host come from [crashes]; token: BUGSINK_TOKEN
 dsn_host = "bugs.example.org"      # where containers send events (granted as egress, :443)
 team = "00000000-0000-0000-0000-000000000000"   # Bugsink team new projects belong to
@@ -123,9 +123,9 @@ project). Platform tokens never reach a container.
 
 **Generated values.** The DSN is stored as a project secret, `HUTA_SENTRY_DSN_<TARGET>`, so the
 redactor and the secret machinery treat it as any secret. Check uuids (ping capabilities) are
-kept in `huta.db` and also in `<state_dir>/monitor/needles` (root-only, one per line, written
-atomically before the row); `cfg.redact` loads that file with the secrets, so every process
-redacts them, whole URL or bare uuid. Old values stay in the file after rotation.
+kept in `huta.db` and also in `secrets/_monitor/CAPABILITIES` (root-only, one per line, written
+atomically before the row); `cfg.redact` reads every secret file, so every process redacts
+them, whole URL or bare uuid. Old values stay in the file after rotation.
 
 **Registry** (`projects.d/<p>.toml`, per target):
 
@@ -194,7 +194,7 @@ two remote resources with huta's name is an error (`monitor-fail`, "ambiguous"),
 ### 2. `ensure`: remote resources, idempotent
 
 `monitor.ensure(platform, st, project, t, kinds)` creates what has no `monitors` row and repairs
-what a row says exists but whose local half is missing (the DSN secret, the needle). It runs
+what a row says exists but whose local half is missing (the DSN secret). It runs
 under `<state_dir>/monitor-ensure.lock` (one ensure on the host at a time; not in `locks/`, so
 it doesn't block an install), with one 30 s budget for the whole call.
 
@@ -377,8 +377,8 @@ bounds what a forged press can do (it rolls code back one release).
 | Step | Recorded first | Crash right after → reconcile / next run | Outcome |
 |---|---|---|---|
 | remote create (check, project, site) | nothing; the name is deterministic | next `ensure` finds exactly one by name and writes the row; two matches → `monitor-fail` ambiguous, nothing guessed | release unaffected |
-| needle written | — | row written by the next `ensure` | release unaffected |
-| `monitors` row written | needle, remote resource | the DSN secret is repaired from the row's remote id by the next `ensure` | release unaffected |
+| capability written | — | row written by the next `ensure` | release unaffected |
+| `monitors` row written | capability, remote resource | the DSN secret is repaired from the row's remote id by the next `ensure` | release unaffected |
 | DSN secret written | row | — | release unaffected |
 | plan made with or without the variables | the plan | as any plan | as today |
 | job checks converged | `monitors` spec | next tick compares spec and calls again | live |
@@ -402,8 +402,8 @@ Each is one install; each leaves every target working. The rules of `BUILD-v2.md
 | # | What | Gate | Tests | Status |
 |---|---|---|---|---|
 | 0 | API survey checked with real tokens on a test host, shapes kept as fixtures; fake services in `tests/fakehost.py`; `[monitor]`, `monitor`, `watch`, `matomo`, `monitor_env` refused by name | all tests green; golden unchanged | `test_app_toml` (refusals), `test_monitor` (fake API shapes) | built; real-token checks of the writing calls pending |
-| 1 | Config, `huta secret set _platform`, migration 4, clients, `ensure`, needles in the redactor, `huta monitor status\|ensure` | `ensure` twice on a test target creates each thing once; with the API down a release still goes live | unit: parsing, URL rules, hostile answers (oversize, redirect, wrong shape, two matches, bad DSN); redaction of a bare uuid; crash: `MonitorEnsure` (die after each create, needle and row), `MonitorApiDown`; golden: new case `notes-monitored`, old cases byte-identical | |
-| 2 | Env injection from the plan, one effective egress list, `[monitor] env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: compose and effective for `notes-monitored`; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: `MonitoredRelease` | |
+| 1 | Config, `huta secret set _platform`, migration 4, clients, `ensure`, check ids in the redactor, `huta monitor status\|ensure` | `ensure` twice on a test target creates each thing once; with the API down a release still goes live | unit: parsing, URL rules, hostile answers (oversize, redirect, wrong shape, two matches, bad DSN); redaction of a bare uuid; crash: `MonitorEnsure` (die after each create, capability, row and the DSN secret), API down; old golden cases byte-identical (the plan's `effective` doesn't change until milestone 2) | built (tests); gate on a test host pending |
+| 2 | Env injection from the plan, one effective egress list, `[monitor] env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: new case `notes-monitored` (compose and effective), old cases byte-identical; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: `MonitoredRelease` | |
 | 3 | Job checks (tick convergence, OnCalendar schedules) and pings | a job run turns its check up; a failing job turns it down; removing a job pauses it | unit: schedule, fallback period and grace (weekday schedule), exit code mapping; ping failure doesn't change the exit; crash: tick killed after a convergence call | |
 | 4 | Tick: timer, budget, probe, self-ping; `public_check` requires `ok` | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip and revalidation rules, sample ring, budget; `test_monitor_tick` | |
 | 5 | Watch: episodes, signals (local included), coverage, verdicts, history lines, `huta watch`, `status` | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, coverage thirds, re-evaluation from rows; crash: tick killed after each write, twice (`WatchTick`) | |

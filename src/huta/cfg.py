@@ -208,6 +208,7 @@ class Platform:
     caddy_group: str = "caddy"
     postgres_images: dict = field(default_factory=dict)   # [postgres.images] version -> ref@digest
     wrangler_image: str = ""                      # [external] wrangler: the publisher, by digest
+    monitoring: dict = field(default_factory=dict)   # [monitoring] (PLAN-monitoring); {} = off
 
     def secret(self, name: str) -> str:
         return read_secret(self.secrets_dir / "_platform" / name)
@@ -252,6 +253,9 @@ class Target:
     # token, routes, compatibility_date}.
     external: dict = field(default_factory=dict)
     migrate_secrets: list = field(default_factory=list)   # the only secrets [migrate] gets
+    # Monitoring hooks (docs/PLAN-monitoring.md): which kinds are on, and a Matomo site to adopt.
+    monitor: dict = field(default_factory=dict)
+    matomo: int | None = None
 
     @property
     def egress_allow(self) -> list[str]:
@@ -292,6 +296,24 @@ def _logs_cfg(v, where: str) -> dict:
                 raise ConfigError(f"{where}: logs.{k} must be true or false")
             out[k] = v[k]
     return out
+
+
+def _monitor_cfg(v, where: str) -> dict:
+    """monitor = { uptime, jobs, errors, analytics }: the kinds wired up for this target."""
+    if v is None:
+        return {}
+    if not isinstance(v, dict) or not v or set(v) - set(MONITOR_KINDS):
+        raise ConfigError(f"{where}: monitor = {{ uptime, jobs, errors, analytics }} (true/false)")
+    out = {k: _bool(v.get(k, False), f"{where} monitor.{k}") for k in MONITOR_KINDS}
+    return {k: b for k, b in out.items() if b}
+
+
+def _matomo_id(v, where: str) -> int | None:
+    if v is None:
+        return None
+    if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v < 1 << 31:
+        raise ConfigError(f"{where}: matomo must be a Matomo site id (a positive integer)")
+    return v
 
 
 def _crash_id(v, where: str) -> int | None:
@@ -352,9 +374,6 @@ def load_platform(etc: Path = ETC) -> Platform:
     if d.get("schema") != 1:
         raise ConfigError("huta.toml: schema must be 1")
     p = _need(d, "platform", dict, "huta.toml")
-    if "monitoring" in d:
-        raise ConfigError("huta.toml: [monitoring] is planned (docs/PLAN-monitoring.md), "
-                          "not built yet")
     cf = d.get("cloudflare", {})
     zones = [z.lower() for z in cf.get("zones", [])]
     for z in zones:
@@ -383,7 +402,82 @@ def load_platform(etc: Path = ETC) -> Platform:
         caddy_group=_caddy_group(p.get("caddy_group", "caddy")),
         postgres_images=_postgres_images(d.get("postgres", {})),
         wrangler_image=_wrangler(d.get("external", {})),
+        monitoring=_monitoring_cfg(d.get("monitoring"), bool(d.get("crashes"))),
     )
+
+
+MONITOR_KINDS = ("uptime", "jobs", "errors", "analytics")
+_LOOPBACK_URL = re.compile(r"http://(127\.0\.0\.1|\[::1\]|localhost):\d{1,5}")
+_HTTPS_URL = re.compile(r"https://(?P<host>[a-z0-9.-]{1,253})(:\d{1,5})?(?P<path>(/[A-Za-z0-9._~-]+)*)")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _service_url(v, where: str, path_ok: bool = False) -> str:
+    """http:// on loopback, or https:// to a hostname; no userinfo, query or fragment."""
+    if not isinstance(v, str):
+        raise ConfigError(f"{where} must be a URL")
+    v = v.rstrip("/")
+    m = _HTTPS_URL.fullmatch(v)
+    if _LOOPBACK_URL.fullmatch(v) or (m and HOST_RE.match(m.group("host"))
+                                      and (path_ok or not m.group("path"))):
+        return v
+    raise ConfigError(f"{where} must be http://127.0.0.1:<port> or https://<hostname>"
+                      + ("[/path]" if path_ok else ""))
+
+
+def _monitoring_cfg(v, crashes: bool) -> dict:
+    """[monitoring] (docs/PLAN-monitoring.md): the services huta wires targets into. Each table
+    is optional; a missing one turns that integration off on this host. Tokens are platform
+    secrets: HEALTHCHECKS_API_KEY, BUGSINK_TOKEN, MATOMO_TOKEN."""
+    if v is None:
+        return {}
+    if not isinstance(v, dict) or set(v) - {"prefix", "healthchecks", "bugsink", "matomo", "watch"}:
+        raise ConfigError("[monitoring] accepts prefix, healthchecks, bugsink, matomo, watch")
+    prefix = v.get("prefix", "huta")
+    if not isinstance(prefix, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,15}", prefix):
+        raise ConfigError("[monitoring] prefix: 1..16 of a-z, 0-9, -")
+    out: dict = {"prefix": prefix, "healthchecks": None, "bugsink": None, "matomo": None}
+    hc = v.get("healthchecks")
+    if hc is not None:
+        w = "[monitoring.healthchecks]"
+        if not isinstance(hc, dict) or set(hc) - {"url", "ping", "host", "channels", "self"}:
+            raise ConfigError(f"{w} accepts url, ping, host, channels, self")
+        host = hc.get("host", "")
+        if host and (not isinstance(host, str) or not HOST_RE.match(host)):
+            raise ConfigError(f"{w} host must be a hostname")
+        ch = hc.get("channels", "*")
+        if not isinstance(ch, str) or len(ch) > 500 or "\n" in ch:
+            raise ConfigError(f"{w} channels: \"*\", \"\" or names separated by commas")
+        out["healthchecks"] = {"url": _service_url(hc.get("url"), f"{w} url"),
+                               "ping": _service_url(hc.get("ping"), f"{w} ping", path_ok=True),
+                               "host": host, "channels": ch,
+                               "self": _bool(hc.get("self", False), f"{w} self")}
+    bs = v.get("bugsink")
+    if bs is not None:
+        w = "[monitoring.bugsink]"
+        if not isinstance(bs, dict) or set(bs) - {"dsn_host", "team"}:
+            raise ConfigError(f"{w} accepts dsn_host and team")
+        if not crashes:
+            raise ConfigError(f"{w} needs [crashes] (the Bugsink API address and Host)")
+        dsn_host = bs.get("dsn_host")
+        if not isinstance(dsn_host, str) or not HOST_RE.match(dsn_host):
+            raise ConfigError(f"{w} dsn_host must be a hostname")
+        team = bs.get("team")
+        if not isinstance(team, str) or not UUID_RE.match(team):
+            raise ConfigError(f"{w} team must be a Bugsink team id (a uuid)")
+        out["bugsink"] = {"dsn_host": dsn_host, "team": team}
+    mt = v.get("matomo")
+    if mt is not None:
+        w = "[monitoring.matomo]"
+        if not isinstance(mt, dict) or set(mt) - {"url", "host"}:
+            raise ConfigError(f"{w} accepts url and host")
+        host = mt.get("host", "")
+        if host and (not isinstance(host, str) or not HOST_RE.match(host)):
+            raise ConfigError(f"{w} host must be a hostname")
+        out["matomo"] = {"url": _service_url(mt.get("url"), f"{w} url"), "host": host}
+    if "watch" in v:
+        raise ConfigError("[monitoring.watch] is planned (the watch window), not built yet")
+    return out
 
 
 def _wrangler(v) -> str:
@@ -856,9 +950,8 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             if not isinstance(egress, list) or not egress or len(egress) > 64:
                 raise ConfigError(f"{tw}: egress is \"none\" or a list of host:port entries")
             egress = sorted({egress_entry(e, f"{tw} egress") for e in egress})
-        for k in ("monitor", "watch", "matomo"):
-            if k in t:
-                raise ConfigError(f"{tw}: {k} is planned (docs/PLAN-monitoring.md), not built yet")
+        if "watch" in t:
+            raise ConfigError(f"{tw}: watch is planned (docs/PLAN-monitoring.md), not built yet")
         approve = t.get("approve", "always")
         if approve != "always":
             # Unattended prod needs CI-attested images (planned); until then every release asks.
@@ -876,7 +969,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
                             "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
                             "components", "worker_liveness", "postgres", "external",
-                            "migrate_online"}
+                            "migrate_online", "monitor", "matomo"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -955,6 +1048,8 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             postgres=_postgres_cfg(t.get("postgres"), tw),
             external=_external_cfg(t.get("external", {}), tw),
             migrate_online=_bool(t.get("migrate_online", False), f"{tw} migrate_online"),
+            monitor=_monitor_cfg(t.get("monitor"), tw),
+            matomo=_matomo_id(t.get("matomo"), tw),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -1000,6 +1095,15 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                     if not platform.wrangler_image:
                         raise ConfigError(f"{p.name}/{t.name}: external needs [external] "
                                           "wrangler in huta.toml")
+                mon = platform.monitoring
+                need = {"uptime": "healthchecks", "jobs": "healthchecks", "errors": "bugsink",
+                        "analytics": "matomo"}
+                for kind in t.monitor:
+                    if not (mon and mon.get(need[kind])):
+                        raise ConfigError(f"{p.name}/{t.name}: monitor.{kind} needs "
+                                          f"[monitoring.{need[kind]}] in huta.toml")
+                if t.matomo is not None and "analytics" not in t.monitor:
+                    raise ConfigError(f"{p.name}/{t.name}: matomo = <id> needs monitor.analytics")
                 if t.data and not platform.backup:
                     # Even with backup = "off" (no schedule, no shipping): a one-writer release
                     # copies the data before the new code runs, to restore it if that fails

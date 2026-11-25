@@ -297,6 +297,12 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
                               "or the target's database); the host firewall's guard has no "
                               "huta_intra set yet (operator: load "
                               "systemd/nftables-huta-egress.nft.example again)")
+    if t.monitor and platform.monitoring:
+        # The resources that change the container are made now, before the plan is written, so
+        # the plan shows exactly what the release gets (docs/PLAN-monitoring.md §2). A failure
+        # is an event; the release goes on without them.
+        from . import monitor as M
+        M.ensure(platform, st, project, t, kinds=M.PLAN_KINDS, log=say)
     live = st.live(project.name, t.name)
     live_rel = st.release(live["release_id"]) if live else None
     if R.data_mount(app) and not t.data:
@@ -1460,12 +1466,76 @@ def cmd_log(a):
 # ---------------------------------------------------------------- v1: secrets, data, jobs, egress
 
 def cmd_secret(a):
+    if a.project == "_platform":
+        return _platform_secret(a)
     platform, project, st = ctx(a.project)
     if a.action == "list":
         return _cmd_secret(a, platform, project, st)
     # Never in the middle of a release applying or reverting values (grok secrets #4).
     with st.lock(project.name, R.SECRETS_LOCK, wait=300):
         return _cmd_secret(a, platform, project, st)
+
+
+PLATFORM_SECRETS = ("BUGSINK_TOKEN", "HEALTHCHECKS_API_KEY", "MATOMO_TOKEN", "GITHUB_TOKEN",
+                    "CLOUDFLARE_API_TOKEN")
+
+
+def _platform_secret(a):
+    """huta secret set|list|rm _platform NAME: the host's own tokens (secrets/_platform/), which
+    no container ever gets. Names are not checked against a list: [external] tokens have the
+    operator's names."""
+    platform = load_platform()
+    st = S.Store(platform.state_dir)
+    d = platform.secrets_dir / "_platform"
+    if a.action == "list":
+        have = sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")) \
+            if d.is_dir() else []
+        for n in have:
+            say(n)
+        for n in PLATFORM_SECRETS:
+            if n not in have:
+                say(f"{n:<32} (not set)")
+        return 0
+    if a.action == "set":
+        if len(a.names) != 1:
+            raise ConfigError("secret set _platform <NAME>; the value comes from stdin")
+        if sys.stdin.isatty():
+            import getpass
+            value = getpass.getpass(f"{a.names[0]} (not echoed): ")
+        else:
+            value = sys.stdin.read()
+        R._write_secret(d, a.names[0], value.rstrip("\n"))
+        st.event("secret", f"platform secret {a.names[0]} set", None, None, None)
+        say(f"{a.names[0]} set")
+        return 0
+    if a.action == "rm":
+        for n in a.names:
+            p = d / n
+            if R.ENV_NAME_RE.match(n) and p.is_file() and not p.is_symlink():
+                R.retire(p, d, n)
+                p.unlink()
+                st.event("secret", f"platform secret {n} removed", None, None, None)
+                say(f"{n} removed")
+        return 0
+    raise ConfigError("secret list|set|rm _platform")
+
+
+def cmd_monitor(a):
+    from . import monitor as M
+    if a.action == "tick":
+        raise ConfigError("huta monitor tick is planned (milestone 4)")
+    if not (a.project and a.target):
+        raise ConfigError(f"huta monitor {a.action} <project> <target>")
+    platform, project, st = ctx(a.project)
+    t = target_of(project, a.target)
+    res: dict = {}
+    if a.action == "ensure":
+        res = M.ensure(platform, st, project, t, log=say)
+        if not res:
+            say("nothing to make (no monitor on this target, or monitoring is off)")
+    for line in M.status_lines(platform, st, project, t):
+        say(line)
+    return 0 if all(v == "ok" for v in res.values()) else 1
 
 
 def _cmd_secret(a, platform, project, st):
@@ -1818,6 +1888,9 @@ def main(argv=None) -> int:
     s = sub.add_parser("secret"); s.add_argument("action", choices=["list", "set", "import", "rm", "discard"])
     s.add_argument("project"); s.add_argument("names", nargs="*")
     s.add_argument("--from", dest="file"); s.set_defaults(f=cmd_secret)
+    s = sub.add_parser("monitor"); s.add_argument("action", choices=["status", "ensure", "tick"])
+    s.add_argument("project", nargs="?"); s.add_argument("target", nargs="?")
+    s.set_defaults(f=cmd_monitor)
     s = sub.add_parser("data"); s.add_argument("action", choices=["status", "ensure", "import", "export"])
     s.add_argument("project"); s.add_argument("target"); s.add_argument("paths", nargs="*")
     s.set_defaults(f=cmd_data)

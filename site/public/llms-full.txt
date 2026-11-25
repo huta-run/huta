@@ -437,6 +437,30 @@ Targets with several components need the firewall fragment's `huta_intra` set (i
 `systemd/nftables-huta-egress.nft.example`; load it again if yours predates it, then
 `sudo huta egress sync`).
 
+Monitoring hooks (optional; only the remote resources are built so far, the rest is planned):
+if the human already runs healthchecks, Bugsink or Matomo, huta can make a check, a project or
+a site per target that asks for it (`monitor = { … }` in the registry). Each table is
+optional; leave out the services they don't run.
+
+```toml
+[monitoring]
+prefix = "huta"
+[monitoring.healthchecks]
+url = "http://127.0.0.1:8000"          # its API, loopback http or https://<host>
+ping = "https://hc.example.org/ping"   # its ping base
+[monitoring.bugsink]                   # needs [crashes]
+dsn_host = "bugs.example.org"          # the host in its DSNs (Bugsink's BASE_URL)
+team = "<team uuid>"
+[monitoring.matomo]
+url = "http://127.0.0.1:8081"
+host = "stats.example.org"
+```
+
+The human sets the tokens (a healthchecks project's read-write API key, Bugsink's token,
+a Matomo superuser token if huta should create sites): `sudo huta secret set _platform
+HEALTHCHECKS_API_KEY` (and `BUGSINK_TOKEN`, `MATOMO_TOKEN`); the value is read without echo.
+Check a target with `sudo huta monitor ensure <project> <target>`.
+
 ## 10. Verify
 
 ```sh
@@ -2344,6 +2368,8 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta status <project> <target> [-n N]` | that target's releases, then its containers now (as on dev) |
 | `huta logs <project> <target> [options]` | the target's logs, same options and redaction as on dev; collects first, so it is up to the moment |
 | `huta egress-log` / `traffic` / `crashes <project> <target> [--since …]` | as on dev |
+| `huta monitor status\|ensure <project> <target>` | monitoring hooks: what is wired up for the target (a Bugsink project and its DSN, a Matomo site, a healthchecks check), and `ensure` makes what is missing. Failures are events, never release outcomes. Only these remote resources are built so far |
+| `huta secret list\|set\|rm _platform [NAME]` | the host's own tokens (`GITHUB_TOKEN`, `CLOUDFLARE_API_TOKEN`, `BUGSINK_TOKEN`, `HEALTHCHECKS_API_KEY`, `MATOMO_TOKEN`); `set` reads the value from stdin; containers never get them |
 | `huta diag <project> <target> <name>` | as on dev; recorded with the operator's name |
 | `huta logs-collect` | store new slot output of every target, then apply the size caps (run every minute by `huta-logs.timer`) |
 | `huta log [release] [-n N]` | events (default 50) |

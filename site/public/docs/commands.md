@@ -369,6 +369,8 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta status <project> <target> [-n N]` | that target's releases, then its containers now (as on dev) |
 | `huta logs <project> <target> [options]` | the target's logs, same options and redaction as on dev; collects first, so it is up to the moment |
 | `huta egress-log` / `traffic` / `crashes <project> <target> [--since …]` | as on dev |
+| `huta monitor status\|ensure <project> <target>` | monitoring hooks: what is wired up for the target (a Bugsink project and its DSN, a Matomo site, a healthchecks check), and `ensure` makes what is missing. Failures are events, never release outcomes. Only these remote resources are built so far |
+| `huta secret list\|set\|rm _platform [NAME]` | the host's own tokens (`GITHUB_TOKEN`, `CLOUDFLARE_API_TOKEN`, `BUGSINK_TOKEN`, `HEALTHCHECKS_API_KEY`, `MATOMO_TOKEN`); `set` reads the value from stdin; containers never get them |
 | `huta diag <project> <target> <name>` | as on dev; recorded with the operator's name |
 | `huta logs-collect` | store new slot output of every target, then apply the size caps (run every minute by `huta-logs.timer`) |
 | `huta log [release] [-n N]` | events (default 50) |

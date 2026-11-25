@@ -136,7 +136,8 @@ class FakeMonitoring:
 
     # ------------------------------------------------------------ HTTP
 
-    def handle(self, method: str, url: str, headers: dict, body: bytes | None):
+    def handle(self, method: str, url: str, headers: dict, body: bytes | None,
+               timeout: float = 10):
         u = urllib.parse.urlsplit(url)
         service = self._service(u)
         s = self._load()
@@ -307,6 +308,10 @@ class FakeMonitoring:
                                "visibility": "team_members", "alert_on_new_issue": True,
                                "alert_on_regression": True, "alert_on_unmute": True,
                                "retention_max_event_count": 10000})
+        m = re.fullmatch(r"projects/(\d+)/", path)
+        if m and method == "GET":
+            p = b["projects"].get(m.group(1))
+            return _json(200, self._project(p)) if p else _json(404, {"detail": "Not found."})
         if path == "teams/" and method == "GET":
             return _json(200, {"next": None, "previous": None,
                                "results": [{"id": BUGSINK_TEAM, "name": "team",

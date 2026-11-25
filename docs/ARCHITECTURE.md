@@ -110,6 +110,9 @@ logs = { days = 7, max = "200m", boxes = true, jobs = false }   # huta logs (the
 crashes = 11                   # Bugsink project id (huta crashes)
 adopt = "hello.example.org.caddy"   # moving a live site: its vhost file, replaced at the first release
 edge = { body = "1g", timeout = "10m" }   # v2: request body limit, upstream timeouts (unset: unchanged)
+# Monitoring hooks (docs/PLAN-monitoring.md; milestone 1 makes the remote resources only):
+monitor = { uptime = true, errors = true, analytics = true }   # jobs = true: planned
+matomo = 7                     # optional: adopt this Matomo site instead of creating one
 
 # v2: a gateway, a hostname for a service huta doesn't run (DESIGN-v2 §1). No slots, uid or repo.
 [targets.media]
@@ -169,6 +172,19 @@ syslog = false                 # true: also send each stored (redacted) line to 
 [crashes]                      # optional: Bugsink on this host, for huta crashes
 url = "http://127.0.0.1:8000"  # loopback only; token: secrets/_platform/BUGSINK_TOKEN
 host = "bugs.example.org"      # the Host header its ALLOWED_HOSTS accepts
+[monitoring]                   # optional: wire targets into services the operator runs
+prefix = "huta"                # remote names <prefix>_<project>_<target>[_<job>]
+[monitoring.healthchecks]      # token: secrets/_platform/HEALTHCHECKS_API_KEY
+url = "http://127.0.0.1:8000"  # management API: loopback http or https://<host>
+ping = "https://hc.example.org/ping"   # ping base; huta builds ping URLs from it
+host = ""                      # Host header for a loopback url (optional)
+channels = "*"                 # sent only when a check is created
+[monitoring.bugsink]           # API from [crashes]; token: BUGSINK_TOKEN (global, can create)
+dsn_host = "bugs.example.org"  # the host in DSNs; must resolve to public addresses
+team = "<team uuid>"           # the Bugsink team new projects belong to
+[monitoring.matomo]            # token: MATOMO_TOKEN (superuser, to create sites)
+url = "http://127.0.0.1:8081"
+host = "stats.example.org"
 [upstreams.vpn-exit]           # a host service containers may reach (opt-in per target)
 to = "127.0.0.1:1080"
 port = 4881                    # 4881..4899
@@ -178,8 +194,12 @@ Secrets live in `/etc/huta/secrets/` (root 0700), one file each. A value a dev b
 `secret`) waits in `secrets/<project>/.staged/<NAME>` until a release that uses it is approved
 (see "Secrets from a box" below). The platform ones are
 `_platform/GITHUB_TOKEN` (read-only) and `_platform/CLOUDFLARE_API_TOKEN` (Zone Read, DNS Edit,
-SSL and Certificates Edit, Zone Settings Edit, Config Rules Edit). Push boxes' registry
-passwords are `registry/<box>`.
+SSL and Certificates Edit, Zone Settings Edit, Config Rules Edit), and with `[monitoring]`
+`HEALTHCHECKS_API_KEY`, `BUGSINK_TOKEN`, `MATOMO_TOKEN`; set them with `huta secret set
+_platform <NAME>`. Push boxes' registry passwords are `registry/<box>`. huta writes two kinds
+itself: `<project>/HUTA_SENTRY_DSN_<TARGET>` (a target's Bugsink DSN) and
+`_monitor/CAPABILITIES` (healthchecks check ids, which work as ping capabilities; kept there so
+the redactor hides them in every process).
 
 **Setting up a host.** What a host needs besides huta itself (an amd64 KVM-class server with
 cgroup v2 and loop devices; Docker with the compose plugin; Caddy importing
@@ -291,6 +311,30 @@ content.
 - **Crash:** a dead huta leaves the container and the snapshot; the next diag of the target
   removes both (`docker rm -f` by name, `rm -rf` of `.diag-*`).
 
+## Monitoring (`monitor.py`)
+
+Built so far (docs/PLAN-monitoring.md milestone 1): the remote resources. The rest of the plan
+(env injection, job checks, the probe timer, the watch window, the ↩️ button) is *planned*.
+
+- `ensure` makes what a target's `monitor` grants, once, and finds it again by name
+  (`<prefix>_<project>_<target>`): a Bugsink project and its DSN (`errors`; `crashes = <id>`
+  adopts that project instead), a Matomo site for `https://<host>` (`analytics`; `matomo = <id>`
+  adopts), a healthchecks check fed by the uptime probe (`uptime`; the probe is planned).
+- It runs at planning time for `errors` and `analytics` (the kinds that will change the
+  container), and for everything with `huta monitor ensure`. One ensure on the host at a time
+  (`<state_dir>/monitor-ensure.lock`, outside `locks/`), 30 s for all its calls.
+- Calls: no proxy, no redirect, 10 s each with a wall-clock deadline, 8 MiB. Answers are
+  checked: ids by regex, exactly one remote resource per name (two is `ambiguous`, nothing is
+  guessed), the DSN must be `https://<32 hex>@<dsn_host>/<project id>`. healthchecks' returned
+  ping URL is never used; huta builds ping URLs from `ping` and the checked id. Matomo calls are
+  POST with the token in the body and `X-Forwarded-Proto: https` (Matomo with `force_ssl`
+  redirects plain loopback calls otherwise).
+- A failure is an event `monitor-fail` (kind and a short reason) and never fails a release.
+- Order and crashes: remote create → capability (check ids) → `monitors` row → DSN secret. A
+  crash after a create is healed by the next `find` (same name); a row whose DSN secret is
+  missing is repaired from the project id. A new check is created with `channels` (healthchecks
+  gives API-made checks no channels otherwise); later calls don't send it.
+
 ## Crash safety
 
 - Every vhost change is journaled (`/var/lib/huta/edge/*.pending` plus `.prev`), validated as
@@ -340,6 +384,8 @@ huta enroll <box> --from <ip> --pubkey '<key>'   push: add or update a box, prin
 huta revoke <box>                        push: remove a box
 huta client-bundle                       the client as a .tar.gz on stdout
 huta secret list|set|import|rm|discard <project> [NAME…] [--from <env file>]   set/import drop a staged value
+huta secret list|set|rm _platform [NAME]   the host's own tokens (never given to a container)
+huta monitor status|ensure <project> <target>   what is wired up / make what is missing
 huta data status|ensure|import|export <project> <target> [dir | path…]
 huta backup <project> <target>           consistent copy + ship (the timer runs it)
 huta job list|run <project> <target> [name]
@@ -623,7 +669,8 @@ The CLI `huta approve` remains the fallback.
 ## Not yet
 
 Unattended releases, plain (non-Cloudflare) TLS, read-only debug access for agents beyond what
-exists (`snapshot`), monitoring hooks, plain-HTTP egress.
+exists (`snapshot`), monitoring hooks beyond their remote resources (docs/PLAN-monitoring.md),
+plain-HTTP egress.
 
 v2 is built (`DESIGN-v2.md`, `BUILD-v2.md`): several containers per target, Postgres per
 target, migrations with schema versions (exclusive and online), gateways, and publishing to

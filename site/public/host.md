@@ -404,6 +404,30 @@ Targets with several components need the firewall fragment's `huta_intra` set (i
 `systemd/nftables-huta-egress.nft.example`; load it again if yours predates it, then
 `sudo huta egress sync`).
 
+Monitoring hooks (optional; only the remote resources are built so far, the rest is planned):
+if the human already runs healthchecks, Bugsink or Matomo, huta can make a check, a project or
+a site per target that asks for it (`monitor = { … }` in the registry). Each table is
+optional; leave out the services they don't run.
+
+```toml
+[monitoring]
+prefix = "huta"
+[monitoring.healthchecks]
+url = "http://127.0.0.1:8000"          # its API, loopback http or https://<host>
+ping = "https://hc.example.org/ping"   # its ping base
+[monitoring.bugsink]                   # needs [crashes]
+dsn_host = "bugs.example.org"          # the host in its DSNs (Bugsink's BASE_URL)
+team = "<team uuid>"
+[monitoring.matomo]
+url = "http://127.0.0.1:8081"
+host = "stats.example.org"
+```
+
+The human sets the tokens (a healthchecks project's read-write API key, Bugsink's token,
+a Matomo superuser token if huta should create sites): `sudo huta secret set _platform
+HEALTHCHECKS_API_KEY` (and `BUGSINK_TOKEN`, `MATOMO_TOKEN`); the value is read without echo.
+Check a target with `sudo huta monitor ensure <project> <target>`.
+
 ## 10. Verify
 
 ```sh

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS live (
 # The database's own version (PRAGMA user_version). Migrations run forward only, each in one
 # transaction; a database newer than this code is refused, never misread (DESIGN-v2 §0).
 # 0 = a database from before versioning, which is version 1's tables.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MIGRATIONS: dict[int, str] = {1: SCHEMA, 2: """
 ALTER TABLE releases ADD COLUMN images TEXT;
 ALTER TABLE releases ADD COLUMN schema INTEGER;
@@ -72,11 +72,26 @@ CREATE TABLE external_deploys (
   name TEXT NOT NULL, kind TEXT NOT NULL, release_id TEXT NOT NULL, deployment TEXT NOT NULL,
   previous TEXT, content TEXT, created REAL NOT NULL
 )
+""", 4: """
+CREATE TABLE monitors (
+  project TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+  remote_id TEXT NOT NULL, spec TEXT, state TEXT NOT NULL, updated REAL NOT NULL,
+  PRIMARY KEY (project, target, kind, name)
+);
+CREATE TABLE watches (
+  release_id TEXT NOT NULL, since REAL NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL,
+  opened REAL NOT NULL, until REAL NOT NULL, state TEXT NOT NULL, reasons TEXT,
+  coverage TEXT, signals TEXT, last_tick REAL, policy TEXT, notified TEXT,
+  button_hash TEXT, button_target TEXT, button_expires REAL, chat INTEGER, message_id INTEGER,
+  action TEXT, acked REAL, acked_by TEXT,
+  PRIMARY KEY (release_id, since)
+)
 """}
 # What each version added: 1, the v1 tables; 2, release image maps and schemas, resources
 # (a target's data volume or database, with its schema), restore points pinned per release,
 # and plans that are not releases (infra: edge, gateways, Postgres; restore); 3, deployments
-# published to Cloudflare by releases (DESIGN-v2 §5).
+# published to Cloudflare by releases (DESIGN-v2 §5); 4, monitoring: the remote checks, projects
+# and sites made for targets, and watch windows (docs/PLAN-monitoring.md).
 
 
 class StoreError(Exception):
@@ -270,6 +285,29 @@ class Store:
             raise RuntimeError(f"plan {pid} is {now['state'] if now else 'unknown'}, not {frm}")
         r = self.plan_row(pid)
         self.event(to, msg or to, pid, r["project"], r["target"])
+
+    # ---------------------------------------------------------------- monitors
+
+    def monitors(self, project: str, target: str | None = None) -> list:
+        if target is None:
+            return self.db.execute("SELECT * FROM monitors WHERE project=? ORDER BY target, kind,"
+                                   " name", (project,)).fetchall()
+        return self.db.execute("SELECT * FROM monitors WHERE project=? AND target=?"
+                               " ORDER BY kind, name", (project, target)).fetchall()
+
+    def monitor(self, project: str, target: str, kind: str, name: str):
+        return self.db.execute("SELECT * FROM monitors WHERE project=? AND target=? AND kind=?"
+                               " AND name=?", (project, target, kind, name)).fetchone()
+
+    def set_monitor(self, project: str, target: str, kind: str, name: str, remote_id: str,
+                    spec: dict | None, state: str = "active") -> None:
+        self.db.execute(
+            "INSERT INTO monitors (project, target, kind, name, remote_id, spec, state, updated)"
+            " VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(project, target, kind, name) DO UPDATE SET"
+            " remote_id=excluded.remote_id, spec=excluded.spec, state=excluded.state,"
+            " updated=excluded.updated",
+            (project, target, kind, name, remote_id,
+             json.dumps(spec, sort_keys=True) if spec is not None else None, state, time.time()))
 
     # ---------------------------------------------------------------- resources
 

@@ -24,7 +24,8 @@ volume with consistent backups shipped off the server, its own Postgres, schema 
 (exclusive or online, with restore points and restore plans), scheduled jobs, smoke checks with
 an automatic switch back, taking over a live site's vhost, gateways for services huta doesn't
 run, and publishing to Cloudflare Pages and Workers (`docs/DESIGN-v1.md`, `docs/DESIGN-v2.md`).
-Running in production on one host.
+Monitoring hooks (`docs/PLAN-monitoring.md`) are being built: the remote resources exist,
+the rest is planned. Running in production on one host.
 
 ## Ideas it's built on
 
@@ -56,6 +57,7 @@ src/huta/        the huta command (Python 3.11+, standard library only)
   egress.py      the egress daemon (CONNECT allowlist, upstreams) and its policy
   data.py        data volumes (loop-mounted ext4), consistent backups, import/export
   jobs.py        generated job and backup timers, running a job
+  monitor.py     monitoring hooks: healthchecks, Bugsink and Matomo clients, ensure (partly built)
   cli.py         commands
 examples/hello/  the smallest project: a static page in a ~14 MB image
 examples/notes/  every v1 feature on one small Python app
