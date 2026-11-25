@@ -93,6 +93,7 @@ class FakeHost:
         no_cf=True           Cloudflare's IP-range list can't be fetched
         old_phase=True       phase files lack the previous vhost (as an older huta wrote them)
         migrate_fail=True    the [migrate] command exits non-zero (after writing)
+        worker_dies=True     a new worker exits during its liveness window
         """
         f = self._load("faults")
         f.update(kw)
@@ -111,13 +112,16 @@ class FakeHost:
 
     # ------------------------------------------------------------ images
 
-    def add_image(self, project: str, sha: str) -> str:
+    def add_image(self, project: str, sha: str, name: str | None = None) -> str:
+        import hashlib
         d = self._load("docker")
-        iid = "sha256:" + (sha * 2)[:64]
+        iid = "sha256:" + (hashlib.sha256(f"{sha}/{name}".encode()).hexdigest() if name
+                           else (sha * 2)[:64])
+        labels = {"org.opencontainers.image.revision": sha, "run.huta.project": project}
+        if name:
+            labels["run.huta.image"] = name
         d["images"][iid] = {"Id": iid, "Architecture": "amd64", "Os": "linux",
-                            "Config": {"User": "10001", "Volumes": None, "Labels": {
-                                "org.opencontainers.image.revision": sha,
-                                "run.huta.project": project}}}
+                            "Config": {"User": "10001", "Volumes": None, "Labels": labels}}
         self._save("docker", d)
         return iid
 
@@ -182,41 +186,58 @@ class FakeHost:
     def _compose(self, d, args):
         project = args[args.index("-p") + 1]
         doc = json.loads(Path(args[args.index("-f") + 1]).read_text())
-        verb, svc = args[args.index("-f") + 2], args[-1]
-        mine = [cid for cid, c in d["containers"].items()
-                if c["labels"].get("com.docker.compose.project") == project and c["service"] == svc]
+        verb = args[args.index("-f") + 2]
+        svcs = [a for a in args[args.index("-f") + 3:] if a.startswith("slot-")]
+        assert svcs, args
         if verb == "stop":
-            for cid in mine:
-                d["containers"][cid]["running"] = False
-                d["containers"][cid]["stopped_by_user"] = True
+            for svc in svcs:
+                for c in d["containers"].values():
+                    if c["labels"].get("com.docker.compose.project") == project and c["service"] == svc:
+                        c["running"], c["stopped_by_user"] = False, True
             self._save("docker", d)
-            self._op(f"compose stop {svc}")
+            self._op(f"compose stop {' '.join(svcs)}")
             return ""
         assert verb == "up" and "--no-deps" in args and "--pull" in args, args
-        spec = doc["services"][svc]
-        # Recreate as compose does: the old container is removed, then the new one created and
-        # started (separate steps; a crash can fall between them).
-        for cid in mine:
-            del d["containers"][cid]
-        if mine:
+        for svc in svcs:
+            d = self._load("docker")
+            spec = doc["services"][svc]
+            mine = [cid for cid, c in d["containers"].items()
+                    if c["labels"].get("com.docker.compose.project") == project and c["service"] == svc]
+            # Recreate as compose does: the old container is removed, then the new one created
+            # and started (separate steps; a crash can fall between them).
+            for cid in mine:
+                del d["containers"][cid]
+            if mine:
+                self._save("docker", d)
+                self._op(f"compose removed {svc}")
+            cid = f"c{d['next']:04d}"
+            d["next"] += 1
+            worker = spec.get("restart") == "no"
+            dies = worker and self._faults().get("worker_dies")
+            d["containers"][cid] = {
+                "service": svc, "image": spec["image"], "running": not dies,
+                "stopped_by_user": False, "restart": spec.get("restart", "no"), "worker": worker,
+                "labels": {**spec["labels"], "com.docker.compose.project": project},
+                "port": int(spec["ports"][0].split(":")[1]) if spec.get("ports") else None,
+                "data": bool(spec.get("volumes"))}
             self._save("docker", d)
-            self._op(f"compose removed {svc}")
-        cid = f"c{d['next']:04d}"
-        d["next"] += 1
-        d["containers"][cid] = {
-            "service": svc, "image": spec["image"], "running": True, "stopped_by_user": False,
-            "restart": spec.get("restart", "no"),
-            "labels": {**spec["labels"], "com.docker.compose.project": project},
-            "port": int(spec["ports"][0].split(":")[1]), "data": bool(spec.get("volumes"))}
-        self._save("docker", d)
-        self._started(cid)
-        self._op(f"compose up {svc}")
+            if not dies:
+                self._started(cid)
+            self._op(f"compose up {svc}")
         return ""
 
     def _started(self, cid):
-        """A data container writes at once; a second running writer is an overlap."""
+        """A data container writes at once; a second running writer is an overlap. A worker
+        starting while another copy of it runs is a worker overlap."""
         d = self._load("docker")
         c = d["containers"][cid]
+        comp = c["labels"].get("run.huta.component")
+        if comp and any(o["running"] and o["labels"].get("run.huta.component") == comp
+                        and o.get("worker") and ocid != cid
+                        and o["labels"]["run.huta.target"] == c["labels"]["run.huta.target"]
+                        for ocid, o in d["containers"].items()):
+            d.setdefault("worker_overlaps", []).append(comp)
+            self._save("docker", d)
         if not c.get("data"):
             return
         key = c["labels"]["run.huta.project"] + "/" + c["labels"]["run.huta.target"]
@@ -224,6 +245,7 @@ class FakeHost:
         e = v.setdefault(key, {"writes": [], "copy": None, "overlaps": []})
         others = [o["labels"]["run.huta.sha"] for ocid, o in d["containers"].items()
                   if ocid != cid and o["running"] and o.get("data")
+                  and o["labels"]["run.huta.sha"] != c["labels"]["run.huta.sha"]
                   and o["labels"]["run.huta.target"] == c["labels"]["run.huta.target"]
                   and o["labels"]["run.huta.project"] == c["labels"]["run.huta.project"]]
         if others:
@@ -254,10 +276,12 @@ class FakeHost:
                 and c["labels"].get("run.huta.project") == t.project]
 
     def running(self, t) -> dict[str, str]:
-        """slot -> sha of each running container of a target (two for one slot: an error)."""
+        """slot -> sha of each running public container of a target (two for one slot: an
+        error)."""
         out = {}
         for c in self.containers(t):
-            if c["running"]:
+            public = "run.huta.component" not in c["labels"] or c["labels"].get("run.huta.public")
+            if c["running"] and public:
                 slot = c["labels"]["run.huta.slot"]
                 assert slot not in out, f"two running containers claim slot {slot}"
                 out[slot] = c["labels"]["run.huta.sha"]
@@ -320,6 +344,15 @@ class FakeHost:
             if c["running"] and c["port"] == port:
                 return c
         return None
+
+    def component_address(self, t, slot, cid):
+        return f"cid:{cid}"
+
+    def wait_health_at(self, host, port, path, sha, timeout=30):
+        c = self._load("docker")["containers"].get(host.removeprefix("cid:"))
+        if not c or not c["running"] or c["labels"]["run.huta.sha"] != sha \
+                or self._faults().get("unhealthy") == sha:
+            raise recipe.RecipeError(f"{host}:{port}{path} never reported {sha[:12]}")
 
     def wait_health(self, port, path, sha, timeout=30):
         c = self._serving(port)
@@ -473,6 +506,8 @@ class FakeHost:
             patch(recipe, "sh", self.sh)
             patch(recipe, "time", _FAST_TIME)
             patch(recipe, "wait_health", self.wait_health)
+            patch(recipe, "wait_health_at", self.wait_health_at)
+            patch(recipe, "component_address", self.component_address)
             patch(recipe, "public_check", self.public_check)
             patch(recipe, "smoke", lambda *a, **k: [])
             patch(recipe, "_egress_sync", noop)
@@ -516,13 +551,19 @@ class FakeHost:
 
     def plan(self, project, t, app: dict, sha: str) -> str:
         """An approved release, as cli.cmd_approve leaves it for recipe.run."""
-        iid = self.add_image(project.name, sha)
+        from huta import spec as SP
+        if len(app["images"]) > 1 or SP.several(app):
+            imgs = {n: self.add_image(project.name, sha, n) for n in app["images"]}
+            iid = imgs[SP.public(app)["image"]]
+        else:
+            iid = self.add_image(project.name, sha)
+            imgs = {next(iter(app["images"])): iid}
         st = self.store()
         try:
             rid = st.new_release(project=project.name, target=t.name, sha=sha, image_id=iid,
                                  image_tag=f"huta-build/{project.name}:{sha[:12]}",
                                  app_toml=json.dumps(app), plan={}, plan_hash="0" * 64,
-                                 built_by="test")
+                                 built_by="test", images=imgs)
             st.transition(rid, S.PLANNED, S.APPROVED)
         finally:
             st.db.close()

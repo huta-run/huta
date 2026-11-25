@@ -239,6 +239,10 @@ class Target:
     gateway: dict | None = None                      # {"to": "ip:port", "secret": NAME, "header": H}
     edge: dict = field(default_factory=dict)         # {"body": bytes, "timeout": "10m"}
     health_timeout: int = 30                         # seconds a new slot has to report healthy
+    # Several containers (DESIGN-v2 §3): per component limits, env and secrets; how long a new
+    # worker must stay up after the switch.
+    components: dict = field(default_factory=dict)
+    worker_liveness: int = 10
     migrate_secrets: list = field(default_factory=list)   # the only secrets [migrate] gets
 
     @property
@@ -367,6 +371,45 @@ def load_platform(etc: Path = ETC) -> Platform:
         caddy_secrets=Path(p.get("caddy_secrets", "/etc/caddy/huta-secrets")),
         caddy_group=_caddy_group(p.get("caddy_group", "caddy")),
     )
+
+
+def _components_cfg(v, target_env: dict, where: str) -> dict:
+    """[targets.<t>.components.<c>]: limits, env and secrets for one component. The target's
+    own secrets reach only its public component; others get only what is named here."""
+    if not isinstance(v, dict) or len(v) > 8:
+        raise ConfigError(f"{where}: components = {{ <name> = {{ limits, env, secrets }} }}")
+    out = {}
+    for name, c in v.items():
+        w = f"{where} components.{name}"
+        if not NAME_RE.match(name) or not isinstance(c, dict) or set(c) - {"limits", "env", "secrets"}:
+            raise ConfigError(f"{w}: accepts limits, env and secrets")
+        limits = c.get("limits", {})
+        if not isinstance(limits, dict) or set(limits) - {"memory", "cpus", "pids", "tmp"}:
+            raise ConfigError(f"{w}: limits accepts memory, cpus, pids, tmp")
+        if "tmp" in limits:
+            size_bytes(limits["tmp"], f"{w} limits.tmp", 1 << 20, 4 << 30)
+        env = c.get("env", {})
+        if not isinstance(env, dict) or not all(isinstance(x, str) and len(x) <= 4096
+                                                and "\n" not in x and "\0" not in x
+                                                for x in env.values()):
+            raise ConfigError(f"{w}: env values must be one-line strings")
+        for k in env:
+            _env_name(k, f"{w} env")
+        secrets = c.get("secrets", [])
+        if not isinstance(secrets, list) or len(set(secrets)) != len(secrets):
+            raise ConfigError(f"{w}: secrets must be a list of names")
+        for k in secrets:
+            _env_name(k, f"{w} secrets")
+            if k in env or k in target_env:
+                raise ConfigError(f"{w}: {k} is both in env and secrets")
+        out[name] = {"limits": dict(limits), "env": dict(env), "secrets": list(secrets)}
+    return out
+
+
+def _worker_liveness(v, where: str) -> int:
+    if type(v) is not int or not 1 <= v <= 300:
+        raise ConfigError(f"{where}: worker_liveness must be 1..300 seconds")
+    return v
 
 
 def _health_timeout(v, where: str) -> int:
@@ -728,7 +771,8 @@ def load_project(name: str, etc: Path = ETC) -> Project:
         unknown = set(t) - {"hosts", "slots", "egress", "approve", "cloudflare", "limits",
                             "require_ci", "keep_releases", "drain", "env", "secrets",
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
-                            "crashes", "kind", "edge", "health_timeout", "migrate_secrets"}
+                            "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
+                            "components", "worker_liveness"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -802,6 +846,8 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             crashes=_crash_id(t.get("crashes"), tw), edge=edge_cfg,
             health_timeout=_health_timeout(t.get("health_timeout", 30), tw),
             migrate_secrets=_migrate_secrets(t.get("migrate_secrets", []), secrets, tw),
+            components=_components_cfg(t.get("components", {}), env, tw),
+            worker_liveness=_worker_liveness(t.get("worker_liveness", 10), tw),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -870,7 +916,10 @@ def zone_for(host: str, platform: Platform) -> str:
 
 APP_KEYS = {"schema", "project", "order", "build", "images", "components", "state",
             "preflight", "smoke", "jobs", "external", "diag", "migrate"}
-COMPONENT_KEYS = {"image", "kind", "port", "health", "data", "concurrent_safe", "upstream_api"}
+COMPONENT_KEYS = {"image", "kind", "port", "health", "data", "concurrent_safe", "upstream_api",
+                  "public", "cmd"}
+MAX_COMPONENTS = 8
+RESERVED_COMPONENTS = {"postgres", "huta-egress"}   # names other containers answer to
 
 
 def parse_app_toml(text: str, project: str) -> dict:
@@ -897,8 +946,8 @@ def parse_app_toml(text: str, project: str) -> dict:
     if not isinstance(order, list) or sorted(order) != sorted(comps) or len(set(order)) != len(order):
         raise ConfigError("app.toml: top-level 'order' must list every component exactly once")
     # Implemented exactly this much; anything more is refused, not ignored (codex #13).
-    if len(comps) != 1:
-        raise ConfigError("app.toml: huta supports exactly one component")
+    if len(comps) > MAX_COMPONENTS:
+        raise ConfigError(f"app.toml: at most {MAX_COMPONENTS} components")
     for key in ("preflight", "external"):
         if d.get(key):
             raise ConfigError(f"app.toml: '{key}' is not supported by huta yet")
@@ -906,8 +955,22 @@ def parse_app_toml(text: str, project: str) -> dict:
     if st_kind not in ("none", "data"):
         raise ConfigError("app.toml: state.kind must be \"none\" or \"data\"")
     for cname, c in comps.items():
-        if c.get("kind", "http") != "http":
-            raise ConfigError(f"app.toml: components.{cname}: kind = \"http\" only")
+        kind = c.get("kind", "http")
+        if kind not in ("http", "worker"):
+            raise ConfigError(f"app.toml: components.{cname}: kind is \"http\" or \"worker\"")
+        if cname in RESERVED_COMPONENTS:
+            raise ConfigError(f"app.toml: components.{cname}: that name is reserved")
+        if not isinstance(c.get("public", False), bool):
+            raise ConfigError(f"app.toml: components.{cname}.public must be true or false")
+        if kind == "worker" and ({"port", "health", "public"} & set(c)):
+            raise ConfigError(f"app.toml: components.{cname} is a worker: no port, health or "
+                              "public (it serves nothing)")
+        if "cmd" in c:
+            cmd = c["cmd"]
+            if not isinstance(cmd, list) or not 1 <= len(cmd) <= 64 or not all(
+                    isinstance(a, str) and 0 < len(a) <= 1000 and "\0" not in a for a in cmd):
+                raise ConfigError(f"app.toml: components.{cname}.cmd must be an argv list "
+                                  "(no shell)")
         if c.get("upstream_api"):
             raise ConfigError(f"app.toml: components.{cname}.upstream_api is not supported yet")
         data = c.get("data")
@@ -918,17 +981,26 @@ def parse_app_toml(text: str, project: str) -> dict:
                     or ".." in data or data.rstrip("/") in RESERVED_MOUNTS:
                 raise ConfigError(f"app.toml: components.{cname}.data must be an absolute path "
                                   "like /data (not a system directory)")
-        elif st_kind == "data":
-            raise ConfigError(f"app.toml: [state] kind = \"data\" needs components.{cname}.data")
         if not isinstance(c.get("concurrent_safe", False), bool):
             raise ConfigError(f"app.toml: components.{cname}.concurrent_safe must be true or false")
+    if st_kind == "data" and not any(c.get("data") for c in comps.values()):
+        name = order[0] if len(order) == 1 else "<name>"
+        raise ConfigError(f"app.toml: [state] kind = \"data\" needs components.{name}.data")
+    http = [n for n in order if comps[n].get("kind", "http") == "http"]
+    marked = [n for n in order if comps[n].get("public") is True]
+    if len(marked) > 1 or not http or (not marked and len(http) != 1):
+        raise ConfigError("app.toml: exactly one HTTP component is public: mark it public = true "
+                          "(not needed when there is only one)")
     d["smoke"] = _smoke(d.get("smoke", []))
     d["jobs"] = _jobs(d.get("jobs", []))
+    for j in d["jobs"]:
+        if "component" in j and j["component"] not in comps:
+            raise ConfigError(f"app.toml: job {j['name']}: no component {j['component']!r}")
     d["diag"] = _diag(d.get("diag", []))
     # Nested tables are strict too (site review: [images.*], [state], [build] were unchecked).
     imgs = d.get("images", {})
-    if not isinstance(imgs, dict) or len(imgs) != 1:
-        raise ConfigError("app.toml: huta needs exactly one [images.<name>] table")
+    if not isinstance(imgs, dict) or not 1 <= len(imgs) <= MAX_COMPONENTS:
+        raise ConfigError(f"app.toml: huta needs 1..{MAX_COMPONENTS} [images.<name>] tables")
     for iname, img in imgs.items():
         if not NAME_RE.match(iname) or not isinstance(img, dict):
             raise ConfigError(f"app.toml: bad image table {iname!r}")
@@ -1102,8 +1174,11 @@ def _jobs(items) -> list[dict]:
     for i, j in enumerate(items):
         w = f"app.toml: jobs[{i}]"
         if not isinstance(j, dict) or set(j) - {"name", "cmd", "schedule", "timeout",
-                                                "after_release"}:
-            raise ConfigError(f"{w}: keys are name, cmd, schedule, timeout, after_release")
+                                                "after_release", "component"}:
+            raise ConfigError(f"{w}: keys are name, cmd, schedule, timeout, after_release, "
+                              "component")
+        if "component" in j and not (isinstance(j["component"], str) and NAME_RE.match(j["component"])):
+            raise ConfigError(f"{w}: component must be a component name")
         name = j.get("name")
         if not isinstance(name, str) or not NAME_RE.match(name) or name in names:
             raise ConfigError(f"{w}: name must be a unique lowercase name")
@@ -1126,5 +1201,7 @@ def _jobs(items) -> list[dict]:
             # Only when set: a plan made before this key existed compares equal to one without
             # it, so an upgrade alone doesn't mark every release as changing its jobs.
             job["after_release"] = True
+        if "component" in j:
+            job["component"] = j["component"]     # only when set, as after_release
         out.append(job)
     return out

@@ -27,7 +27,7 @@ Rules for every milestone:
 | 0c | Records v2, resources, restore points, plans table, phase v2, edge plans | built |
 | 1 | Gateways, `edge` knobs on every vhost | built |
 | 2 | Migrations, exclusive mode; `health_timeout`; restore plans | built |
-| 3 | Several containers per target; images map | planned |
+| 3 | Several containers per target; images map | built |
 | 4 | Postgres per target | planned |
 | 5 | External publishing (Pages, Workers) | planned |
 | 6 | Migrations, online mode | planned |

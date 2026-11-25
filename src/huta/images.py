@@ -22,7 +22,9 @@ from pathlib import Path
 
 from .recipe import RecipeError, image_facts, sh
 
-BUILD_REF_RE = r"^huta-build/{project}:[0-9a-f]{{12}}$"
+# huta-build/<project>:<sha12>, or huta-build/<project>/<image>:<sha12> for the further images
+# of a project with several (DESIGN-v2 §3).
+BUILD_REF_RE = r"^huta-build/{project}(/[a-z][a-z0-9-]{{0,30}})?:[0-9a-f]{{12}}$"
 MAX_ARCHIVE = 2 * 1024 ** 3
 MAX_MEMBERS = 20000
 MAX_META = 4 * 1024 ** 2
@@ -149,7 +151,8 @@ def _strip_names(src: Path, dst: Path) -> set[str]:
 def import_from_dev(project: str, ref: str, state_dir: Path, container: str = "dev") -> tuple[str, str, str]:
     """Returns (image id, huta tag, claimed sha)."""
     if not re.match(BUILD_REF_RE.format(project=re.escape(project)), ref):
-        raise RecipeError(f"dev image must be named huta-build/{project}:<12 hex>, got {ref!r}")
+        raise RecipeError(f"dev image must be named huta-build/{project}[/<image>]:<12 hex>, "
+                          f"got {ref!r}")
     inc = _incoming(state_dir)
     token = secrets.token_hex(6)
     raw, clean = inc / f"{token}.tar", inc / f"{token}.clean.tar"
@@ -219,7 +222,7 @@ def import_from_registry(project: str, ref: str, digest: str, registry: str) -> 
     registry is mutable; the digest is not), then name it in huta's namespace and drop the
     registry name. Returns (image id, huta tag, claimed sha)."""
     if not re.match(BUILD_REF_RE.format(project=re.escape(project)), ref):
-        raise RecipeError(f"image must be named huta-build/{project}:<12 hex>, got {ref!r}")
+        raise RecipeError(f"image must be named huta-build/{project}[/<image>]:<12 hex>, got {ref!r}")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise RecipeError("bad digest")
     repo = f"{registry}/{ref.split(':')[0]}"

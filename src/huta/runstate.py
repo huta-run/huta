@@ -158,7 +158,10 @@ def runtime_text(platform: Platform, st, project: Project, t: Target) -> str:
         sha = labels.get("run.huta.sha", "")
         rid = _release_of(st, t, sha, c.get("Created", "")) or "-"
         role = "live" if live and live["slot"] == slot else "idle"
-        lines.append(f"slot {slot} ({role}): release {rid} sha {sha[:12]} · {s.get('Status', '?')}"
+        comp = labels.get("run.huta.component", "")
+        public = not comp or labels.get("run.huta.public") == "1"
+        lines.append(f"slot {slot}{' ' + comp if comp else ''} ({role}): release {rid} "
+                     f"sha {sha[:12]} · {s.get('Status', '?')}"
                      f" · started {_since(s.get('StartedAt', ''))}"
                      f" · restarts {c.get('RestartCount', 0)}"
                      + (f" · last exit {s.get('ExitCode')} at {_since(s.get('FinishedAt', ''))}"
@@ -167,7 +170,7 @@ def runtime_text(platform: Platform, st, project: Project, t: Target) -> str:
         if s.get("Running"):
             d = cgroup_dir(c.get("Id", ""), s.get("Pid"))
             lines += [f"  {x}" for x in (usage(d) if d else ["cgroup not found"])]
-        if role == "live" and s.get("Running"):
+        if role == "live" and s.get("Running") and public:
             rel = st.release(live["release_id"])
             app = json.loads(rel["app_toml"])
             health = SP.health(app)

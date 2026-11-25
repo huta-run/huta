@@ -111,8 +111,8 @@ timeout = "10m"
 | `schema` | int | required, must be `1` |
 | `project` | string | required; must equal the project name in the host registry |
 | `order` | array of strings | required; every component exactly once, no duplicates |
-| `images` | table of tables | required; exactly one `[images.<name>]` |
-| `components` | table of tables | required; exactly one component |
+| `images` | table of tables | required; 1..8 `[images.<name>]` |
+| `components` | table of tables | required; 1..8 components, exactly one of them the public HTTP one (below) |
 | `state` | table | optional; `kind` (`"none"` default, or `"data"`), and with data `schema` and `runs_on` (below) |
 | `migrate` | table | optional; a migration this release runs before its code starts (below) |
 | `build` | table | optional; only `test` (accepted; `huta pack` does not run it yet) |
@@ -139,13 +139,60 @@ Name: `^[a-z][a-z0-9-]{0,30}$`. Only these keys:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `image` | string | | required: must name the `[images.<name>]` table |
-| `kind` | string | `"http"` | `"http"` only |
+| `image` | string | | required: must name one of the `[images.<name>]` tables |
+| `kind` | string | `"http"` | `"http"`, or `"worker"` (serves nothing: no `port`, `health` or `public`) |
+| `public` | bool | `false` | the component the site routes to; needed only when there is more than one HTTP component |
+| `cmd` | array of strings | | the command (argv, no shell) instead of the image's own; the image's entrypoint still applies |
 | `port` | int | `8080` | 1..65535; the port your server listens on **inside** the container, on `0.0.0.0` |
 | `health` | string | `"/healthz"` | must match `^/[A-Za-z0-9/_.-]*$` |
-| `data` | string | | with `state.kind = "data"`: the absolute mount path, `^/[a-z0-9][a-z0-9/_.-]*$`, not a system directory (`/etc`, `/tmp`, `/usr`, …). Required with `kind = "data"`, refused without it |
+| `data` | string | | with `state.kind = "data"`: the absolute mount path, `^/[a-z0-9][a-z0-9/_.-]*$`, not a system directory (`/etc`, `/tmp`, `/usr`, …). Only components that name it get the volume; with `kind = "data"` at least one must, without it none may |
 | `concurrent_safe` | bool | `false` | `true`: two releases may run on the same data at once. It only takes effect when the host allows it too (`data.concurrent` in the registry) |
 | `upstream_api` | string | | must be absent or empty (*planned*) |
+
+### Several components
+
+A target can run up to 8 components from up to 8 images: a web front, an API, a worker.
+
+```toml
+order = ["web", "api", "worker"]          # start order
+
+[images.web]
+dockerfile = "web/Dockerfile"
+[images.api]
+dockerfile = "api/Dockerfile"
+
+[components.web]
+image = "web"
+public = true                             # the site routes here
+[components.api]
+image = "api"
+port = 8081
+data = "/data"
+[components.worker]
+image = "api"
+kind = "worker"
+cmd = ["python", "-m", "app.worker"]
+data = "/data"
+```
+
+- **A slot is the whole set.** Slot a is web + api + worker of one release, on its own network:
+  the components reach each other by name (`http://api:8081`). The other slot's release can't
+  reach them. The switch moves everything at once, so versions never mix.
+- Only the public component is published (on the slot's loopback port, as with one component).
+  Every other HTTP component must answer its `health` path with `ok` and the sha too; the host
+  checks it on its slot address before the switch.
+- **Workers are single.** A new release's workers start only after the switch and the public
+  checks, once the old release's workers have stopped. They must still be running after the
+  host's `worker_liveness` (default 10 s); otherwise the release goes back (when the old slot is
+  still there) or ends `needs-human`.
+- One writer is per volume: every component that mounts the data counts. Two releases overlap
+  only if all of them are `concurrent_safe` and the host allows it.
+- The host's secrets reach the public component; other components get only what the registry
+  names for them (`[targets.<t>.components.<c>]`). Jobs and diagnostics take
+  `component = "<name>"` (default: the public one) for their image and mount.
+- `huta pack` builds every image (each labelled `run.huta.image=<name>`); the public
+  component's image keeps the name `huta-build/<project>:<sha12>`, the others are
+  `huta-build/<project>/<image>:<sha12>`. `huta submit` sends them all.
 
 ### `[state]`
 
@@ -401,6 +448,8 @@ see each other: the box is the unit huta can tell apart.
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
+| `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
+| `worker_liveness` | int | `10` | 1..300 seconds a new worker must stay up after the switch |
 | `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |
 | `kind` | string | `"app"` | `"gateway"`: a hostname huta proxies to a service it doesn't run (below) |
 

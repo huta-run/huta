@@ -72,6 +72,32 @@ def service(slot: str) -> str:
     return f"slot-{slot}"   # independent of component names (codex #4)
 
 
+# Several components (DESIGN-v2 §3): a slot is a set of containers on its own network (ICC on,
+# component names as aliases); the two slots never share one. A one-component target keeps
+# slot-a/slot-b on the shared network above, unchanged.
+
+def slot_network_name(t: Target, slot: str) -> str:
+    return f"{compose_name(t)}_{slot}{NET_GEN}"
+
+
+def slot_bridge_name(t: Target, slot: str) -> str:
+    return "dp-" + hashlib.sha1(f"{t.project}/{t.name}/{NET_GEN}/{slot}".encode()).hexdigest()[:12]
+
+
+def network_names(t: Target) -> list[str]:
+    """Every network a target's containers may be on (egress learns their subnets)."""
+    return [network_name(t), slot_network_name(t, "a"), slot_network_name(t, "b")]
+
+
+def services(app: dict, slot: str, which: str = "all") -> list[str]:
+    """Compose service names of a slot: all, "serving" (started before the switch) or
+    "workers" (started after it)."""
+    if not SP.several(app):
+        return [] if which == "workers" else [service(slot)]
+    names = {"all": app["order"], "serving": SP.serving(app), "workers": SP.workers(app)}[which]
+    return [f"slot-{slot}-{c}" for c in names]
+
+
 # ------------------------------------------------------------------ images
 
 def image_facts(ref: str) -> dict:
@@ -131,12 +157,19 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
             **({"schema": app["state"]["schema"], "runs_on": app["state"]["runs_on"]}
                if (app.get("state") or {}).get("schema") else {}),
             "compose": compose_doc(platform, project, t, app,
-                                   {s: ("<image>", "<sha>") for s in SLOTS}, with_secrets=False)}
+                                   {s: ({n: f"<image {n}>" for n in app["images"]}
+                                        if SP.several(app) else "<image>", "<sha>")
+                                    for s in SLOTS}, with_secrets=False),
+            **({"components": {n: t.components.get(n, {}) for n in app["order"]},
+                "worker_liveness": t.worker_liveness} if SP.several(app) else {})}
 
 
 def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
                 images: dict[str, tuple[str, str]], with_secrets: bool = True) -> dict:
-    """images: slot -> (image id, sha). Generated from the schema; repo compose is never used."""
+    """images: slot -> (image id, sha); with several components slot -> ({image name: id}, sha).
+    Generated from the schema; repo compose is never used."""
+    if SP.several(app):
+        return _compose_several(platform, project, t, app, images, with_secrets)
     comp = SP.public(app)
     mount = R.data_mount(app)
     services = {}
@@ -181,6 +214,58 @@ def compose_doc(platform: Platform, project: Project, t: Target, app: dict,
     }
 
 
+def _compose_several(platform: Platform, project: Project, t: Target, app: dict,
+                     images: dict, with_secrets: bool) -> dict:
+    public = SP.public_name(app)
+    services_ = {}
+    networks = {}
+    for slot, port in zip(SLOTS, t.slots):
+        image_map, sha = images[slot]
+        net = f"{slot}{NET_GEN}"
+        networks[net] = {
+            "name": slot_network_name(t, slot),
+            # ICC on: a slot's components talk to each other by name. The slots' networks are
+            # separate, so an old and a new release never reach each other.
+            "driver_opts": {"com.docker.network.bridge.name": slot_bridge_name(t, slot),
+                            "com.docker.network.bridge.enable_icc": "true"}}
+        for cname in app["order"]:
+            c = app["components"][cname]
+            worker = c.get("kind", "http") == "worker"
+            reg = t.components.get(cname, {})
+            svc = {
+                # The other slot may hold an older release with other images; its definition
+                # here is only used if huta recreates it, which an abort does from its own app.
+                "image": (image_map.get(c["image"], next(iter(image_map.values())))
+                          if isinstance(image_map, dict) else image_map),
+                "pull_policy": "never",
+                **R.hardening(project, t, reg.get("limits") or None),
+                # A new worker gets restart "no" until it has stayed up through its liveness
+                # window after the switch; huta then sets unless-stopped.
+                "restart": "no" if worker else "unless-stopped",
+                "stop_grace_period": "10s",
+                "logging": L.SLOT_LOGGING,
+                "environment": R.compose_escape(R.component_environment(
+                    platform, project, t, sha, slot, cname, cname == public, with_secrets)),
+                "labels": {"run.huta.project": project.name, "run.huta.target": t.name,
+                           "run.huta.slot": slot, "run.huta.sha": sha,
+                           "run.huta.component": cname,
+                           **({"run.huta.public": "1"} if cname == public else {})},
+                "networks": {net: {"aliases": [cname]}},
+            }
+            if cname == public:
+                svc["ports"] = [f"127.0.0.1:{port}:{int(c.get('port', 8080))}"]
+            if c.get("cmd"):
+                svc["command"] = list(c["cmd"])
+            if R.needs_gateway(t):
+                svc["extra_hosts"] = [f"{R.EGRESS_HOST}:host-gateway"]
+            if c.get("data"):
+                _img, where = R.data_paths(platform, t)
+                svc["volumes"] = [{"type": "bind", "source": str(where), "target": c["data"],
+                                   "bind": {"create_host_path": False}}]
+            services_[f"slot-{slot}-{cname}"] = svc
+    return {"name": compose_name(t), "services": services_, "networks": networks}
+
+
 def compose_file(platform: Platform, t: Target) -> Path:
     d = platform.state_dir / "compose" / t.project / t.name
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -198,12 +283,13 @@ def compose(platform: Platform, t: Target, *args: str) -> str:
     return sh(["docker", "compose", "-p", compose_name(t), "-f", str(compose_file(platform, t)), *args])
 
 
-def slot_containers(t: Target) -> dict[str, dict]:
-    """What Docker actually runs for this target, by slot."""
+def slot_members(t: Target) -> dict[str, dict[str, dict]]:
+    """What Docker actually runs for this target: slot -> component -> container. A container
+    without a component label (a one-component target) is keyed "" (DESIGN-v2 §3)."""
     ids = sh(["docker", "ps", "-aq", "--no-trunc",
               "--filter", f"label=run.huta.project={t.project}",
               "--filter", f"label=run.huta.target={t.name}"]).split()
-    res = {}
+    res: dict[str, dict[str, dict]] = {}
     if not ids:
         return res
     for c in json.loads(sh(["docker", "inspect", *ids])):
@@ -211,13 +297,23 @@ def slot_containers(t: Target) -> dict[str, dict]:
         if labels.get("com.docker.compose.project") != compose_name(t):
             continue  # same labels but another compose project: not ours to manage
         slot = labels.get("run.huta.slot")
-        if slot in SLOTS:
-            running = bool((c.get("State") or {}).get("Running"))
-            if slot in res and res[slot]["running"] and not running:
-                continue   # two containers claim the slot: the running one is what matters
-            res[slot] = {"id": c["Id"], "running": running,
-                         "image": c.get("Image"), "sha": labels.get("run.huta.sha")}
+        if slot not in SLOTS:
+            continue
+        comp = labels.get("run.huta.component", "")
+        running = bool((c.get("State") or {}).get("Running"))
+        have = res.setdefault(slot, {}).get(comp)
+        if have and have["running"] and not running:
+            continue   # two containers claim the place: the running one is what matters
+        res[slot][comp] = {"id": c["Id"], "running": running, "image": c.get("Image"),
+                           "sha": labels.get("run.huta.sha"), "component": comp,
+                           "public": not comp or labels.get("run.huta.public") == "1"}
     return res
+
+
+def slot_containers(t: Target) -> dict[str, dict]:
+    """The public container of each slot (what the vhost routes to)."""
+    return {slot: next(c for c in m.values() if c["public"])
+            for slot, m in slot_members(t).items() if any(c["public"] for c in m.values())}
 
 
 # ------------------------------------------------------------------ health
@@ -257,18 +353,33 @@ def _get_json(url: str, timeout: float, headers=None) -> dict:
 
 def wait_health(port: int, path: str, sha: str, timeout: float = 30) -> None:
     """The image is untrusted: no redirects, capped body, a real total deadline (codex #12)."""
+    wait_health_at("127.0.0.1", port, path, sha, timeout)
+
+
+def component_address(t: Target, slot: str, cid: str) -> str:
+    """A container's address on its slot network: how the host checks an internal component
+    (it has no published port; DESIGN-v2 §3)."""
+    d = json.loads(sh(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", cid]))
+    net = (d or {}).get(slot_network_name(t, slot)) or {}
+    ip = net.get("IPAddress")
+    if not ip:
+        raise RecipeError(f"container {cid[:12]} has no address on {slot_network_name(t, slot)}")
+    return ip
+
+
+def wait_health_at(host: str, port: int, path: str, sha: str, timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     last = "no answer"
     while (left := deadline - time.monotonic()) > 0:
         try:
-            body = _get_json(f"http://127.0.0.1:{port}{path}", min(3, left))
+            body = _get_json(f"http://{host}:{port}{path}", min(3, left))
             if body.get("ok") is True and body.get("sha") == sha:
                 return
             last = f"reports ok={body.get('ok')!r} sha={str(body.get('sha'))[:12]}"
         except Exception as e:  # noqa: BLE001 — any failure is "not ready yet"
             last = type(e).__name__
         time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-    raise RecipeError(f"127.0.0.1:{port}{path} never reported {sha[:12]} ({last})")
+    raise RecipeError(f"{host}:{port}{path} never reported {sha[:12]} ({last})")
 
 
 SMOKE_BODY = 1 << 20
@@ -530,10 +641,10 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         # then the routed slot starts below. A migration that may still run goes first.
         if phase.get("migrated") or phase.get("stage") in ("migrating", "migrated"):
             sh(["docker", "rm", "-f", migrate_name(t)], check=False)
-        for slot, oc in cons.items():
-            if slot != routed and oc["running"]:
-                stop_container(oc["id"])
-                if slot_containers(t).get(slot, {}).get("running"):
+        for slot, members in slot_members(t).items():
+            if slot != routed and any(m["running"] for m in members.values()):
+                _stop_members(t, slot)
+                if any(m["running"] for m in slot_members(t).get(slot, {}).values()):
                     raise RecipeError(f"slot {slot} would not stop: needs a human")
                 log(f"reconcile: stopped the interrupted release's slot {slot}")
         if phase.get("copied"):
@@ -601,7 +712,8 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         # `retired` (huta rollback's target; grok #12). Its new state goes in the same
         # transaction as the live pointer, so a crash can't leave it retired (crash tests).
         failed = bool(prev and prev != serving["id"] and st.db.execute(
-            "SELECT 1 FROM events WHERE release_id=? AND kind='public-fail'", (prev,)).fetchone())
+            "SELECT 1 FROM events WHERE release_id=? AND kind IN ('public-fail', 'workers-fail')",
+            (prev,)).fetchone())
         st.make_live(serving["id"], routed, prev,
                      f"reconciled: slot {routed} serves this release{note}",
                      retire_as=S.ROLLED_BACK if failed else S.RETIRED,
@@ -610,13 +722,15 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     for r in st.in_state(project.name, t.name, S.RUNNING, S.APPROVED):
         if r["id"] != serving["id"]:
             st.set_state(r["id"], S.NOTHING_ACTIVATED, msg=why)
-    for slot, oc in cons.items():
-        if slot != routed and oc["running"]:
-            stop_container(oc["id"])
+    for slot, members in slot_members(t).items():
+        if slot != routed and any(m["running"] for m in members.values()):
+            _stop_members(t, slot)
             log(f"reconcile: stopped unrouted slot {slot}")
-    for slot, oc in slot_containers(t).items():
-        if slot != routed and not oc["running"]:
+    for slot in slot_members(t):
+        if slot != routed:
             _idle_policy(t, slot)
+    if not stopped:
+        _complete_slot(platform, st, t, serving, routed, log)
     # The timers follow the live release (a crash after the switch could leave them stale).
     try:
         from . import jobs as J
@@ -782,9 +896,11 @@ def _bring_back(platform, t, slot: str, port: int, health: str, sha: str, log) -
     """Start the old slot again (one-writer releases stop it first) and wait for it. Its own
     stopped container is started as it was: recreating it from the current host config could
     change what it runs with (env, secrets) at the worst moment."""
-    c = slot_containers(t).get(slot)
-    if c and c.get("sha") == sha:
-        start_container(c["id"])
+    members = slot_members(t).get(slot, {})
+    if members and all(c.get("sha") == sha for c in members.values()):
+        for c in members.values():
+            if not c["running"]:
+                start_container(c["id"])
     else:
         compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", service(slot))
     wait_health(port, health, sha, timeout=60)
@@ -806,7 +922,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     app = json.loads(rel["app_toml"])
     health = SP.health(app)
     checks = app.get("smoke", [])
-    check_image(rel["image_id"], rel["sha"], project.name)
+    check_images(st, rel, app, project.name)
     has_data = bool(R.data_mount(app))
     if has_data and not t.data:
         raise RecipeError("app.toml mounts data, but the host registry gives this target none")
@@ -823,10 +939,10 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
         concurrent = concurrent and R.concurrent_safe(json.loads(cur["app_toml"]), t)
         live_slot = live["slot"]
         idle = "b" if live_slot == "a" else "a"
-        images = {live_slot: (cur["image_id"], cur["sha"]), idle: (rel["image_id"], rel["sha"])}
+        images = {live_slot: slot_images(st, cur, app), idle: slot_images(st, rel, app)}
     else:
         live_slot, idle = None, "a"
-        images = {s: (rel["image_id"], rel["sha"]) for s in SLOTS}
+        images = {s: slot_images(st, rel, app) for s in SLOTS}
     adopting = not live and edge.adopt_pending(platform, t) is not None
     # A stopped target (huta stop, or a restore) stays stopped if this release fails: the old
     # slot may not belong on the data any more.
@@ -883,10 +999,11 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
             _phase_set(platform, t, v=PHASE_VERSION, stage="migrated", rid=rid, old=live_slot,
                        idle=idle, copied=True, migrated=True, **mig_rec)
         compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", "--force-recreate",
-                service(idle))
+                *services(app, idle, "serving"))
         _egress_sync(platform, log)
         log(f"slot {idle} started, verifying {health} reports {rel['sha'][:12]} (no traffic yet)")
         wait_health(port_of[idle], health, rel["sha"], timeout=t.health_timeout)
+        _check_internal(t, app, idle, rel["sha"], log)
         bad = smoke(f"http://127.0.0.1:{port_of[idle]}", checks, t.hosts[0])
         if bad:
             raise RecipeError("smoke on the new slot failed: " + "; ".join(bad[:5]))
@@ -950,6 +1067,14 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     if outcome is not None:
         return outcome
 
+    # 3b. Workers: the old ones stop, then the new ones start and must stay up (DESIGN-v2 §3).
+    if SP.workers(app) or (cur and SP.workers(json.loads(cur["app_toml"]))):
+        try:
+            _hand_over_workers(platform, st, t, app, cur, idle, live_slot, log)
+        except RecipeError as e:
+            return _workers_failed(platform, st, project, t, rid, live, cur, idle, live_slot,
+                                   concurrent and not stopped_old, undo_pre, port_of, str(e), log)
+
     # 4. Drain and stop the old slot.
     if live_slot and not stopped_old:
         time.sleep(t.drain)
@@ -969,6 +1094,118 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
         except Exception as e:  # noqa: BLE001 — belt and braces: the release stays live
             log(f"WARNING after-release jobs not started: {e}")
     return S.LIVE
+
+
+def _complete_slot(platform, st, t, rel, slot: str, log) -> None:
+    """Every component of the release serving on the routed slot runs: a crash can leave a
+    worker not yet created (its handoff comes after the switch) or one stopped. Unrouted slots
+    are stopped first, so this never makes two workers."""
+    app = json.loads(rel["app_toml"])
+    if not SP.several(app):
+        return
+    members = slot_members(t).get(slot, {})
+    missing = [f"slot-{slot}-{n}" for n in app["order"] if n not in members]
+    if missing:
+        compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", *missing)
+        log(f"reconcile: started {', '.join(missing)}")
+    for n, m in slot_members(t).get(slot, {}).items():
+        if n in app["components"] and not m["running"]:
+            start_container(m["id"])
+            log(f"reconcile: started {n} of slot {slot}")
+        elif n in app["components"]:
+            sh(["docker", "update", "--restart=unless-stopped", m["id"]], check=False)
+
+
+def slot_images(st: S.Store, r, app: dict):
+    """What compose_doc takes for one slot: the image id (one component) or the image map."""
+    return (st.images(r) if SP.several(app) else r["image_id"], r["sha"])
+
+
+def check_images(st: S.Store, r, app: dict, project: str) -> None:
+    check_image_map(st.images(r), r["sha"], app, project)
+
+
+def check_image_map(imgs: dict, sha: str, app: dict, project: str) -> None:
+    """Every image of a release is checked as the v1 image is; with several, each must also say
+    which image it is (run.huta.image), so one can't stand in for another."""
+    if len(app.get("images", {})) <= 1:
+        check_image(next(iter(imgs.values())), sha, project)
+        return
+    if set(imgs) != set(app["images"]):
+        raise RecipeError(f"the release brings images {sorted(imgs)}, app.toml names "
+                          f"{sorted(app['images'])}")
+    for name in app["images"]:
+        iid = imgs[name]
+        check_image(iid, sha, project)
+        got = image_facts(iid)["labels"].get("run.huta.image")
+        if got != name:
+            raise RecipeError(f"{iid[:19]}: run.huta.image is {got!r}, expected {name!r}")
+
+
+def _check_internal(t: Target, app: dict, slot: str, sha: str, log) -> None:
+    """Health of the slot's HTTP components other than the public one, on their slot-network
+    addresses, before any traffic moves."""
+    public = SP.public_name(app)
+    members = slot_members(t).get(slot, {})
+    for cname in SP.serving(app):
+        if cname == public:
+            continue
+        c = app["components"][cname]
+        m = members.get(cname)
+        if not m or not m["running"]:
+            raise RecipeError(f"component {cname} of slot {slot} is not running")
+        wait_health_at(component_address(t, slot, m["id"]), int(c.get("port", 8080)),
+                       c.get("health", "/healthz"), sha, timeout=t.health_timeout)
+        log(f"component {cname} healthy")
+
+
+def _hand_over_workers(platform, st, t, app, cur, idle, live_slot, log) -> None:
+    """One worker at a time: the old slot's workers stop, then the new ones start with restart
+    "no", must still run after worker_liveness seconds, and only then get unless-stopped."""
+    if cur and live_slot:
+        old_workers = set(SP.workers(json.loads(cur["app_toml"])))
+        _stop_members(t, live_slot, only=old_workers)
+        if any(c["running"] for n, c in slot_members(t).get(live_slot, {}).items()
+               if n in old_workers):
+            raise RecipeError("the old workers would not stop")
+    new = services(app, idle, "workers")
+    if not new:
+        return
+    compose(platform, t, "up", "-d", "--no-deps", "--pull", "never", "--force-recreate", *new)
+    time.sleep(t.worker_liveness)
+    members = slot_members(t).get(idle, {})
+    dead = [n for n in SP.workers(app) if not members.get(n, {}).get("running")]
+    if dead:
+        raise RecipeError(f"worker(s) {', '.join(dead)} stopped within {t.worker_liveness} s")
+    for n in SP.workers(app):
+        sh(["docker", "update", "--restart=unless-stopped", members[n]["id"]], check=False)
+    log(f"workers running: {', '.join(SP.workers(app))}")
+
+
+def _workers_failed(platform, st, project, t, rid, live, cur, idle, live_slot, can_revert,
+                    undo, port_of, why, log) -> str:
+    """The switch happened and the public checks passed, but the new workers didn't hold. With
+    the old slot still running, go back to it (its workers again); otherwise a human decides."""
+    st.event("workers-fail", why, rid, project.name, t.name)
+    if can_revert and live and cur:
+        try:
+            _stop_members(t, idle)
+            with edge.edge_lock(platform):
+                if undo:
+                    edge.transact(platform, [(Path(p), txt) for p, txt in undo])
+                else:
+                    edge.change_vhost(platform, t, _previous_vhost(platform, t, port_of[live_slot]))
+            for c in slot_members(t).get(live_slot, {}).values():
+                if not c["running"]:
+                    start_container(c["id"])
+            st.revert_live(rid, live["release_id"], live_slot,
+                           f"reverted to {live['release_id']} on slot {live_slot}: {why}")
+            _stop_quietly(platform, t, idle)
+            return S.ROLLED_BACK
+        except Exception as e:  # noqa: BLE001
+            why = f"{why}; and the revert failed: {type(e).__name__}: {e}"
+    st.set_state(rid, S.NEEDS_HUMAN, msg=f"live, but its workers failed: {why}")
+    return S.NEEDS_HUMAN
 
 
 def after_switch(platform, st, project, t, log) -> str | None:
@@ -1049,7 +1286,7 @@ def _abort_before_switch(platform, st, project, t, app, rid, images, idle, live_
         old_app = json.loads(cur["app_toml"])
         health = SP.health(old_app)
         write_compose(platform, t, compose_doc(platform, project, t, old_app,
-                                               {s: images[live_slot] for s in SLOTS}))
+                                               {s: slot_images(st, cur, old_app) for s in SLOTS}))
     if stopped_old or copied:
         try:
             if copied:
@@ -1127,9 +1364,15 @@ def start_container(cid: str) -> None:
 
 
 def _idle_policy(t: Target, slot: str) -> None:
-    c = slot_containers(t).get(slot)
-    if c and not c["running"]:
-        sh(["docker", "update", "--restart=no", c["id"]], check=False)
+    for c in slot_members(t).get(slot, {}).values():
+        if not c["running"]:
+            sh(["docker", "update", "--restart=no", c["id"]], check=False)
+
+
+def _stop_members(t: Target, slot: str, only=None) -> None:
+    for c in slot_members(t).get(slot, {}).values():
+        if c["running"] and (only is None or c["component"] in only):
+            stop_container(c["id"])
 
 
 def jobs_running(t: Target) -> list[str]:
@@ -1138,17 +1381,25 @@ def jobs_running(t: Target) -> list[str]:
 
 
 def _stop_strict(platform, t, slot: str) -> None:
-    """Stop a slot and prove it is stopped (before another writer may start)."""
-    compose(platform, t, "stop", service(slot))
-    c = slot_containers(t).get(slot)
-    if c and c["running"]:
+    """Stop a slot (all its containers) and prove it is stopped (before another writer may
+    start)."""
+    members = slot_members(t).get(slot, {})
+    if len(members) == 1 and "" in members:
+        compose(platform, t, "stop", service(slot))     # one component: as always
+    else:
+        _stop_members(t, slot)
+    if any(c["running"] for c in slot_members(t).get(slot, {}).values()):
         raise RecipeError(f"slot {slot} is still running after stop")
     _idle_policy(t, slot)
 
 
 def _stop_quietly(platform, t, slot):
     try:
-        compose(platform, t, "stop", service(slot))
+        members = slot_members(t).get(slot, {})
+        if len(members) <= 1 and set(members) <= {""}:
+            compose(platform, t, "stop", service(slot))
+        else:
+            _stop_members(t, slot)
         _idle_policy(t, slot)
     except RecipeError:
         pass
@@ -1156,26 +1407,34 @@ def _stop_quietly(platform, t, slot):
 
 def prune_images(st: S.Store, project: Project, t: Target) -> list[str]:
     """Untag old images of this target. Protects every image a live release of any target,
-    an unfinished release, or the newest keep_releases releases still refer to (codex #10)."""
-    protect = set()
-    for r in st.db.execute("SELECT r.image_id FROM live l JOIN releases r ON r.id = l.release_id"):
-        protect.add(r["image_id"])
-    for r in st.db.execute("SELECT image_id FROM releases WHERE state IN (?,?,?)",
+    an unfinished release, or the newest keep_releases releases still refer to (codex #10).
+    A release with several images is kept or dropped as a whole (DESIGN-v2 §3)."""
+    def ids(r) -> set[str]:
+        return set(st.images(r).values()) | {r["image_id"]}
+
+    protect: set[str] = set()
+    for r in st.db.execute("SELECT r.* FROM live l JOIN releases r ON r.id = l.release_id"):
+        protect |= ids(r)
+    for r in st.db.execute("SELECT * FROM releases WHERE state IN (?,?,?)",
                            (S.PLANNED, S.APPROVED, S.RUNNING)):
-        protect.add(r["image_id"])
+        protect |= ids(r)
     rows = st.db.execute("SELECT * FROM releases WHERE project=? AND target=? ORDER BY created DESC",
                          (project.name, t.name)).fetchall()
     # Count only releases that actually went live, so abandoned plans can't push the rollback
     # target out of the window (grok #7); and always keep the newest retired one.
-    seen: list[str] = []
+    seen: list[frozenset] = []
     for r in rows:
-        if r["state"] in (S.LIVE, S.RETIRED) and r["image_id"] not in seen:
-            seen.append(r["image_id"])
-    protect.update(seen[:max(2, t.keep_releases)])
+        if r["state"] in (S.LIVE, S.RETIRED) and frozenset(ids(r)) not in seen:
+            seen.append(frozenset(ids(r)))
+    for s in seen[:max(2, t.keep_releases)]:
+        protect |= s
     removed = []
     for r in rows:
-        if r["image_id"] in protect or not TAG_RE.match(r["image_tag"]):
-            continue
-        if subprocess.run(["docker", "image", "rm", r["image_tag"]], capture_output=True).returncode == 0:
-            removed.append(r["image_tag"])
+        for iid in sorted(ids(r) - protect):
+            tag = r["image_tag"] if iid == r["image_id"] else \
+                f"huta/{project.name}:{r['sha'][:12]}-{iid.split(':')[1][:12]}"
+            if not TAG_RE.match(tag):
+                continue
+            if subprocess.run(["docker", "image", "rm", tag], capture_output=True).returncode == 0:
+                removed.append(tag)
     return removed

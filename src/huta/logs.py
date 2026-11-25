@@ -354,6 +354,8 @@ def collect(platform: Platform, project: Project, t: Target, st=None) -> str:
             seen.add(cid)
             sha = labels.get("run.huta.sha", "")
             base = {"slot": labels["run.huta.slot"], "sha": sha[:12],
+                    **({"comp": labels["run.huta.component"]}
+                       if labels.get("run.huta.component") else {}),
                     "rel": _release_of(st, t, sha, c.get("Created", ""))}
             files = _log_files(c.get("LogPath") or "", cid)
             if files:
@@ -442,7 +444,7 @@ def trim_total(platform: Platform) -> None:
 def query(platform: Platform, st, project: Project, t: Target, since: str | None = None,
           until: str | None = None, grep: str | None = None, tail: int | None = None,
           slot: str | None = None, release: str | None = None, job: str | None = None,
-          box: str | None = None) -> dict:
+          box: str | None = None, component: str | None = None) -> dict:
     """Matching lines, newest last, within ANSWER_MAX. box: who asks (None: the operator); a box
     is held to the target's logs.boxes / logs.jobs."""
     if box is not None:
@@ -497,6 +499,8 @@ def query(platform: Platform, st, project: Project, t: Target, since: str | None
                     continue
                 if slot and r.get("slot") != slot:
                     continue
+                if component and r.get("comp") != component:
+                    continue
                 if release and r.get("rel") != release:
                     continue
                 # Gate again: values learned and drop patterns added since the line was stored.
@@ -539,14 +543,16 @@ def answer(head: str, lines, matched: int, tail: int, slow: bool, extra=()) -> d
 
 
 def slot_state(t: Target, slot: str) -> str:
-    """One line on a slot container's state: for the release's events when it failed to start."""
+    """One line per container of a slot: for the release's events when it failed to start."""
     from .recipe import compose_name
+    out = []
     for c in _docker_inspect(t):
         labels = (c.get("Config") or {}).get("Labels") or {}
         if labels.get("com.docker.compose.project") == compose_name(t) \
                 and labels.get("run.huta.slot") == slot:
             s = c.get("State") or {}
-            parts = [f"slot {slot}: {s.get('Status', '?')}"]
+            comp = labels.get("run.huta.component", "")
+            parts = [f"slot {slot}{' ' + comp if comp else ''}: {s.get('Status', '?')}"]
             if not s.get("Running"):
                 parts.append(f"exit code {s.get('ExitCode')}")
             if s.get("OOMKilled"):
@@ -554,5 +560,7 @@ def slot_state(t: Target, slot: str) -> str:
             parts.append(f"restarts {c.get('RestartCount', 0)}")
             if s.get("Error"):
                 parts.append(f"docker: {str(s['Error'])[:200]}")
-            return ", ".join(parts) + f" · its output: huta logs {t.project} {t.name} --slot {slot}"
-    return f"slot {slot}: no container"
+            out.append(", ".join(parts))
+    if not out:
+        return f"slot {slot}: no container"
+    return "; ".join(out) + f" · its output: huta logs {t.project} {t.name} --slot {slot}"

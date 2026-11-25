@@ -1,6 +1,6 @@
 # huta
 
-> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v1. Available: one recipe `web` (exactly one HTTP container), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Planned, not available: several containers per project, Postgres and migrations, unattended releases, gateway/external recipes, `huta snapshot`, monitoring hooks, plain-HTTP egress.
+> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v1. Available: one recipe `web` (exactly one HTTP container), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, and gateways (a public hostname for a service huta doesn't run). Planned, not available: Postgres, publishing to Cloudflare Pages/Workers, online migrations, unattended releases, `huta snapshot`, monitoring hooks, plain-HTTP egress.
 
 If you are an agent running on an empty server and asked to **set it up as a huta host**, follow https://huta.run/host.md step by step (it diagnoses the server first, then asks the human before each change). If you are an agent asked to **install the huta client** on a machine, follow https://huta.run/install.md step by step (it tells you what to ask the human and what to confirm before touching the server). If you are an agent asked to deploy a project with huta, read the start page first, check its prerequisites, then follow it in order. Everything is also in one file: https://huta.run/llms-full.md
 
@@ -832,8 +832,8 @@ plan expired).
 Also tell the human, without being asked, when:
 
 - a prerequisite in step 0 is missing;
-- the project needs something huta does not have (several components, Postgres, preflight
-  checks): name the feature and say it is planned in huta, not available;
+- the project needs something huta does not have (Postgres, external publishing, online
+  migrations, preflight checks): name the feature and say it is planned in huta, not available;
 - the host registry needs a new or changed entry (env, secrets, egress, upstreams, data): give
   them the exact file (jobs and smoke checks live in `app.toml`; the owner sees them in the
   plan);
@@ -969,8 +969,8 @@ timeout = "10m"
 | `schema` | int | required, must be `1` |
 | `project` | string | required; must equal the project name in the host registry |
 | `order` | array of strings | required; every component exactly once, no duplicates |
-| `images` | table of tables | required; exactly one `[images.<name>]` |
-| `components` | table of tables | required; exactly one component |
+| `images` | table of tables | required; 1..8 `[images.<name>]` |
+| `components` | table of tables | required; 1..8 components, exactly one of them the public HTTP one (below) |
 | `state` | table | optional; `kind` (`"none"` default, or `"data"`), and with data `schema` and `runs_on` (below) |
 | `migrate` | table | optional; a migration this release runs before its code starts (below) |
 | `build` | table | optional; only `test` (accepted; `huta pack` does not run it yet) |
@@ -997,13 +997,60 @@ Name: `^[a-z][a-z0-9-]{0,30}$`. Only these keys:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `image` | string | | required: must name the `[images.<name>]` table |
-| `kind` | string | `"http"` | `"http"` only |
+| `image` | string | | required: must name one of the `[images.<name>]` tables |
+| `kind` | string | `"http"` | `"http"`, or `"worker"` (serves nothing: no `port`, `health` or `public`) |
+| `public` | bool | `false` | the component the site routes to; needed only when there is more than one HTTP component |
+| `cmd` | array of strings | | the command (argv, no shell) instead of the image's own; the image's entrypoint still applies |
 | `port` | int | `8080` | 1..65535; the port your server listens on **inside** the container, on `0.0.0.0` |
 | `health` | string | `"/healthz"` | must match `^/[A-Za-z0-9/_.-]*$` |
-| `data` | string | | with `state.kind = "data"`: the absolute mount path, `^/[a-z0-9][a-z0-9/_.-]*$`, not a system directory (`/etc`, `/tmp`, `/usr`, …). Required with `kind = "data"`, refused without it |
+| `data` | string | | with `state.kind = "data"`: the absolute mount path, `^/[a-z0-9][a-z0-9/_.-]*$`, not a system directory (`/etc`, `/tmp`, `/usr`, …). Only components that name it get the volume; with `kind = "data"` at least one must, without it none may |
 | `concurrent_safe` | bool | `false` | `true`: two releases may run on the same data at once. It only takes effect when the host allows it too (`data.concurrent` in the registry) |
 | `upstream_api` | string | | must be absent or empty (*planned*) |
+
+### Several components
+
+A target can run up to 8 components from up to 8 images: a web front, an API, a worker.
+
+```toml
+order = ["web", "api", "worker"]          # start order
+
+[images.web]
+dockerfile = "web/Dockerfile"
+[images.api]
+dockerfile = "api/Dockerfile"
+
+[components.web]
+image = "web"
+public = true                             # the site routes here
+[components.api]
+image = "api"
+port = 8081
+data = "/data"
+[components.worker]
+image = "api"
+kind = "worker"
+cmd = ["python", "-m", "app.worker"]
+data = "/data"
+```
+
+- **A slot is the whole set.** Slot a is web + api + worker of one release, on its own network:
+  the components reach each other by name (`http://api:8081`). The other slot's release can't
+  reach them. The switch moves everything at once, so versions never mix.
+- Only the public component is published (on the slot's loopback port, as with one component).
+  Every other HTTP component must answer its `health` path with `ok` and the sha too; the host
+  checks it on its slot address before the switch.
+- **Workers are single.** A new release's workers start only after the switch and the public
+  checks, once the old release's workers have stopped. They must still be running after the
+  host's `worker_liveness` (default 10 s); otherwise the release goes back (when the old slot is
+  still there) or ends `needs-human`.
+- One writer is per volume: every component that mounts the data counts. Two releases overlap
+  only if all of them are `concurrent_safe` and the host allows it.
+- The host's secrets reach the public component; other components get only what the registry
+  names for them (`[targets.<t>.components.<c>]`). Jobs and diagnostics take
+  `component = "<name>"` (default: the public one) for their image and mount.
+- `huta pack` builds every image (each labelled `run.huta.image=<name>`); the public
+  component's image keeps the name `huta-build/<project>:<sha12>`, the others are
+  `huta-build/<project>/<image>:<sha12>`. `huta submit` sends them all.
 
 ### `[state]`
 
@@ -1259,6 +1306,8 @@ see each other: the box is the unit huta can tell apart.
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |
 | `health_timeout` | int | `30` | 5..900 seconds a new slot has to report healthy on `/healthz` |
 | `migrate_secrets` | array | `[]` | secret names `[migrate]` gets (it gets no others) |
+| `components.<name>` | table | | for a component of an app with several: `limits`, `env`, `secrets` (the target's own secrets reach only the public component) |
+| `worker_liveness` | int | `10` | 1..300 seconds a new worker must stay up after the switch |
 | `edge` | table | `{}` | `body` (request body limit, 1m..64g) and `timeout` (upstream read/write timeout, like `90s`, `10m`, `2h`; at most 24h). Unset: nothing is added to the vhost |
 | `kind` | string | `"app"` | `"gateway"`: a hostname huta proxies to a service it doesn't run (below) |
 
@@ -1883,7 +1932,8 @@ update fails, the command's own result still stands; it says `couldn't update th
 Builds the image for `HEAD` of the current git checkout.
 
 - refuses uncommitted changes to tracked files (releases are commits);
-- reads `--app` (default `deploy/app.toml`); needs exactly one `[images.*]`;
+- reads `--app` (default `deploy/app.toml`) and builds every `[images.*]` (with several, each
+  labelled `run.huta.image=<name>`);
 - exports the commit with `git archive HEAD` into a temporary directory and builds **from that
   export**, never from the working tree. Untracked and git-ignored files (a `.env`, a local
   build output, `node_modules`) never reach the image. Anything the image needs must be
@@ -2028,6 +2078,7 @@ The target's container output (stdout and stderr), redacted by the host. Options
 | `--slot` | `a`, `b`, `live` or `previous` (the other slot) |
 | `--release` | one release's lines (8 hex) |
 | `--job` | a job's output instead of the slots' (only if the host sets `logs.jobs = true`) |
+| `--component` | one component's lines, on a target with several |
 
 One line per output line, oldest first, times in UTC:
 `<time> slot-<a|b> <release> <out|err> <text>` (or `job:<name>` instead of the slot).
@@ -2180,7 +2231,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta check` | validate `/etc/huta/huta.toml` and every `projects.d/*.toml` (no shared uids, ports or hosts) |
 | `huta edge <project> <target> [--apply\|--now]` | certificate, vhost, Cloudflare per-host SSL rule, and a proxied A record for hosts with no address record (A/AAAA/CNAME); dry run by default. `--apply` makes an edge plan, applied by `huta approve <id>`; `--now` applies at once (for the console; recorded) |
 | `huta import-dev <project> <ref>` | import `huta-build/<project>:<sha12>` from the dev box by hand |
-| `huta submit <project> <target> <sha> <image>` | verify and plan by hand |
+| `huta submit <project> <target> <sha> <image> [--image <name>=<image> …]` | verify and plan by hand (`--image` for every image of a project with several) |
 | `huta show <release>` | print a plan |
 | `huta approve <id> [--via cli\|telegram] [--confirm-data-loss]` | re-check everything and run the release, or apply an edge or restore plan. `--via telegram` is what a button press runs (as a transient systemd unit); it only changes how the approval is recorded. A restore plan needs `--confirm-data-loss` on the CLI |
 | `huta reject <release>` | reject a planned release |
@@ -2288,6 +2339,7 @@ Everything in a request is a claim; the host re-checks each one itself.
    directory, then checked (regular file owned by the dev user, at most 16 KiB), parsed, and
    **the id inside must equal the file name**.
 4. For a submit, the host runs `docker save huta-build/<project>:<sha12>` inside the dev box
+   (for each image, when the project has several)
    (15-minute deadline) and checks the archive: exactly one image, plain relative entries, at
    most 20000 entries and 2 GiB logical size, no sparse files, no duplicate paths. It **strips
    every image name**, loads the image by id and names it `huta/<project>:<sha12>-<id12>`
@@ -2699,8 +2751,8 @@ Ask the human, and stop, when:
 - the project needs a host registry entry or a change to one;
 - the project needs something the host registry doesn't grant yet (a secret, a data volume,
   an egress entry, an upstream): write the exact request for the operator;
-- the project needs anything huta refuses: several components, Postgres, preflight checks,
-  plain-HTTP egress;
+- the project needs anything huta refuses: Postgres, external publishing, online migrations,
+  preflight checks, plain-HTTP egress;
 - a one-writer release ended `needs-human` after its switch: the human decides whether to roll
   back (`huta rollback`), because the data was already written by the new release;
 - a DNS record or certificate is missing (`huta edge` is the operator's step);
@@ -2738,7 +2790,7 @@ Only `schema project order build images components state preflight smoke jobs ex
 **`ConfigError: app.toml: top-level 'order' must list every component exactly once`**
 `order` is missing, not an array, or does not match the `[components.*]` names.
 
-**`ConfigError: app.toml: huta needs exactly one [images.<name>] table`**: exactly one image.
+**`ConfigError: app.toml: huta needs 1..8 [images.<name>] tables`**.
 
 **`ConfigError: app.toml: images.web has unknown keys ['args']`**: only `dockerfile` and
 `context`. **`ConfigError: app.toml: images.web.dockerfile is required`**.
@@ -2749,9 +2801,8 @@ Set `image = "<the [images.*] name>"` in the component.
 **`ConfigError: app.toml: [state] accepts only 'kind', got ['kind', 'path']`**,
 **`ConfigError: app.toml: [build] accepts only 'test', got [...]`**: remove the other keys.
 
-**`ConfigError: app.toml: huta supports exactly one component`**,
 **`ConfigError: app.toml: 'preflight' is not supported by huta yet`** (also `external`),
-**`ConfigError: app.toml: components.web: kind = "http" only`**,
+**`ConfigError: app.toml: exactly one HTTP component is public`**: mark one `public = true`,
 **`ConfigError: app.toml: components.web.upstream_api is not supported yet`**:
 the project needs a feature that is planned. Do not delete the need to get past the check; tell
 the human.
@@ -2973,7 +3024,8 @@ stage of the Dockerfile.
 **`huta: no deploy/app.toml in this checkout (use --app)`**: run from the repo, or pass
 `--app <path>`.
 
-**`huta: huta builds exactly one image per project`**: one `[images.*]` entry only.
+**`ConfigError: app.toml at <sha> names 2 images and the request brought one`**: the client is
+older than the host: `huta self-update`, then `huta pack` and `huta submit` again.
 
 **``huta: huta-build/myapp:0123456789ab not built; run `huta pack` first``**: `HEAD` moved since
 the last pack, or you never packed.

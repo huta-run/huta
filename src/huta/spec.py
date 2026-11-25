@@ -35,3 +35,21 @@ def health(app: dict) -> str:
 
 def port(app: dict) -> int:
     return int(public(app).get("port", 8080))
+
+
+def several(app: dict) -> bool:
+    """More than one component: slots are sets of containers (DESIGN-v2 §3)."""
+    return len(app["components"]) > 1
+
+
+def kind(app: dict, name: str) -> str:
+    return app["components"][name].get("kind", "http")
+
+
+def workers(app: dict) -> list[str]:
+    return [n for n in app["order"] if kind(app, n) == "worker"]
+
+
+def serving(app: dict) -> list[str]:
+    """Components that start before the switch: everything but workers."""
+    return [n for n in app["order"] if kind(app, n) != "worker"]

@@ -196,6 +196,14 @@ that server.
   `logging` pinned to `json-file` 10m×3, uncompressed (the collector reads those files).
   The host firewall gives `dp-*` bridges nothing but the egress daemon's ports
   (`systemd/nftables-huta-egress.nft.example`).
+  With several components (DESIGN-v2 §3) the services are `slot-<s>-<component>`, each slot on
+  its own network `huta_<p>_<t>_<s>2` (bridge `dp-<hash of the slot>`, ICC on, component names
+  as aliases), labels `run.huta.component` (and `run.huta.public` on the public one), only the
+  public component published, per-component limits, env and secrets, data only where named,
+  workers with restart `no` until they have held for `worker_liveness` after the switch. The
+  guard's `huta_intra` set lets exactly each slot bridge talk to itself; `huta egress sync`
+  keeps it filled. Releases carry an image map (`releases.images`); every image is checked,
+  with `run.huta.image` naming which it is.
 - **egress policy** (`/run/huta-egress/policy.json`, root-written, world-readable): subnet →
   target, allowlist, upstreams, plus the host's own addresses and Docker subnets to refuse.
   `huta-egress.service` (DynamicUser) reads it.
@@ -306,7 +314,7 @@ huta check                               validate the whole registry
 huta edge <project> <target> [--apply|--now]   certificate, vhost, Cloudflare rule, A record if no
                                          A/AAAA/CNAME; --apply plans it (huta approve <id>), --now applies
 huta import-dev <project> <ref>          import huta-build/<project>:<sha12> from the dev box
-huta submit <project> <target> <sha> <image>
+huta submit <project> <target> <sha> <image> [--image name=image …]
 huta show <release> | reject <release>
 huta approve <id> [--via cli|telegram] [--confirm-data-loss]   a release, or an edge or
                                          restore plan; restore needs --confirm-data-loss on the CLI

@@ -47,13 +47,17 @@ def build_policy(platform, registry, network_name) -> dict:
         for t in project.targets.values():
             if not (t.egress_allow or t.upstreams):
                 continue
-            net = network_name(t)
-            r = subprocess.run(["docker", "network", "inspect", net, "--format",
-                                "{{json .IPAM.Config}}"], capture_output=True, text=True,
-                               timeout=30, cwd="/")
-            if r.returncode != 0:
+            subnets = []
+            names = network_name(t)
+            for net in (names if isinstance(names, list) else [names]):
+                r = subprocess.run(["docker", "network", "inspect", net, "--format",
+                                    "{{json .IPAM.Config}}"], capture_output=True, text=True,
+                                   timeout=30, cwd="/")
+                if r.returncode == 0:
+                    subnets += [c["Subnet"] for c in json.loads(r.stdout or "[]") or []
+                                if c.get("Subnet")]
+            if not subnets:
                 continue   # no network yet: nothing of this target runs
-            subnets = [c["Subnet"] for c in json.loads(r.stdout or "[]") or [] if c.get("Subnet")]
             targets.append({"target": f"{project.name}/{t.name}", "subnets": subnets,
                             "allow": t.egress_allow,
                             "upstreams": {u: platform.upstreams[u]["port"] for u in t.upstreams}})
@@ -112,14 +116,59 @@ def sync(platform, registry) -> bool:
     """Build and publish under one host-wide lock: two releases syncing at once can't publish
     an older view over a newer one (codex code review #20)."""
     import fcntl
-    from .recipe import network_name
+    from .recipe import network_names
     POLICY_DIR.mkdir(mode=0o755, exist_ok=True)
     fd = os.open(platform.state_dir / "egress.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        return write_policy(build_policy(platform, registry, network_name))
+        sync_intra(registry)
+        return write_policy(build_policy(platform, registry, network_names))
     finally:
         os.close(fd)
+
+
+# ------------------------------------------------------------------ bridges whose containers talk
+# A slot with several components is one bridge on which those containers talk to each other
+# (ICC on). The host's guard drops everything forwarded from dp-* bridges, which, with Docker's
+# bridge netfilter, includes traffic between two containers on the same bridge. So the guard
+# accepts exactly "this bridge to itself" for the bridges listed in a set huta keeps
+# (systemd/nftables-huta-egress.nft.example; DESIGN-v2 §3). Never a bridge to another one.
+
+INTRA_SET = ("inet", "huta_guard", "huta_intra")
+
+
+def intra_ready() -> bool:
+    """Whether the host's guard has the set (the operator loads the fragment once)."""
+    r = subprocess.run(["nft", "list", "set", *INTRA_SET], capture_output=True, text=True,
+                       timeout=30, cwd="/")
+    return r.returncode == 0
+
+
+def intra_bridges(registry) -> list[str]:
+    """Bridges of slot networks that exist now (targets with several components)."""
+    from .recipe import slot_bridge_name, slot_network_name
+    out = []
+    for project in registry.values():
+        for t in project.targets.values():
+            if t.kind == "gateway":
+                continue
+            for slot in ("a", "b"):
+                r = subprocess.run(["docker", "network", "inspect", slot_network_name(t, slot)],
+                                   capture_output=True, timeout=30, cwd="/")
+                if r.returncode == 0:
+                    out.append(slot_bridge_name(t, slot))
+    return out
+
+
+def sync_intra(registry) -> None:
+    """Add every existing slot bridge to the set (elements are only added: a removed network's
+    name matches nothing). No set: nothing to do; a release with several components refuses to
+    plan until the operator adds it."""
+    if not intra_ready():
+        return
+    for br in intra_bridges(registry):
+        subprocess.run(["nft", "add", "element", *INTRA_SET, "{", f'"{br}" . "{br}"', "}"],
+                       capture_output=True, timeout=30, cwd="/")
 
 
 # ------------------------------------------------------------------ matching

@@ -23,7 +23,7 @@ Only `schema project order build images components state preflight smoke jobs ex
 **`ConfigError: app.toml: top-level 'order' must list every component exactly once`**
 `order` is missing, not an array, or does not match the `[components.*]` names.
 
-**`ConfigError: app.toml: huta needs exactly one [images.<name>] table`**: exactly one image.
+**`ConfigError: app.toml: huta needs 1..8 [images.<name>] tables`**.
 
 **`ConfigError: app.toml: images.web has unknown keys ['args']`**: only `dockerfile` and
 `context`. **`ConfigError: app.toml: images.web.dockerfile is required`**.
@@ -34,9 +34,8 @@ Set `image = "<the [images.*] name>"` in the component.
 **`ConfigError: app.toml: [state] accepts only 'kind', got ['kind', 'path']`**,
 **`ConfigError: app.toml: [build] accepts only 'test', got [...]`**: remove the other keys.
 
-**`ConfigError: app.toml: huta supports exactly one component`**,
 **`ConfigError: app.toml: 'preflight' is not supported by huta yet`** (also `external`),
-**`ConfigError: app.toml: components.web: kind = "http" only`**,
+**`ConfigError: app.toml: exactly one HTTP component is public`**: mark one `public = true`,
 **`ConfigError: app.toml: components.web.upstream_api is not supported yet`**:
 the project needs a feature that is planned. Do not delete the need to get past the check; tell
 the human.
@@ -258,7 +257,8 @@ stage of the Dockerfile.
 **`huta: no deploy/app.toml in this checkout (use --app)`**: run from the repo, or pass
 `--app <path>`.
 
-**`huta: huta builds exactly one image per project`**: one `[images.*]` entry only.
+**`ConfigError: app.toml at <sha> names 2 images and the request brought one`**: the client is
+older than the host: `huta self-update`, then `huta pack` and `huta submit` again.
 
 **``huta: huta-build/myapp:0123456789ab not built; run `huta pack` first``**: `HEAD` moved since
 the last pack, or you never packed.

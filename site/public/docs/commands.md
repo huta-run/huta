@@ -57,7 +57,8 @@ update fails, the command's own result still stands; it says `couldn't update th
 Builds the image for `HEAD` of the current git checkout.
 
 - refuses uncommitted changes to tracked files (releases are commits);
-- reads `--app` (default `deploy/app.toml`); needs exactly one `[images.*]`;
+- reads `--app` (default `deploy/app.toml`) and builds every `[images.*]` (with several, each
+  labelled `run.huta.image=<name>`);
 - exports the commit with `git archive HEAD` into a temporary directory and builds **from that
   export**, never from the working tree. Untracked and git-ignored files (a `.env`, a local
   build output, `node_modules`) never reach the image. Anything the image needs must be
@@ -202,6 +203,7 @@ The target's container output (stdout and stderr), redacted by the host. Options
 | `--slot` | `a`, `b`, `live` or `previous` (the other slot) |
 | `--release` | one release's lines (8 hex) |
 | `--job` | a job's output instead of the slots' (only if the host sets `logs.jobs = true`) |
+| `--component` | one component's lines, on a target with several |
 
 One line per output line, oldest first, times in UTC:
 `<time> slot-<a|b> <release> <out|err> <text>` (or `job:<name>` instead of the slot).
@@ -354,7 +356,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta check` | validate `/etc/huta/huta.toml` and every `projects.d/*.toml` (no shared uids, ports or hosts) |
 | `huta edge <project> <target> [--apply\|--now]` | certificate, vhost, Cloudflare per-host SSL rule, and a proxied A record for hosts with no address record (A/AAAA/CNAME); dry run by default. `--apply` makes an edge plan, applied by `huta approve <id>`; `--now` applies at once (for the console; recorded) |
 | `huta import-dev <project> <ref>` | import `huta-build/<project>:<sha12>` from the dev box by hand |
-| `huta submit <project> <target> <sha> <image>` | verify and plan by hand |
+| `huta submit <project> <target> <sha> <image> [--image <name>=<image> …]` | verify and plan by hand (`--image` for every image of a project with several) |
 | `huta show <release>` | print a plan |
 | `huta approve <id> [--via cli\|telegram] [--confirm-data-loss]` | re-check everything and run the release, or apply an edge or restore plan. `--via telegram` is what a button press runs (as a transient systemd unit); it only changes how the approval is recorded. A restore plan needs `--confirm-data-loss` on the CLI |
 | `huta reject <release>` | reject a planned release |

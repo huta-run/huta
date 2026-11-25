@@ -41,6 +41,10 @@ class Scenario:
     faults: dict = {}
     schema_r1 = schema_r2 = None   # migration scenarios: the schema each release declares
     migrate_r2 = False
+
+    def app(self):
+        """The manifest both releases use (scenarios with several components shape it)."""
+        return app_toml(self.project_name)
     clean: str = LIVE              # r2's outcome without a crash
     allowed: set = {LIVE, NA}      # r2's outcomes after a crash and reconcile
 
@@ -50,7 +54,7 @@ class Scenario:
         host = FakeHost()
         project = host.registry[self.project_name]
         t = project.targets[self.target_name]
-        app = app_toml(self.project_name)
+        app = self.app()
         r1 = None
         if self.adopt_file:
             (host.platform.caddy_sites / self.adopt_file).write_text(
@@ -98,15 +102,30 @@ class Scenario:
             self.assertEqual(routed, live["slot"], f"{where}: vhost and live pointer disagree")
             self.assertEqual(running, {routed: rows[live["release_id"]]["sha"]},
                              f"{where}: running {running}, routed {routed}")
+            live_sha = rows[live["release_id"]]["sha"]
             for c in host.containers(t):
-                want = "unless-stopped" if c["labels"]["run.huta.slot"] == routed else "no"
-                self.assertEqual(c["restart"], want,
-                                 f"{where}: slot {c['labels']['run.huta.slot']} restart policy")
+                slot, comp = c["labels"]["run.huta.slot"], c["labels"].get("run.huta.component", "")
+                want = "unless-stopped" if slot == routed else "no"
+                self.assertEqual(c["restart"], want, f"{where}: slot {slot} {comp} restart policy")
+                if slot == routed:
+                    self.assertTrue(c["running"], f"{where}: routed {comp} not running")
+                    self.assertEqual(c["labels"]["run.huta.sha"], live_sha, f"{where}: {comp} sha")
+                else:
+                    self.assertFalse(c["running"], f"{where}: unrouted slot {slot} {comp} runs")
+            if json.loads(rows[live["release_id"]]["app_toml"])["components"].keys() - {""}:
+                app_live = json.loads(rows[live["release_id"]]["app_toml"])
+                have = {c["labels"].get("run.huta.component") for c in host.containers(t)
+                        if c["labels"]["run.huta.slot"] == routed}
+                if len(app_live["components"]) > 1:
+                    self.assertEqual(have, set(app_live["components"]),
+                                     f"{where}: routed slot lacks components")
         else:
             self.assertEqual(running, {}, f"{where}: nothing is live but {running} runs")
             if self.adopt_file:
                 self.assertTrue((host.platform.caddy_sites / self.adopt_file).exists(),
                                 f"{where}: the adopted site's own file is gone")
+        self.assertEqual(host._load("docker").get("worker_overlaps", []), [],
+                         f"{where}: two copies of a worker ran at once")
         if self.one_writer:
             ds = host.data_state(t)
             self.assertEqual(ds["overlaps"], [], f"{where}: two writers ran at once")
@@ -356,6 +375,61 @@ class MigrateFirstRelease(Scenario, unittest.TestCase):
     first_release = True
     one_writer = True
     schema_r2, migrate_r2 = 1, True
+
+
+def stateless(app):
+    """The shop manifest without data: its slots may overlap (workers still hand over)."""
+    app = json.loads(json.dumps(app))
+    app["state"] = {"kind": "none"}
+    for c in app["components"].values():
+        c.pop("data", None)
+    return app
+
+
+class SeveralOneWriter(Scenario, unittest.TestCase):
+    """web + api + worker on data: the whole old slot stops, the new one starts (workers after
+    the switch)."""
+    project_name, target_name = "shop", "prod"
+    one_writer = True
+
+
+class SeveralConcurrent(Scenario, unittest.TestCase):
+    """web + api + worker without data: slots overlap; the old worker stops before the new one
+    starts, after the switch."""
+    project_name, target_name = "shop", "live"
+
+    def app(self):
+        return stateless(app_toml("shop"))
+
+
+class SeveralWorkerDies(Scenario, unittest.TestCase):
+    """The new worker exits in its liveness window: back to the old slot and its worker."""
+    project_name, target_name = "shop", "live"
+    faults = {"worker_dies": True}
+    clean, allowed = RB, {NA, RB, NH, LIVE}
+
+    def app(self):
+        return stateless(app_toml("shop"))
+
+
+class SeveralFromOne(Scenario, unittest.TestCase):
+    """A target moving from one component to several: r1 is web only, r2 adds an api and a
+    worker."""
+    project_name, target_name = "shop", "live"
+
+    def setup_host(self):
+        self._r = 0
+        return super().setup_host()
+
+    def app(self):
+        self._r = getattr(self, "_r", 0) + 1
+        full = stateless(app_toml("shop"))
+        if self._r == 1:
+            web = dict(full["components"]["web"])
+            web.pop("public", None)
+            return {**full, "order": ["web"], "components": {"web": web},
+                    "images": {"web": full["images"]["web"]}}
+        return full
 
 
 class PhaseRecords(unittest.TestCase):

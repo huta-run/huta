@@ -6,7 +6,10 @@ it is never taken from the request: pull knows its container, push learns the bo
 kernel (the socket peer's uid).
 
   {"v": 1, "id": "<16 hex>", "op": "submit", "project": "hello", "target": "prod",
-   "sha": "<40 hex>", "image": "huta-build/hello:<sha12>"[, "digest": "sha256:<64 hex>"]}
+   "sha": "<40 hex>", "image": "huta-build/hello:<sha12>"[, "digest": "sha256:<64 hex>"]
+   [, "images": {"<name>": {"image": "huta-build/hello/<name>:<sha12>"[, "digest": "…"]}, …}]}
+     (images: only from projects with more than one image; DESIGN-v2 §3. A request without it
+      is exactly a v1 request.)
   {"v": 1, "id": "...", "op": "status", "project": "hello", "target": "prod"}
   {"v": 1, "id": "...", "op": "log", "release": "<8 hex>"}
   {"v": 1, "id": "...", "op": "jobs", "project": "hello", "target": "prod"}   (read-only)
@@ -49,8 +52,8 @@ FIELDS = {
     "client": set(),               # the client this host would install (huta self-update)
     "secret": {"project", "name", "value"},   # stage a value for a secret the registry names
 }
-OPTIONAL = {"submit": {"digest"},  # push: the manifest digest the box pushed to the registry
-            "logs": {"since", "until", "grep", "tail", "slot", "release", "job"},
+OPTIONAL = {"submit": {"digest", "images"},  # push: the digest the box pushed; several images
+            "logs": {"since", "until", "grep", "tail", "slot", "release", "job", "component"},
             "egress-log": {"since", "until"}, "traffic": {"since", "until"},
             "crashes": {"since"}}
 WHEN = r"\d{1,6}[smhd]|\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?)?Z?"   # = logs.WHEN_PATTERN
@@ -102,6 +105,16 @@ def parse(raw: bytes) -> dict:
     _str(d, "sha", r"[0-9a-f]{40}")
     if "image" in d:
         _str(d, "image", rf"huta-build/{re.escape(d['project'])}:[0-9a-f]{{12}}")
+    if "images" in d:
+        imgs = d["images"]
+        if not isinstance(imgs, dict) or not 1 <= len(imgs) <= 8:
+            raise RequestError("images must map 1..8 image names to their refs")
+        for name, v in imgs.items():
+            if not (isinstance(name, str) and NAME.fullmatch(name)) or not isinstance(v, dict) \
+                    or set(v) - {"image", "digest"} or "image" not in v:
+                raise RequestError("bad images entry")
+            _str(v, "image", rf"huta-build/{re.escape(d['project'])}(/{re.escape(name)})?:[0-9a-f]{{12}}")
+            _str(v, "digest", r"sha256:[0-9a-f]{64}")
     _str(d, "release", r"[0-9a-f]{8}")
     _str(d, "digest", r"sha256:[0-9a-f]{64}")
     _str(d, "name", r"[A-Z][A-Z0-9_]{0,63}")
@@ -109,6 +122,7 @@ def parse(raw: bytes) -> dict:
     _str(d, "until", WHEN)
     _str(d, "slot", r"a|b|live|previous")
     _str(d, "job", NAME.pattern)
+    _str(d, "component", NAME.pattern)
     _str(d, "diag", NAME.pattern)
     # A plain substring, matched after redaction: no pattern language to hang or probe with.
     _str(d, "grep", r"[^\x00-\x1f\x7f]{1,200}")

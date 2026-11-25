@@ -146,8 +146,16 @@ def run_job(platform: Platform, project: Project, t: Target, name: str, st, log)
         job = next((j for j in app.get("jobs", []) if j["name"] == name), None)
         if job is None:
             raise ConfigError(f"the live release has no job {name!r}")
-        check_image(rel["image_id"], rel["sha"], project.name)
-        if R.data_mount(app):
+        from . import spec as SP
+        from .recipe import slot_network_name
+        comp_name = job.get("component") or SP.public_name(app)
+        comp = app["components"][comp_name]
+        image = st.images(rel).get(comp["image"], rel["image_id"])
+        check_image(image, rel["sha"], project.name)
+        # With several components a job runs on the live slot's network, so it reaches the
+        # other components by name (DESIGN-v2 §3); one component: the target's network.
+        network = slot_network_name(t, live["slot"]) if SP.several(app) else network_name(t)
+        if comp.get("data"):
             from .data import mounted
             if not mounted(R.data_paths(platform, t)[1]):
                 raise ConfigError("the data volume is not mounted")
@@ -170,8 +178,9 @@ def run_job(platform: Platform, project: Project, t: Target, name: str, st, log)
             entry = ["--entrypoint", cmd[0]]
             cmd = cmd[1:]
         args = ["docker", "run", "--rm", *R.docker_run_args(platform, project, t, app,
-                                                            network_name(t), env, cname, labels),
-                *entry, rel["image_id"], *cmd]
+                                                            network, env, cname, labels,
+                                                            comp_name if SP.several(app) else None),
+                *entry, image, *cmd]
         # Values reach docker through its environment (--env NAME), never the command line.
         proc = subprocess.Popen(args, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", **env}, cwd="/",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

@@ -6,7 +6,7 @@
 # 1. the accept your main input chain needs (its policy is drop), in that chain's table;
 # 2. a guard table, evaluated before it, that drops everything else from dp-*, whatever later
 #    rules (open ports, Docker's own forward accepts) would allow. It resets itself, so loading
-#    the file again doesn't duplicate rules.
+#    the file again doesn't duplicate rules (and empties huta_intra: run `huta egress sync`).
 # Adjust part 1 to your ruleset's table and chain names. Check with `nft -c -f`, then apply.
 
 table inet filter {
@@ -18,6 +18,13 @@ table inet filter {
 table inet huta_guard
 delete table inet huta_guard
 table inet huta_guard {
+	# Bridges whose own containers may talk to each other: one per slot of a target with
+	# several components (DESIGN-v2 §3). huta adds "<bridge> . <bridge>" pairs as it creates
+	# those networks (huta egress sync puts them back after this file is loaded again). Only a
+	# bridge to itself: never one bridge to another, never out.
+	set huta_intra {
+		type ifname . ifname
+	}
 	chain input {
 		type filter hook input priority filter - 5; policy accept;
 		iifname "dp-*" ct state established,related accept
@@ -27,6 +34,7 @@ table inet huta_guard {
 	}
 	chain forward {
 		type filter hook forward priority filter - 5; policy accept;
+		iifname . oifname @huta_intra accept comment "huta: components of one slot"
 		iifname "dp-*" counter drop comment "huta containers: no route out, only the egress daemon"
 	}
 }

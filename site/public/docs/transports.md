@@ -64,6 +64,7 @@ Everything in a request is a claim; the host re-checks each one itself.
    directory, then checked (regular file owned by the dev user, at most 16 KiB), parsed, and
    **the id inside must equal the file name**.
 4. For a submit, the host runs `docker save huta-build/<project>:<sha12>` inside the dev box
+   (for each image, when the project has several)
    (15-minute deadline) and checks the archive: exactly one image, plain relative entries, at
    most 20000 entries and 2 GiB logical size, no sparse files, no duplicate paths. It **strips
    every image name**, loads the image by id and names it `huta/<project>:<sha12>-<id12>`

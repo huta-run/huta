@@ -89,6 +89,18 @@ def build_ref(project: str, sha: str) -> str:
     return f"huta-build/{project}:{sha[:12]}"
 
 
+def image_refs(project: str, sha: str, app: dict) -> dict[str, str]:
+    """name -> local ref of every image the project builds. One image keeps the v1 name; with
+    several, the public component's image keeps it and the others get huta-build/<p>/<name>."""
+    imgs = app.get("images", {})
+    if len(imgs) <= 1:
+        return {n: build_ref(project, sha) for n in imgs}
+    from .spec import public
+    main = public(app)["image"]
+    return {n: build_ref(project, sha) if n == main else f"huta-build/{project}/{n}:{sha[:12]}"
+            for n in imgs}
+
+
 def cmd_pack(a) -> int:
     root, sha = _repo()
     if _git("status", "--porcelain", "--untracked-files=no", cwd=root):
@@ -96,11 +108,9 @@ def cmd_pack(a) -> int:
     app = _app(root, a.app)
     project = app.get("project")
     imgs = app.get("images", {})
-    if len(imgs) != 1:
-        raise ClientError("huta builds exactly one image per project")
-    (_name, img), = imgs.items()
-    ref = build_ref(project, sha)
-    print(f"building {ref} from {sha[:12]} (a clean export of the commit)", flush=True)
+    if not imgs:
+        raise ClientError("app.toml has no [images.<name>]")
+    refs = image_refs(project, sha, app)
     # Build from `git archive` of the commit, never from the working tree: untracked or
     # git-ignored files (a .env, a key) can't end up in an image labelled as this commit
     # (transport review #13).
@@ -113,22 +123,28 @@ def cmd_pack(a) -> int:
         if x.returncode != 0:
             raise ClientError("could not unpack the commit")
         export = Path(tmp)
-        dockerfile = (export / img["dockerfile"]).resolve()
-        context = (export / img.get("context", ".")).resolve()
-        for p in (dockerfile, context):
-            if export.resolve() not in p.parents and p != export.resolve():
-                raise ClientError(f"{p} is outside the checkout")
-        # Always linux/amd64 (the host's platform), also on arm64 Macs (emulated); no provenance
-        # attestation, so the pushed digest is a plain image manifest.
-        r = _run_with_heartbeat(["docker", "build", "-q", "-f", str(dockerfile),
-                            "--platform", "linux/amd64", "--provenance=false",
-                            "--build-arg", f"RELEASE_SHA={sha}",
-                            "--label", f"org.opencontainers.image.revision={sha}",
-                            "--label", f"run.huta.project={project}",
-                            "-t", ref, str(context)], None, 3600, "still building")
-    if r.returncode != 0:
-        raise ClientError(f"docker build failed:\n{r.stderr.strip()[-2000:]}")
-    print(f"built {ref} ({r.stdout.strip()[:19]})")
+        for name, img in imgs.items():
+            ref = refs[name]
+            print(f"building {ref} from {sha[:12]} (a clean export of the commit)", flush=True)
+            dockerfile = (export / img["dockerfile"]).resolve()
+            context = (export / img.get("context", ".")).resolve()
+            for p in (dockerfile, context):
+                if export.resolve() not in p.parents and p != export.resolve():
+                    raise ClientError(f"{p} is outside the checkout")
+            # Each image of a project with several says which it is, so the host can't be
+            # handed one in place of another (DESIGN-v2 §3).
+            named = ["--label", f"run.huta.image={name}"] if len(imgs) > 1 else []
+            # Always linux/amd64 (the host's platform), also on arm64 Macs (emulated); no
+            # provenance attestation, so the pushed digest is a plain image manifest.
+            r = _run_with_heartbeat(["docker", "build", "-q", "-f", str(dockerfile),
+                                "--platform", "linux/amd64", "--provenance=false",
+                                "--build-arg", f"RELEASE_SHA={sha}",
+                                "--label", f"org.opencontainers.image.revision={sha}",
+                                "--label", f"run.huta.project={project}", *named,
+                                "-t", ref, str(context)], None, 3600, "still building")
+            if r.returncode != 0:
+                raise ClientError(f"docker build failed:\n{r.stderr.strip()[-2000:]}")
+            print(f"built {ref} ({r.stdout.strip()[:19]})")
     print(f"next: push {sha[:12]} to main if it isn't there, then `huta submit <target>`")
     return 0
 
@@ -376,12 +392,27 @@ def cmd_submit(a) -> int:
     root, sha = _repo()
     app = _app(root, a.app)
     project = app.get("project")
+    refs = image_refs(project, sha, app)
+    for ref in refs.values():
+        if subprocess.run(["docker", "image", "inspect", ref], capture_output=True).returncode != 0:
+            raise ClientError(f"{ref} not built; run `huta pack` first")
     ref = build_ref(project, sha)
-    if subprocess.run(["docker", "image", "inspect", ref], capture_output=True).returncode != 0:
-        raise ClientError(f"{ref} not built; run `huta pack` first")
     fields = {"project": project, "target": a.target, "sha": sha, "image": ref}
     cfg = _config()
-    if cfg.get("transport") == "push":
+    push = cfg.get("transport") == "push"
+    if len(refs) > 1:
+        # Several images (DESIGN-v2 §3): all of them, each with its digest when pushed. A
+        # one-image project sends exactly the v1 request, so older hosts keep working.
+        fields["images"] = {}
+        for name, r in refs.items():
+            entry = {"image": r}
+            if push:
+                entry["digest"] = _push_image(cfg, r)
+                print(f"pushed {r} ({entry['digest'][:19]})", flush=True)
+            fields["images"][name] = entry
+        if push:
+            fields["digest"] = fields["images"][next(n for n, r in refs.items() if r == ref)]["digest"]
+    elif push:
         fields["digest"] = _push_image(cfg, ref)
         print(f"pushed {ref} ({fields['digest'][:19]})", flush=True)
     ans = _send(_req("submit", **fields), not a.no_wait)
@@ -449,7 +480,7 @@ def cmd_jobs(a) -> int:
     return _show(_send(_req("jobs", project=a.project, target=a.target), True))
 
 
-LOG_OPTS = ("since", "until", "grep", "tail", "slot", "release", "job")
+LOG_OPTS = ("since", "until", "grep", "tail", "slot", "release", "job", "component")
 
 
 def cmd_observe(a) -> int:
@@ -569,6 +600,7 @@ def main(argv=None) -> int:
     s.add_argument("--slot", choices=["a", "b", "live", "previous"])
     s.add_argument("--release", help="a release id (8 hex)")
     s.add_argument("--job", help="a job's output instead of the slots' (if the host allows it)")
+    s.add_argument("--component", help="one component's lines (targets with several)")
     s.set_defaults(f=cmd_logs)
     for name, what in (("egress-log", "what the egress proxy refused for the target, per minute"),
                        ("traffic", "edge summary: requests per minute by status class, and 5xx"),

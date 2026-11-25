@@ -1,0 +1,397 @@
+{
+  "name": "huta_shop_prod",
+  "networks": {
+    "a2": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "true",
+        "com.docker.network.bridge.name": "dp-86263b0d40a6"
+      },
+      "name": "huta_shop_prod_a2"
+    },
+    "b2": {
+      "driver_opts": {
+        "com.docker.network.bridge.enable_icc": "true",
+        "com.docker.network.bridge.name": "dp-80cd11de173c"
+      },
+      "name": "huta_shop_prod_b2"
+    }
+  },
+  "services": {
+    "slot-a-api": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "API_DB_KEY": "‹secret›",
+        "API_MODE": "full",
+        "HUTA_COMPONENT": "api",
+        "HUTA_PROJECT": "shop",
+        "HUTA_SLOT": "a",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "image": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "labels": {
+        "run.huta.component": "api",
+        "run.huta.project": "shop",
+        "run.huta.sha": "0123456789abcdef0123456789abcdef01234567",
+        "run.huta.slot": "a",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "512m",
+      "networks": {
+        "a2": {
+          "aliases": [
+            "api"
+          ]
+        }
+      },
+      "pids_limit": 128,
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29003:29003",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/shop/prod",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    },
+    "slot-a-web": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "HUTA_COMPONENT": "web",
+        "HUTA_PROJECT": "shop",
+        "HUTA_SLOT": "a",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567",
+        "SHOP_SESSION_KEY": "‹secret›"
+      },
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.component": "web",
+        "run.huta.project": "shop",
+        "run.huta.public": "1",
+        "run.huta.sha": "0123456789abcdef0123456789abcdef01234567",
+        "run.huta.slot": "a",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": {
+        "a2": {
+          "aliases": [
+            "web"
+          ]
+        }
+      },
+      "pids_limit": 128,
+      "ports": [
+        "127.0.0.1:19130:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29003:29003"
+    },
+    "slot-a-worker": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": [
+        "python",
+        "-m",
+        "worker"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "HUTA_COMPONENT": "worker",
+        "HUTA_PROJECT": "shop",
+        "HUTA_SLOT": "a",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "image": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "labels": {
+        "run.huta.component": "worker",
+        "run.huta.project": "shop",
+        "run.huta.sha": "0123456789abcdef0123456789abcdef01234567",
+        "run.huta.slot": "a",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": {
+        "a2": {
+          "aliases": [
+            "worker"
+          ]
+        }
+      },
+      "pids_limit": 128,
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "no",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29003:29003",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/shop/prod",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    },
+    "slot-b-api": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "API_DB_KEY": "‹secret›",
+        "API_MODE": "full",
+        "HUTA_COMPONENT": "api",
+        "HUTA_PROJECT": "shop",
+        "HUTA_SLOT": "b",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "ffffffffffffffffffffffffffffffffffffffff"
+      },
+      "image": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "labels": {
+        "run.huta.component": "api",
+        "run.huta.project": "shop",
+        "run.huta.sha": "ffffffffffffffffffffffffffffffffffffffff",
+        "run.huta.slot": "b",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "512m",
+      "networks": {
+        "b2": {
+          "aliases": [
+            "api"
+          ]
+        }
+      },
+      "pids_limit": 128,
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29003:29003",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/shop/prod",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    },
+    "slot-b-web": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "HUTA_COMPONENT": "web",
+        "HUTA_PROJECT": "shop",
+        "HUTA_SLOT": "b",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "ffffffffffffffffffffffffffffffffffffffff",
+        "SHOP_SESSION_KEY": "‹secret›"
+      },
+      "image": "sha256:abababababababababababababababababababababababababababababababab",
+      "labels": {
+        "run.huta.component": "web",
+        "run.huta.project": "shop",
+        "run.huta.public": "1",
+        "run.huta.sha": "ffffffffffffffffffffffffffffffffffffffff",
+        "run.huta.slot": "b",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": {
+        "b2": {
+          "aliases": [
+            "web"
+          ]
+        }
+      },
+      "pids_limit": 128,
+      "ports": [
+        "127.0.0.1:19131:8080"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29003:29003"
+    },
+    "slot-b-worker": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": [
+        "python",
+        "-m",
+        "worker"
+      ],
+      "cpus": 1.0,
+      "dns": [
+        "127.0.0.254"
+      ],
+      "environment": {
+        "HUTA_COMPONENT": "worker",
+        "HUTA_PROJECT": "shop",
+        "HUTA_SLOT": "b",
+        "HUTA_TARGET": "prod",
+        "RELEASE_SHA": "ffffffffffffffffffffffffffffffffffffffff"
+      },
+      "image": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "labels": {
+        "run.huta.component": "worker",
+        "run.huta.project": "shop",
+        "run.huta.sha": "ffffffffffffffffffffffffffffffffffffffff",
+        "run.huta.slot": "b",
+        "run.huta.target": "prod"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "compress": "false",
+          "max-file": "3",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "256m",
+      "networks": {
+        "b2": {
+          "aliases": [
+            "worker"
+          ]
+        }
+      },
+      "pids_limit": 128,
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "no",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=16777216,mode=1777"
+      ],
+      "user": "29003:29003",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/var/lib/huta/data/shop/prod",
+          "target": "/data",
+          "type": "bind"
+        }
+      ]
+    }
+  }
+}

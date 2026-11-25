@@ -1,0 +1,27 @@
+# Test fixture: a project with a web, an api and a worker (DESIGN-v2 §3).
+schema = 1
+project = "shop"
+order = ["web", "api", "worker"]
+
+[images.web]
+dockerfile = "web/Dockerfile"
+[images.api]
+dockerfile = "api/Dockerfile"
+
+[components.web]
+image = "web"
+public = true
+port = 8080
+[components.api]
+image = "api"
+port = 8081
+health = "/ready"
+data = "/data"
+[components.worker]
+image = "api"
+kind = "worker"
+cmd = ["python", "-m", "worker"]
+data = "/data"
+
+[state]
+kind = "data"

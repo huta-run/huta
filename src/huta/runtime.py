@@ -350,6 +350,23 @@ def environment(platform: Platform, project: Project, t: Target, sha: str, slot:
     return env
 
 
+def component_environment(platform: Platform, project: Project, t: Target, sha: str, slot: str,
+                          cname: str, public: bool, with_secrets: bool) -> dict[str, str]:
+    """A component's environment when a slot has several (DESIGN-v2 §3): the target's env and
+    egress for all; the target's secrets only for the public component; the registry's
+    per-component env and secrets on top."""
+    env = environment(platform, project, t, sha, slot, with_secrets)
+    if not public:
+        for n in t.secrets:
+            env.pop(n, None)
+    c = t.components.get(cname, {})
+    env.update(c.get("env", {}))
+    for n in c.get("secrets", []):
+        env[n] = secret_value(platform, project.name, n) if with_secrets else SECRET_PLACEHOLDER
+    env["HUTA_COMPONENT"] = cname
+    return env
+
+
 def compose_escape(env: dict[str, str]) -> dict[str, str]:
     """Compose interpolates $ in its file; a value is data, so every $ is doubled."""
     return {k: v.replace("$", "$$") for k, v in env.items()}
@@ -380,8 +397,8 @@ def concurrent_safe(app: dict, t: Target | None = None) -> bool:
 
 # ------------------------------------------------------------------ hardening (shared)
 
-def hardening(project: Project, t: Target) -> dict:
-    lim = t.limits
+def hardening(project: Project, t: Target, limits: dict | None = None) -> dict:
+    lim = t.limits if limits is None else limits
     tmp = size_bytes(lim["tmp"], "limits.tmp", 1 << 20, 4 << 30) if "tmp" in lim else 16 << 20
     return {
         "user": f"{project.uid}:{project.uid}",
@@ -401,9 +418,13 @@ def needs_gateway(t: Target) -> bool:
 
 
 def docker_run_args(platform: Platform, project: Project, t: Target, app: dict, network: str,
-                    env: dict[str, str], name: str, labels: dict[str, str]) -> list[str]:
-    """`docker run` flags matching the compose slots, for jobs."""
-    h = hardening(project, t)
+                    env: dict[str, str], name: str, labels: dict[str, str],
+                    component: str | None = None) -> list[str]:
+    """`docker run` flags matching the compose slots, for jobs. component: which component's
+    limits and data mount apply (default: the public one)."""
+    comp = app["components"][component] if component else SP.public(app)
+    h = hardening(project, t, (t.components.get(component, {}).get("limits") or None)
+                  if component else None)
     args = ["--name", name, "--network", network, "--user", h["user"], "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
             "--memory", h["mem_limit"], "--cpus", str(h["cpus"]),
@@ -416,7 +437,7 @@ def docker_run_args(platform: Platform, project: Project, t: Target, app: dict, 
         args += ["--label", f"{k}={v}"]
     if needs_gateway(t):
         args += ["--add-host", f"{EGRESS_HOST}:host-gateway"]
-    mnt = data_mount(app)
+    mnt = comp.get("data")
     if mnt:
         _img, where = data_paths(platform, t)
         args += ["--mount", f"type=bind,source={where},target={mnt}"]

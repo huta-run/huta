@@ -42,7 +42,7 @@ from .data import DataError
 from . import store as S
 from .cfg import (ConfigError, load_platform, load_registry, parse_app_toml, read_secret, redact,
                   redact_obj,
-                  zone_for)
+                  zone_for, NAME_RE)
 from .ext import Cloudflare, ExtError, GitHub
 from . import spec as SP
 
@@ -254,10 +254,30 @@ def _resolve_image(ref: str) -> tuple[str, str]:
     return image_id, tag
 
 
-def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> str:
+def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", images=None) -> str:
+    """images: {name: image id} for a project with several images (DESIGN-v2 §3); image_id and
+    tag are then the public component's."""
     # P-003: the manifest comes from git at this sha, not from the submitter or image labels.
     app = parse_app_toml(gh.read_file(project.repo, project.app_toml, sha), project.name)
-    recipe.check_image(image_id, sha, project.name)
+    if len(app["images"]) > 1:
+        if not images:
+            raise ConfigError(f"app.toml at {sha[:12]} names {len(app['images'])} images and the "
+                              "request brought one: update the client (huta self-update), "
+                              "pack and submit again")
+        if set(images) != set(app["images"]):
+            raise ConfigError(f"the request brings images {sorted(images)}, app.toml names "
+                              f"{sorted(app['images'])}")
+        image_id = images[SP.public(app)["image"]]
+        tag = _resolve_image(image_id)[1]
+    else:
+        images = {next(iter(app["images"])): image_id}
+    recipe.check_image_map(images, sha, app, project.name)
+    if SP.several(app):
+        from . import egress as E
+        if not E.intra_ready():
+            raise ConfigError("this release has several components, which talk over their slot's "
+                              "bridge; the host firewall's guard has no huta_intra set yet "
+                              "(operator: load systemd/nftables-huta-egress.nft.example again)")
     live = st.live(project.name, t.name)
     live_rel = st.release(live["release_id"]) if live else None
     if R.data_mount(app) and not t.data:
@@ -354,7 +374,7 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="") -> s
     return st.new_release(project=project.name, target=t.name, sha=sha, image_id=image_id,
                           image_tag=tag, app_toml=json.dumps(app), plan=plan,
                           plan_hash=hashlib.sha256(blob.encode()).hexdigest(), built_by="dev",
-                          images={next(iter(app["images"])): image_id},
+                          images=images,
                           schema=(app.get("state") or {}).get("schema"))
 
 
@@ -362,7 +382,9 @@ def secret_names(t) -> list[str]:
     """Every secret name a target uses: its own, its jobs' and a gateway's header."""
     gw = [t.gateway["secret"]] if t.gateway and t.gateway.get("secret") else []
     mig = [n for n in t.migrate_secrets if n not in t.secrets]
-    return t.secrets + [n for names in t.job_secrets.values() for n in names] + gw + mig
+    comp = [n for c in t.components.values() for n in c["secrets"]]
+    names = t.secrets + [n for names in t.job_secrets.values() for n in names] + gw + mig + comp
+    return list(dict.fromkeys(names))
 
 
 def _gates(gh, project, t, sha):
@@ -379,7 +401,15 @@ def cmd_submit(a):
         raise ConfigError("sha must be hex")
     sha = GitHub(platform).full_sha(project.repo, a.sha)
     image_id, tag = _resolve_image(a.image)
-    rid = submit_release(platform, project, st, t, sha, image_id, tag)
+    images = None
+    if a.images:
+        images = {}
+        for item in a.images:
+            name, _, ref = item.partition("=")
+            if not NAME_RE.match(name) or not ref:
+                raise ConfigError("--image takes <name>=<image id or tag>")
+            images[name] = _resolve_image(ref)[0]
+    rid = submit_release(platform, project, st, t, sha, image_id, tag, images)
     st.event("submitted-by", f"CLI on {platform.host}", rid, project.name, t.name)
     tell(platform, st, rid)
     ask(platform, st, rid)
@@ -476,14 +506,14 @@ def notify(platform, text: str) -> None:
         pass
 
 
-def submit_release(platform, project, st, t, sha, image_id, tag) -> str:
+def submit_release(platform, project, st, t, sha, image_id, tag, images=None) -> str:
     """Shared by `huta submit` and the pull/push intake: gates, reconcile, plan."""
     gh = GitHub(platform)
     _gates(gh, project, t, sha)
     with st.lock(project.name, t.name), st.lock(project.name, R.SECRETS_LOCK, wait=60):
         recipe.reconcile(platform, st, project, t, say)
         settle_journal(platform, st, project)
-        return plan_release(platform, project, st, t, sha, image_id, tag, gh)
+        return plan_release(platform, project, st, t, sha, image_id, tag, gh, images=images)
 
 
 # Release states after which an interrupted secret apply can be settled: keep the new values
@@ -747,15 +777,20 @@ def cmd_rollback(a):
         if not live:
             raise ConfigError("nothing is live")
         cur = st.release(live["release_id"])
+        # A release differs by any of its images (a rollback that only changes a worker counts).
         prev = [r for r in st.releases(project.name, limit=500)
-                if r["target"] == t.name and r["state"] == S.RETIRED and r["image_id"] != cur["image_id"]]
+                if r["target"] == t.name and r["state"] == S.RETIRED
+                and st.images(r) != st.images(cur)]
         if not prev:
             raise ConfigError("no earlier release to roll back to")
         p = prev[0]
         # The historical identity must still be on this host, exactly (codex #9).
-        recipe.check_image(p["image_id"], p["sha"], project.name)
+        p_images = st.images(p)
+        for iid in p_images.values():
+            recipe.check_image(iid, p["sha"], project.name)
         rid = plan_release(platform, project, st, t, p["sha"], p["image_id"], p["image_tag"],
-                           GitHub(platform), note=f"rollback to {p['id']}")
+                           GitHub(platform), note=f"rollback to {p['id']}",
+                           images=p_images if len(p_images) > 1 else None)
     st.event("submitted-by", f"rollback on {platform.host}", rid, project.name, t.name)
     tell(platform, st, rid)
     ask(platform, st, rid)
@@ -871,7 +906,8 @@ def handle_request(platform, registry, st, req: dict, transport: str, box: str) 
         # Redacted at ingest and again here, then filtered and cut (logs.py). Every read is an
         # event, with what was asked but none of the lines.
         from . import logs as L
-        opts = {k: req[k] for k in ("since", "until", "grep", "tail", "slot", "release", "job")
+        opts = {k: req[k] for k in ("since", "until", "grep", "tail", "slot", "release", "job",
+                                    "component")
                 if k in req}
         res = L.query(platform, st, project, t, box=box, **opts)
         st.event("logs-read", f"box {box} ({transport}): {json.dumps(opts)[:300]} → "
@@ -879,25 +915,42 @@ def handle_request(platform, registry, st, req: dict, transport: str, box: str) 
                  None, project.name, t.name)
         return {"ok": True, "text": res["text"], "truncated": res["truncated"]}
     # submit
-    if transport == "push":
-        if "digest" not in req:
-            raise ConfigError("a push submit must name the pushed digest")
-        image_id, tag, claimed = images.import_from_registry(
-            project.name, req["image"], req["digest"], platform.push["registry_local"])
-    else:
-        if "digest" in req:
+    def fetch(ref: str, digest: str | None):
+        if transport == "push":
+            if not digest:
+                raise ConfigError("a push submit must name the pushed digest of every image")
+            return images.import_from_registry(project.name, ref, digest,
+                                               platform.push["registry_local"])
+        if digest:
             raise ConfigError("digest is only used by the push transport")
-        image_id, tag, claimed = images.import_from_dev(project.name, req["image"],
-                                                        platform.state_dir, box)
+        return images.import_from_dev(project.name, ref, platform.state_dir, box)
+
+    fetched: list[tuple[str, str]] = []
     try:
-        if claimed != req["sha"]:
-            raise ConfigError(f"image says {claimed[:12]}, request says {req['sha'][:12]}")
-        rid = submit_release(platform, project, st, t, req["sha"], image_id, tag)
+        if "images" in req:
+            # Several images (DESIGN-v2 §3): each comes in like the one image of a v1 request.
+            imap = {}
+            for name, v in sorted(req["images"].items()):
+                iid, itag, claimed = fetch(v["image"], v.get("digest"))
+                fetched.append((iid, itag))
+                if claimed != req["sha"]:
+                    raise ConfigError(f"image {name} says {claimed[:12]}, request says {req['sha'][:12]}")
+                imap[name] = iid
+            image_id, tag = fetched[0]
+            rid = submit_release(platform, project, st, t, req["sha"], image_id, tag, imap)
+        else:
+            image_id, tag, claimed = fetch(req["image"], req.get("digest"))
+            fetched.append((image_id, tag))
+            if claimed != req["sha"]:
+                raise ConfigError(f"image says {claimed[:12]}, request says {req['sha'][:12]}")
+            rid = submit_release(platform, project, st, t, req["sha"], image_id, tag)
     except Exception:
-        # A refused submit must not leave its image behind (transport review #2). Untag only
-        # when no release refers to it; docker frees the image once nothing names or uses it.
-        if not st.db.execute("SELECT 1 FROM releases WHERE image_id=?", (image_id,)).fetchone():
-            subprocess.run(["docker", "image", "rm", tag], capture_output=True, timeout=120)
+        # A refused submit must not leave its images behind (transport review #2). Untag only
+        # when no release refers to one; docker frees an image once nothing names or uses it.
+        for iid, itag in fetched:
+            if not st.db.execute("SELECT 1 FROM releases WHERE image_id=? OR images LIKE ?",
+                                 (iid, f'%"{iid}"%')).fetchone():
+                subprocess.run(["docker", "image", "rm", itag], capture_output=True, timeout=120)
         raise
     st.event("submitted-by", f"from {box} ({transport})", rid, project.name, t.name)
     text = plan_text(st, rid)
@@ -1394,7 +1447,8 @@ def cmd_logs(a):
     except RuntimeError:
         pass                                    # the collector is busy; read what is there
     res = L.query(platform, st, project, t, since=a.since, until=a.until, grep=a.grep,
-                  tail=a.tail, slot=a.slot, release=a.release, job=a.job)
+                  tail=a.tail, slot=a.slot, release=a.release, job=a.job,
+                  component=a.component)
     print(res["text"])
     return 0
 
@@ -1503,15 +1557,15 @@ def cmd_start(a):
             from . import data as D
             say(D.ensure(platform, project, t))
         cons = recipe.slot_containers(t)
-        imgs = {s: (rel["image_id"], rel["sha"]) for s in recipe.SLOTS}
+        imgs = {s: recipe.slot_images(st, rel, app) for s in recipe.SLOTS}
         other = "b" if live["slot"] == "a" else "a"
-        if other in cons:
+        if other in cons and not SP.several(app):
             imgs[other] = (cons[other]["image"], cons[other]["sha"])
         recipe.write_compose(platform, t, recipe.compose_doc(platform, project, t, app, imgs))
         args = ["up", "-d", "--no-deps", "--pull", "never"]
         if a.cmd == "restart":
             args.append("--force-recreate")
-        recipe.compose(platform, t, *args, recipe.service(live["slot"]))
+        recipe.compose(platform, t, *args, *recipe.services(app, live["slot"]))
         recipe.wait_health(t.slots[recipe.SLOTS.index(live["slot"])], SP.health(app),
                            rel["sha"], timeout=60)
         st.event("started", f"slot {live['slot']} {a.cmd}ed by the operator", live["release_id"],
@@ -1529,6 +1583,7 @@ def _logs_args(s) -> None:
     s.add_argument("--slot", choices=["a", "b", "live", "previous"])
     s.add_argument("--release", help="a release id (8 hex)")
     s.add_argument("--job", help="a job's output instead of the slots'")
+    s.add_argument("--component", help="one component's lines (targets with several)")
 
 
 def main(argv=None) -> int:
@@ -1547,7 +1602,10 @@ def main(argv=None) -> int:
     s = sub.add_parser("import-dev"); s.add_argument("project"); s.add_argument("ref")
     s.set_defaults(f=cmd_import_dev)
     s = sub.add_parser("submit"); s.add_argument("project"); s.add_argument("target")
-    s.add_argument("sha"); s.add_argument("image"); s.set_defaults(f=cmd_submit)
+    s.add_argument("sha"); s.add_argument("image")
+    s.add_argument("--image", dest="images", action="append", default=[],
+                   help="<name>=<image>: every image of a project with several (repeat)")
+    s.set_defaults(f=cmd_submit)
     s = sub.add_parser("show"); s.add_argument("release"); s.set_defaults(f=cmd_show)
     s = sub.add_parser("approve"); s.add_argument("release")
     s.add_argument("--via", choices=["cli", "telegram"], default="cli")

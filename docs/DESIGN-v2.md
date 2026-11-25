@@ -135,7 +135,7 @@ runs_on = [3, 4]                      # schemas this code runs on (must contain 
   `huta approve <id> --confirm-data-loss`, or the Telegram button; huta checks at approval
   that the restore point's fingerprint is unchanged.
 
-## 3. Several containers per target
+## 3. Several containers per target (built)
 
 ```toml
 # app.toml

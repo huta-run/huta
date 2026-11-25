@@ -83,6 +83,75 @@ class Migrations(unittest.TestCase):
                      "must name one of")
 
 
+MULTI = """schema = 1
+project = "shop"
+order = ["web", "api", "worker"]
+
+[images.web]
+dockerfile = "web/Dockerfile"
+[images.api]
+dockerfile = "api/Dockerfile"
+
+[components.web]
+image = "web"
+public = true
+port = 8080
+[components.api]
+image = "api"
+port = 8081
+health = "/ready"
+data = "/data"
+[components.worker]
+image = "api"
+kind = "worker"
+cmd = ["python", "-m", "worker"]
+data = "/data"
+
+[state]
+kind = "data"
+"""
+
+
+class SeveralComponents(unittest.TestCase):
+    """Several containers per target (DESIGN-v2 §3)."""
+
+    def parse(self, text):
+        return parse_app_toml(text, "shop")
+
+    def refused(self, text, pattern):
+        with self.assertRaisesRegex(ConfigError, pattern):
+            self.parse(text)
+
+    def test_accepted(self):
+        app = self.parse(MULTI)
+        self.assertEqual(app["order"], ["web", "api", "worker"])
+        self.assertEqual(len(app["images"]), 2)
+
+    def test_one_public_needed(self):
+        self.refused(MULTI.replace("public = true\n", ""), "exactly one HTTP component is public")
+        self.refused(MULTI.replace('port = 8081', 'port = 8081\npublic = true'),
+                     "exactly one HTTP component is public")
+
+    def test_only_http_component_needs_no_mark(self):
+        text = MULTI.replace("public = true\n", "").replace(
+            'image = "api"\nport = 8081\nhealth = "/ready"', 'image = "api"\nkind = "worker"')
+        self.assertEqual(self.parse(text)["components"]["api"]["kind"], "worker")
+
+    def test_worker_serves_nothing(self):
+        self.refused(MULTI.replace('kind = "worker"', 'kind = "worker"\nport = 9000'), "worker")
+
+    def test_cmd_is_argv(self):
+        self.refused(MULTI.replace('cmd = ["python", "-m", "worker"]', 'cmd = "python -m worker"'),
+                     "argv")
+
+    def test_reserved_name(self):
+        self.refused(MULTI.replace('"worker"]', '"postgres"]').replace(
+            "[components.worker]", "[components.postgres]"), "reserved")
+
+    def test_data_needs_a_writer(self):
+        self.refused(MULTI.replace('data = "/data"\n', ""), "needs components")
+
+
 class PlannedFeaturesRefused(unittest.TestCase):
     """Today's refusals. A v2 step that builds a feature replaces its test here."""
 
@@ -92,18 +161,6 @@ class PlannedFeaturesRefused(unittest.TestCase):
 
     def test_schema_2(self):
         self.refused(HELLO.replace("schema = 1", "schema = 2"), "schema must be 1")
-
-    def test_second_component(self):
-        text = HELLO.replace('order = ["web"]', 'order = ["web", "worker"]')
-        self.refused(with_lines(text, after='[components.worker]\nimage = "web"\nkind = "worker"\n'),
-                     "exactly one component")
-
-    def test_worker_kind(self):
-        self.refused(HELLO.replace('kind = "http"', 'kind = "worker"'), 'kind = "http" only')
-
-    def test_second_image(self):
-        self.refused(with_lines(HELLO, after='[images.api]\ndockerfile = "Dockerfile.api"\n'),
-                     "exactly one")
 
     def test_external(self):
         self.refused(with_lines(HELLO, after='[external.site]\nkind = "cloudflare-pages"\n'),

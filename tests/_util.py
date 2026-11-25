@@ -48,8 +48,10 @@ def load(etc: Path):
 
 def app_toml(project: str) -> dict:
     from huta.cfg import parse_app_toml
-    return parse_app_toml((ROOT / "examples" / project / "deploy" / "app.toml").read_text(),
-                          project)
+    f = FIXTURES / "apps" / f"{project}.toml"
+    if not f.exists():
+        f = ROOT / "examples" / project / "deploy" / "app.toml"
+    return parse_app_toml(f.read_text(), project)
 
 
 def check_golden(case, name: str, value) -> None:

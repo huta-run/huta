@@ -30,9 +30,23 @@ class Requests(unittest.TestCase):
             parse(raw({**SUBMIT, "v": 2}))
 
     def test_unexpected_field_refused(self):
-        # Today's answer to an images map. v2 adds it as an optional field of v = 1.
         with self.assertRaisesRegex(RequestError, "unexpected"):
-            parse(raw({**SUBMIT, "images": {"web": "huta-build/hello:0123456789ab"}}))
+            parse(raw({**SUBMIT, "colour": "blue"}))
+
+    def test_images_map(self):
+        """Several images (DESIGN-v2 §3): optional, inside v = 1."""
+        imgs = {"web": {"image": "huta-build/hello:0123456789ab"},
+                "api": {"image": "huta-build/hello/api:0123456789ab",
+                        "digest": "sha256:" + "1" * 64}}
+        self.assertEqual(parse(raw({**SUBMIT, "images": imgs}))["images"], imgs)
+        for bad in ({"api": {"image": "huta-build/other/api:0123456789ab"}},
+                    {"api": {"image": "huta-build/hello/web:0123456789ab"}},   # name mismatch
+                    {"API": {"image": "huta-build/hello/API:0123456789ab"}},
+                    {"api": "huta-build/hello/api:0123456789ab"},
+                    {"api": {"image": "huta-build/hello/api:0123456789ab", "x": 1}},
+                    {}):
+            with self.subTest(images=bad), self.assertRaises(RequestError):
+                parse(raw({**SUBMIT, "images": bad}))
 
     def test_image_must_belong_to_project(self):
         with self.assertRaisesRegex(RequestError, "bad image"):
