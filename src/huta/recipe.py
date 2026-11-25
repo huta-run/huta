@@ -514,12 +514,15 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
         prev = live["release_id"] if live else None
         note = (" (interrupted after the switch: its public checks did not run)"
                 if serving["state"] == S.RUNNING else "")
-        st.make_live(serving["id"], routed, prev, f"reconciled: slot {routed} serves this release{note}")
-        if prev and prev != serving["id"] and st.db.execute(
-                "SELECT 1 FROM events WHERE release_id=? AND kind='public-fail'", (prev,)).fetchone():
-            # A revert was interrupted after the vhost went back: the failed release must not
-            # become `retired` (that would make it huta rollback's target; grok #12).
-            st.set_state(prev, S.ROLLED_BACK, msg="reverted (finished by reconcile)")
+        # A revert interrupted after the vhost went back: the failed release must not become
+        # `retired` (huta rollback's target; grok #12). Its new state goes in the same
+        # transaction as the live pointer, so a crash can't leave it retired (crash tests).
+        failed = bool(prev and prev != serving["id"] and st.db.execute(
+            "SELECT 1 FROM events WHERE release_id=? AND kind='public-fail'", (prev,)).fetchone())
+        st.make_live(serving["id"], routed, prev,
+                     f"reconciled: slot {routed} serves this release{note}",
+                     retire_as=S.ROLLED_BACK if failed else S.RETIRED,
+                     retire_msg="reverted (finished by reconcile)")
         log(f"reconcile: {serving['id']} is live on slot {routed}")
     for r in st.in_state(project.name, t.name, S.RUNNING, S.APPROVED):
         if r["id"] != serving["id"]:

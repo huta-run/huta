@@ -91,8 +91,11 @@ class Store:
         r = self.release(rid)
         self.event(to, msg or to, rid, r["project"], r["target"])
 
-    def make_live(self, rid: str, slot: str, retire: str | None, msg: str) -> None:
-        """Live pointer, new state and the retired predecessor change in one transaction."""
+    def make_live(self, rid: str, slot: str, retire: str | None, msg: str,
+                  retire_as: str = RETIRED, retire_msg: str = "") -> None:
+        """Live pointer, new state and the predecessor's new state change in one transaction.
+        retire_as: the predecessor's state, RETIRED unless it failed (ROLLED_BACK: a revert
+        finished by reconcile, so it never becomes huta rollback's target)."""
         r = self.release(rid)
         now = time.time()
         with self.db:
@@ -106,7 +109,12 @@ class Store:
                             (LIVE, slot, now, rid))
             if retire and retire != rid:
                 self.db.execute("UPDATE releases SET state=?, updated=? WHERE id=?",
-                                (RETIRED, now, retire))
+                                (retire_as, now, retire))
+                if retire_as != RETIRED:
+                    self.db.execute(
+                        "INSERT INTO events (ts, release_id, project, target, kind, msg)"
+                        " VALUES (?,?,?,?,?,?)", (now, retire, r["project"], r["target"],
+                                                 retire_as, redact(retire_msg or retire_as)))
             self.db.execute(
                 "INSERT INTO events (ts, release_id, project, target, kind, msg) VALUES (?,?,?,?,?,?)",
                 (now, rid, r["project"], r["target"], LIVE, redact(msg)))

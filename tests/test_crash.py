@@ -188,8 +188,6 @@ class Scenario:
 
 # ------------------------------------------------------------ scenarios
 # Known bugs found by these tests, each skipped until the commit that fixes it removes the mark.
-BUG_REVERT_RETIRES = ("known bug: if reconcile dies while finishing a revert, the failed release "
-                      "can end up retired (huta rollback's target)")
 BUG_REVERT_NEEDS_CERT = ("known bug: reconcile's revert needs a usable newest certificate and "
                          "Cloudflare's IP list; without them it raises and records nothing")
 
@@ -209,10 +207,6 @@ class StatelessPublicFail(Scenario, unittest.TestCase):
     project_name, target_name = "hello", "prod"
     faults = {"public_fail": True}
     clean, allowed = RB, {NA, RB}
-
-    @unittest.skip(BUG_REVERT_RETIRES)
-    def test_reconcile_crashes_too(self):
-        pass
 
 
 @unittest.skip(BUG_REVERT_NEEDS_CERT)
