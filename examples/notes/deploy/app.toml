@@ -18,6 +18,10 @@ concurrent_safe = true         # each slot writes its own file (hits.<slot>.log)
 [state]
 kind = "data"
 
+# Monitoring hooks: SENTRY_DSN, SENTRY_RELEASE, SENTRY_ENVIRONMENT, if the host grants errors.
+[monitor]
+env = ["sentry"]
+
 [[smoke]]
 path = "/"
 status = 200

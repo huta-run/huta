@@ -6,6 +6,9 @@
 /egress       fetches https://<NOTES_EGRESS_HOST>/ through the egress proxy (HTTPS_PROXY)
 /upstream     opens a TCP connection to HUTA_UPSTREAM_<NAME> (NOTES_UPSTREAM names it)
 /secret       says whether the NOTES_KEY secret is set (never its value)
+/error        sends one test error to Bugsink (SENTRY_DSN, through the egress proxy), tagged
+              with SENTRY_RELEASE and SENTRY_ENVIRONMENT. Loopback only: a request that came
+              through Cloudflare gets 404, so the public can't fill Bugsink.
 
 Test switch (host env, to watch huta refuse or revert a release):
 NOTES_FAIL=cf     every request that came through Cloudflare gets 503: loopback checks pass,
@@ -21,7 +24,9 @@ import signal
 import socket
 import sys
 import time
+import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA = os.environ.get("NOTES_DATA", "/data")
@@ -82,12 +87,40 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps({"upstream": name, "reachable": True}))
             except Exception as e:  # noqa: BLE001
                 return self.send(502, json.dumps({"upstream": name, "error": f"{type(e).__name__}"}))
+        if self.path == "/error" and not self.headers.get("CF-Connecting-IP"):
+            return self.send(*send_test_error())
         if self.path == "/secret":
             return self.send(200, json.dumps({"NOTES_KEY": bool(os.environ.get("NOTES_KEY"))}))
         return self.send(404, json.dumps({"error": "not found"}))
 
     def log_message(self, *a):
         pass
+
+
+def send_test_error() -> tuple[int, str]:
+    """One event in the Sentry store format, sent with the standard library (no SDK)."""
+    dsn = os.environ.get("SENTRY_DSN", "")
+    if not dsn:
+        return 503, json.dumps({"error": "no SENTRY_DSN (app.toml asks; the host must grant)"})
+    u = urllib.parse.urlsplit(dsn)
+    project = u.path.rstrip("/").rsplit("/", 1)[-1]
+    url = f"{u.scheme}://{u.hostname}{f':{u.port}' if u.port else ''}/api/{project}/store/"
+    event = {"event_id": uuid.uuid4().hex, "timestamp": time.time(), "platform": "python",
+             "level": "error", "logger": "notes",
+             "release": os.environ.get("SENTRY_RELEASE", SHA),
+             "environment": os.environ.get("SENTRY_ENVIRONMENT", ""),
+             "exception": {"values": [{"type": "NotesTestError",
+                                       "value": "a test error from notes /error"}]}}
+    req = urllib.request.Request(url, data=json.dumps(event).encode(), method="POST", headers={
+        "Content-Type": "application/json",
+        "X-Sentry-Auth": f"Sentry sentry_version=7, sentry_key={u.username}, "
+                         "sentry_client=huta-notes-example/1"})
+    try:   # urllib takes the route from HTTPS_PROXY, which huta sets
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return 200, json.dumps({"sent": event["event_id"], "status": r.status,
+                                    "release": event["release"]})
+    except Exception as e:  # noqa: BLE001
+        return 502, json.dumps({"error": f"{type(e).__name__}: {e}"[:300]})
 
 
 def rotate():

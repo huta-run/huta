@@ -830,6 +830,7 @@ class Env(unittest.TestCase):
     def app(self, ask):
         from tests._util import app_toml
         a = app_toml("notes")
+        a.pop("monitor", None)           # the example asks for sentry; each test says its own
         if ask:
             a["monitor"] = {"env": ask}
         return a
