@@ -544,6 +544,7 @@ def text(st, rid: str) -> str:
 NOTIFY_FOR = 24 * 3600     # seconds a verdict's message is retried after the verdict
 TELL_BATCH = 10            # verdict messages per tick
 TELL_RESERVE = 8           # seconds of the tick kept for telling
+EVAL_MIN = 10              # seconds kept for evaluating before leftovers are told
 
 
 def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None) -> None:
@@ -551,7 +552,9 @@ def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None
     tell what changed. Bounded by `end`; time is kept for telling."""
     # Leftovers from earlier ticks get a small share first, so failing deliveries can't eat the
     # time evaluation needs (codex, third look at milestone 5); the rest is told at the end.
-    _tell(platform, st, min(end, time.monotonic() + TELL_RESERVE), log)
+    first = min(TELL_RESERVE, end - time.monotonic() - TELL_RESERVE - EVAL_MIN)
+    if first >= 3:
+        _tell(platform, st, time.monotonic() + first, log)
     work_end = end - TELL_RESERVE
     for project in registry.values():
         for t in project.targets.values():

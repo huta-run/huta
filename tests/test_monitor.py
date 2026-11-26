@@ -2038,6 +2038,13 @@ class WatchBaseline(Watch):
 
 class WatchTellBudget(Watch):
     def test_failing_deliveries_leave_time_to_evaluate(self):
+        for budget in (40.0, 16.0):
+            with self.subTest(budget=budget):
+                self.tearDown()
+                self.setUp()
+                self.check_budget(budget)
+
+    def check_budget(self, budget):
         from huta import notify as N
         app = self.st.release(self.rid)["app_toml"]
         for i in range(10):                         # ten old verdicts whose delivery hangs
@@ -2060,11 +2067,12 @@ class WatchTellBudget(Watch):
         self.st.db.execute("UPDATE live SET since=?", (time.time() - 60,))
         with mock.patch.object(N, "_token", lambda p: "tok"), mock.patch.object(N, "_call", hang), \
                 mock.patch.object(self.W.time, "monotonic", lambda: clock[0]):
-            self.W.tick(self.platform, self.registry, self.st, 40.0)
+            self.W.tick(self.platform, self.registry, self.st, budget)
         live = self.st.live("hello", "prod")
         r = self.st.db.execute("SELECT * FROM watches WHERE release_id=? AND since=?",
                                (live["release_id"], live["since"])).fetchone()
         self.assertIsNotNone(r)                      # opened
         self.assertIsNotNone(r["last_tick"])         # and evaluated
-        self.assertTrue(tried)                       # the deliveries were really attempted
-        self.assertLessEqual(clock[0], 40.0)
+        if budget >= 40:
+            self.assertTrue(tried)                   # the deliveries were really attempted
+        self.assertLessEqual(clock[0], budget)
