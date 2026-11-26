@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS live (
 # The database's own version (PRAGMA user_version). Migrations run forward only, each in one
 # transaction; a database newer than this code is refused, never misread (DESIGN-v2 §0).
 # 0 = a database from before versioning, which is version 1's tables.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MIGRATIONS: dict[int, str] = {1: SCHEMA, 2: """
 ALTER TABLE releases ADD COLUMN images TEXT;
 ALTER TABLE releases ADD COLUMN schema INTEGER;
@@ -86,12 +86,24 @@ CREATE TABLE watches (
   action TEXT, acked REAL, acked_by TEXT,
   PRIMARY KEY (release_id, since)
 )
+""", 5: """
+CREATE TABLE snapshots (
+  id TEXT PRIMARY KEY, project TEXT NOT NULL, target TEXT NOT NULL, name TEXT NOT NULL,
+  box TEXT NOT NULL, transport TEXT NOT NULL, release_id TEXT NOT NULL,
+  definition TEXT NOT NULL, def_hash TEXT NOT NULL, reason TEXT, source TEXT,
+  state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+  size INTEGER, sha256 TEXT, files INTEGER, needles TEXT, refusal TEXT,
+  delivered REAL, delete_after REAL
+);
+CREATE UNIQUE INDEX snapshots_open ON snapshots (project, target)
+  WHERE state IN ('preparing', 'ready', 'approved')
 """}
 # What each version added: 1, the v1 tables; 2, release image maps and schemas, resources
 # (a target's data volume or database, with its schema), restore points pinned per release,
 # and plans that are not releases (infra: edge, gateways, Postgres; restore); 3, deployments
 # published to Cloudflare by releases (DESIGN-v2 §5); 4, monitoring: the remote checks, projects
-# and sites made for targets, and watch windows (docs/PLAN-monitoring.md).
+# and sites made for targets, and watch windows (docs/PLAN-monitoring.md); 5, data snapshots
+# for dev boxes, at most one open per target (docs/PLAN-snapshot.md).
 
 
 class StoreError(Exception):
@@ -102,6 +114,26 @@ class StoreError(Exception):
 PLANNED, APPROVED, RUNNING, LIVE = "planned", "approved", "running", "live"
 NOTHING_ACTIVATED, ROLLED_BACK, NEEDS_HUMAN = "nothing-activated", "rolled-back", "needs-human"
 REJECTED, SUPERSEDED, RETIRED = "rejected", "superseded", "retired"
+
+# Snapshot states (docs/PLAN-snapshot.md). Open: preparing, ready, approved (one per target).
+# delivered = available to the box; deleted = host-managed paths removed.
+SNAP_PREPARING, SNAP_READY, SNAP_APPROVED = "preparing", "ready", "approved"
+SNAP_DELIVERED, SNAP_DELETED, SNAP_FAILED = "delivered", "deleted", "failed"
+SNAP_REJECTED, SNAP_EXPIRED, SNAP_NEEDS_HUMAN = "rejected", "expired", "needs-human"
+SNAP_OPEN = (SNAP_PREPARING, SNAP_READY, SNAP_APPROVED)
+SNAP_NEXT = {
+    SNAP_PREPARING: {SNAP_READY, SNAP_FAILED},
+    SNAP_READY: {SNAP_APPROVED, SNAP_REJECTED, SNAP_EXPIRED, SNAP_FAILED},
+    SNAP_APPROVED: {SNAP_DELIVERED, SNAP_FAILED, SNAP_REJECTED, SNAP_NEEDS_HUMAN},
+    SNAP_DELIVERED: {SNAP_DELETED, SNAP_NEEDS_HUMAN},
+    SNAP_FAILED: {SNAP_DELETED, SNAP_NEEDS_HUMAN},
+    SNAP_REJECTED: {SNAP_DELETED, SNAP_NEEDS_HUMAN},
+    SNAP_EXPIRED: {SNAP_DELETED, SNAP_NEEDS_HUMAN},
+    SNAP_NEEDS_HUMAN: {SNAP_DELETED},
+    SNAP_DELETED: set(),
+}
+SNAP_FIELDS = {"source", "size", "sha256", "files", "needles", "refusal", "delivered",
+               "delete_after"}
 
 
 class Store:
@@ -247,11 +279,13 @@ class Store:
         return rid
 
     def new_id(self) -> str:
-        """8 hex, unused by any release or plan (both are approved by id)."""
+        """8 hex, unused by any release, plan or snapshot (all are approved by id; a snapshot's
+        plan takes the snapshot's id)."""
         while True:
             i = secrets.token_hex(4)
             if not self.db.execute("SELECT 1 FROM releases WHERE id=? UNION ALL"
-                                   " SELECT 1 FROM plans WHERE id=?", (i, i)).fetchone():
+                                   " SELECT 1 FROM plans WHERE id=? UNION ALL"
+                                   " SELECT 1 FROM snapshots WHERE id=?", (i, i, i)).fetchone():
                 return i
 
     def images(self, r) -> dict:
@@ -263,8 +297,10 @@ class Store:
 
     # ---------------------------------------------------------------- plans (not releases)
 
-    def new_plan(self, project: str, target: str, kind: str, plan: dict) -> str:
-        pid = self.new_id()
+    def new_plan(self, project: str, target: str, kind: str, plan: dict,
+                 pid: str | None = None) -> str:
+        """pid: a snapshot's plan takes the snapshot's id (docs/PLAN-snapshot.md)."""
+        pid = pid or self.new_id()
         now = time.time()
         blob = json.dumps(plan, sort_keys=True)
         self.db.execute("INSERT INTO plans (id, project, target, kind, plan, plan_hash, state,"
@@ -285,6 +321,85 @@ class Store:
             raise RuntimeError(f"plan {pid} is {now['state'] if now else 'unknown'}, not {frm}")
         r = self.plan_row(pid)
         self.event(to, msg or to, pid, r["project"], r["target"])
+
+    # ---------------------------------------------------------------- snapshots
+
+    def new_snapshot(self, *, project: str, target: str, name: str, box: str, transport: str,
+                     release_id: str, definition: dict, reason: str, per_day: int,
+                     now: float | None = None) -> str:
+        """A `preparing` row, if the target has no open snapshot and fewer than `per_day`
+        accepted requests in the last 24 h (failures count). One transaction with its event;
+        raises RuntimeError with the reason otherwise."""
+        now = time.time() if now is None else now
+        blob = json.dumps(definition, sort_keys=True)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.db.execute("SELECT 1 FROM snapshots WHERE project=? AND target=? AND state IN"
+                               " (?,?,?)", (project, target, *SNAP_OPEN)).fetchone():
+                raise RuntimeError(f"{project}/{target} already has an open snapshot")
+            n = self.db.execute("SELECT count(*) FROM snapshots WHERE project=? AND target=? AND"
+                                " created > ?", (project, target, now - 86400)).fetchone()[0]
+            if n >= per_day:
+                raise RuntimeError(f"{project}/{target} had {n} snapshots in the last 24 h "
+                                   f"(at most {per_day})")
+            sid = self.new_id()
+            self.db.execute(
+                "INSERT INTO snapshots (id, project, target, name, box, transport, release_id,"
+                " definition, def_hash, reason, state, created, updated)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, project, target, name, box, transport, release_id, blob,
+                 hashlib.sha256(blob.encode()).hexdigest(), reason, SNAP_PREPARING, now, now))
+            self.db.execute("INSERT INTO events (ts, release_id, project, target, kind, msg)"
+                            " VALUES (?,?,?,?,?,?)",
+                            (now, sid, project, target, "snapshot",
+                             redact(f"snapshot {name} of {project}/{target} for box {box} "
+                                    f"({transport})")[:2000]))
+        return sid
+
+    def snapshot(self, sid: str):
+        return self.db.execute("SELECT * FROM snapshots WHERE id=?", (sid,)).fetchone()
+
+    def snapshots(self, project: str | None = None, target: str | None = None,
+                  states=None, limit: int = 200) -> list:
+        q, a = "SELECT * FROM snapshots WHERE 1=1", []
+        if project:
+            q, a = q + " AND project=?", a + [project]
+        if target:
+            q, a = q + " AND target=?", a + [target]
+        if states:
+            q += f" AND state IN ({','.join('?' * len(states))})"
+            a += list(states)
+        return self.db.execute(q + " ORDER BY created DESC LIMIT ?", (*a, limit)).fetchall()
+
+    def snapshot_transition(self, sid: str, frm: str, to: str, msg: str = "",
+                            plan: tuple[str, str] | None = None, **fields) -> None:
+        """Move a snapshot from `frm` to `to` (only along SNAP_NEXT), set `fields`, and with
+        `plan` = (from, to) move its plan the same way: one transaction with the event. Raises
+        RuntimeError if the row (or plan) is not where the caller thinks."""
+        if to not in SNAP_NEXT.get(frm, set()):
+            raise RuntimeError(f"snapshot {sid}: {frm} → {to} is not a step")
+        bad = set(fields) - SNAP_FIELDS
+        if bad:
+            raise RuntimeError(f"snapshot {sid}: unknown fields {sorted(bad)}")
+        now = time.time()
+        sets = ", ".join(f"{k}=?" for k in fields)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            cur = self.db.execute(
+                f"UPDATE snapshots SET state=?, updated=?{', ' + sets if sets else ''}"
+                " WHERE id=? AND state=?", (to, now, *fields.values(), sid, frm))
+            if cur.rowcount != 1:
+                r = self.snapshot(sid)
+                raise RuntimeError(f"snapshot {sid} is {r['state'] if r else 'unknown'}, not {frm}")
+            if plan is not None:
+                c = self.db.execute("UPDATE plans SET state=?, updated=? WHERE id=? AND state=?",
+                                    (plan[1], now, sid, plan[0]))
+                if c.rowcount != 1:
+                    raise RuntimeError(f"plan {sid} is not {plan[0]}")
+            r = self.snapshot(sid)
+            self.db.execute("INSERT INTO events (ts, release_id, project, target, kind, msg)"
+                            " VALUES (?,?,?,?,?,?)", (now, sid, r["project"], r["target"],
+                                                      f"snapshot-{to}", redact(msg or to)[:2000]))
 
     # ---------------------------------------------------------------- monitors
 

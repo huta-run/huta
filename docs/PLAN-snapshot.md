@@ -115,8 +115,8 @@ Open = `preparing`, `ready`, `approved`; one per target (a partial unique index)
 It holds `Store.acquire(<p>, "_snapshot-<t>")` for every step and decision (prepare, approve,
 reject, expiry, deliver, fetch, rm, sweep), and one host-wide `_snapshot` lock while preparing
 (order: per-target, then host-wide; never mixed with the target or secrets locks). Backup
-publication (`data._publish`, `pg.copy`, `recover_publish`) gains a short `_publish-<t>` lock;
-the input is pinned under it. `store.busy` stays as it is: every active step holds a lock in
+publication (`data._publish`, `pg.copy`, `recover_publish`) and pinning share a short lock,
+`<backup dir>/<p>/<t>/.publish.lock` (built in S0); the input is pinned under it. `store.busy` stays as it is: every active step holds a lock in
 `locks/`, and no snapshot plan stays `approved` (a delivery that can't finish ends `failed` or
 `needs-human`). The approval, rejection and expiry paths in `cli` (`_approve_plan`,
 `cmd_reject`, `cmd_press`) branch on `kind == "snapshot"` **before** their target lock and
@@ -129,11 +129,13 @@ the input is pinned under it. `store.busy` stays as it is: every active step hol
    with a fixed name `huta-snapshot-<id>` runs `huta snapshot prepare <id>` (timeout: restore
    budget + `timeout` + 5 min + scan budget; `ExecStopPost` removes its fixed containers). A
    failed `systemd-run` fails the row at once. The answer is the id; the box polls.
-2. **Input.** Under `_publish-<t>`: `recover_publish`, then pin the generation: `cp -al
-   --no-dereference` of `<backup>/<p>/<t>/current` to `.snap-<id>` beside it (data), or one
-   hard link of the dump (Postgres). The copy's own timestamp and provenance come from a
-   `.huta-copy.json` written into the generation before it is published (time, release, for
-   Postgres the server image and major version), not from `last.json`. The unit re-reads its
+2. **Input.** Under the publish lock: recover a half-done rotation, then pin the generation:
+   `cp -al --no-dereference` of `<backup>/<p>/<t>/current` to `<backup>/<p>/<t>/snaps/<id>`
+   (data; never `pins/`, which restore points prune by id), or one hard link of the dump
+   (Postgres). The copy's time is the generation directory's mtime, stamped when it is
+   published (`data.copy_time`, built in S0), not `last.json`. For Postgres, a file beside the
+   dump records the server's image and major version (S5); inside a data generation no file is
+   added, since it would be restored onto the volume. The unit re-reads its
    row under `_snapshot-<t>` and exits unless it is still `preparing`.
 3. **Scratch.** A sparse ext4 image of `scratch` bytes under `<state>/snapshots/<p>/<t>/<id>/`,
    loop-mounted `nodev,nosuid,noexec` at `<id>/mnt`; `mnt/out` (project uid, 0700) is bind
@@ -265,7 +267,7 @@ project is gone from the registry.
 |---|---|---|---|
 | request accepted | row `preparing` | unit never started: as below | failed |
 | unit started, lock taken | — | row re-read; not `preparing`: exit | (as recorded) |
-| input pinned | (fixed names `.snap-<id>`) | remove the links (strict remover: parent, name, no symlink, `--one-file-system`) | failed |
+| input pinned | (fixed names `snaps/<id>`) | remove the links (strict remover: parent, name, no symlink, `--one-file-system`) | failed |
 | scratch image made / attached / mounted | (fixed path) | `docker rm -f` (verified gone), unmount if mounted (retry on EBUSY, never lazy), `losetup -d`, delete the image | failed |
 | scratch server / sanitize / check | (fixed container names) | `docker rm -f` all, then as above | failed |
 | `.artifact.tmp` / artifact renamed | — | row still `preparing`: delete it all | failed |
@@ -290,7 +292,7 @@ same commit.
 
 | Milestone | What | Status |
 |---|---|---|
-| S0 | Records: `snapshots` table, one id with plans, states, `sweep`, host `list/show/rm/sweep`; `_publish-<t>` lock and `.huta-copy.json` in backups | planned |
+| S0 | Records: `snapshots` table, one id with plans, states, `sweep`, host `list/show/rm/sweep`; the publish lock and the copy time in backups | built |
 | S1 | Contract: `[[snapshot]]`, registry `snapshot`, `owner_gid`, the `📦` plan line | planned |
 | S2 | Prepare for data volumes, validation, host-only `prepare`/`export` | planned |
 | S3 | Approval and pull delivery: plan kind, history message, buttons, expiry, outbox, retention, box ops and client commands | planned |
@@ -301,7 +303,7 @@ same commit.
   releases, plans and snapshots, transitions refuse wrong order, the partial unique index),
   sweep on an empty and on a littered directory, the publish lock against a pin (a backup
   rotating mid-pin can't tear it). Gate: v1 goldens unchanged; install on a host with nothing
-  using it changes nothing; the next backup writes `.huta-copy.json`.
+  using it changes nothing; the next backup's `current/` has its publish time.
 - **S1.** Tests: `test_app_toml.py` (valid, each bad key, state kind, `/snapshot` overlapping
   the data path, the component default, absent → `effective` identical), `test_v1_golden.py`,
   a release adding or changing `[[snapshot]]` is `infra` with the `📦` line, `huta check` on
@@ -313,7 +315,7 @@ same commit.
   failure; output never reaches the box; deterministic tar); crash scenarios
   (`SnapshotPrepare`, `SnapshotSanitizeFails`, `SnapshotNeedleHit`, request vs sweep before the
   unit starts): die after every step, then sweep, sweep again, reboot + sweep; invariants: no
-  container, no mount, no loop device, no `.snap-*`, no scratch, state terminal or `ready`
+  container, no mount, no loop device, no `snaps/<id>`, no scratch, state terminal or `ready`
   with a matching hash, the backup generation's content digest unchanged, the target's release
   state untouched. Sweep itself is crashed after each of its steps. Gate: the operator reads an
   exported artifact from a test target.

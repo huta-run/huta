@@ -609,6 +609,23 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
             # The Bugsink grant follows the target's releases (docs/PLAN-monitoring.md §3):
             # after recovery it may have to go (codex review of milestone 2, second look).
             _egress_sync(platform, log)
+        _snapshot_sweep(platform, st, project, t, log)
+
+
+def _snapshot_sweep(platform: Platform, st, project: Project, t: Target, log) -> None:
+    """The target's snapshots, best effort (docs/PLAN-snapshot.md): their own lock, never a
+    reason for a recovery to fail or need a human. Nothing to do without a snapshot row."""
+    try:
+        if st is None or not st.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='snapshots'").fetchone() \
+                or not st.db.execute("SELECT 1 FROM snapshots WHERE project=? AND target=? AND"
+                                     " state != 'deleted' LIMIT 1",
+                                     (project.name, t.name)).fetchone():
+            return
+        from . import snapshot as SN
+        SN.sweep(platform, st, project.name, t.name, log=log)
+    except Exception as e:  # noqa: BLE001
+        log(f"snapshot sweep: {type(e).__name__}: {e}")
 
 
 def _reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log) -> None:
@@ -674,7 +691,10 @@ def _reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log
     # Plans (not releases) of this target that were approved but never recorded an outcome: the
     # process died. A restore that got as far as restoring counts as applied; anything else is
     # failed (an edge change was undone by the edge journal, so plan it again).
-    for p in st.db.execute("SELECT id, kind FROM plans WHERE project=? AND target=? AND state=?",
+    # A snapshot's plan is not this target's work: its own lock and sweep finish it
+    # (docs/PLAN-snapshot.md).
+    for p in st.db.execute("SELECT id, kind FROM plans WHERE project=? AND target=? AND state=?"
+                           " AND kind != 'snapshot'",
                            (project.name, t.name, S.APPROVED)).fetchall():
         done = p["kind"] == "restore" and st.db.execute(
             "SELECT 1 FROM events WHERE release_id=? AND kind='restored'", (p["id"],)).fetchone()

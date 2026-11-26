@@ -96,8 +96,11 @@ def run(platform: Platform, st, project: Project, t: Target, name: str, who: str
                 note = "no backup copy yet: ran without data"
             else:
                 snap = cur.parent / f".diag-{secrets.token_hex(6)}"
-                r = subprocess.run(["cp", "-al", "--no-dereference", "--", str(cur), str(snap)],
-                                   capture_output=True, text=True, timeout=600, cwd="/")
+                from .data import publish_lock
+                with publish_lock(cur.parent):     # a rotation can't tear the tree mid-link
+                    r = subprocess.run(["cp", "-al", "--no-dereference", "--", str(cur),
+                                        str(snap)], capture_output=True, text=True,
+                                       timeout=600, cwd="/")
                 if r.returncode != 0:
                     raise ConfigError(f"could not snapshot the backup copy: {r.stderr.strip()[-200:]}")
                 from .data import last_backup

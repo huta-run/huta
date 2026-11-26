@@ -1,0 +1,12 @@
+[Unit]
+Description=huta: sweep data snapshots (huta snapshot sweep)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/huta snapshot sweep
+TimeoutStartSec=30min
+# root is required (huta.db, mounts, loop devices, docker); keep the rest tight.
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=yes
+Nice=10

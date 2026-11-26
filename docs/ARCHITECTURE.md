@@ -441,6 +441,41 @@ for unattended releases (`ready`, `blocks`, `--ack`). Job checks (milestone 3) a
   operator changed since. Any error in ensure, including its lock file or recording the event,
   stays inside it.
 
+## Snapshots (`snapshot.py`)
+
+Data snapshots for dev boxes (docs/PLAN-snapshot.md). Built so far (milestone S0): the records
+and their recovery; nothing creates a snapshot yet, and everything else in that plan is
+*planned*.
+
+- `snapshots` table (database version 5): one row per request, states `preparing → ready →
+  approved → delivered → deleted`, or `failed` / `rejected` / `expired` / `needs-human`. At most
+  one open (`preparing`, `ready`, `approved`) per target, held by a partial unique index and
+  checked with the per-day count in the insert's transaction. A snapshot's plan takes the
+  snapshot's id (`Store.new_id` checks releases, plans and snapshots; `new_plan(pid=…)`);
+  `Store.snapshot_transition` moves the row only along the allowed steps, sets its fields,
+  moves the plan with it if asked and writes the event, in one transaction.
+- Fixed names per id: work directory `<state_dir>/snapshots/<p>/<t>/<id>/`, input links
+  `<backup dir>/<p>/<t>/snaps/<id>` (never `pins/`), outbox `<outbox>/snapshots/<id>/`,
+  containers `huta-snap-<id>[-check|-pg]`, unit `huta-snapshot-<id>`. Lock `_snapshot-<t>` in
+  `locks/` (so `install.sh` sees it), never the target lock.
+- `huta snapshot sweep` (`huta-snapshot.timer`, hourly; also best effort for the target at the
+  end of every `reconcile` that has snapshot rows, never failing it): per target whose snapshot
+  lock is free, a `preparing` row whose unit is gone and is older than the start budget fails;
+  a `ready` row past 30 minutes expires with its plan; a terminal row, or a delivered one past
+  its deadline, loses its files and becomes `deleted`; leftovers no row owns are removed.
+  Removal is in order (containers, verified gone; the scratch mount, never lazily; its loop
+  device; the work directory; the input links; the outbox copy) and strict (fixed parent, a
+  name of the id's shape, never a symlink, `--one-file-system`); one that can't finish keeps
+  the record as `needs-human` with an event and is retried by every sweep.
+- Host commands: `huta snapshot list [--all] [project [target]]`, `show <id>`, `rm <id>` (an
+  open snapshot is rejected with its plan, a running prepare stopped, then its files go),
+  `sweep`.
+- Backups: rotating a generation (`data._publish`, `recover_publish`, used by `pg.copy` too)
+  and pinning one (`huta diag`'s hard links now, a snapshot's later) share a short lock,
+  `<backup dir>/<p>/<t>/.publish.lock`, so a pin never sees a tree half-renamed or
+  half-removed. `_publish` stamps the generation's directory with the time it was published
+  (`data.copy_time`), which is the copy's age a snapshot will show.
+
 ## Crash safety
 
 - Every vhost change is journaled (`/var/lib/huta/edge/*.pending` plus `.prev`), validated as
@@ -494,6 +529,7 @@ huta secret list|set|rm _platform [NAME]   the host's own tokens (never given to
 huta monitor status|ensure <project> <target>   what is wired up (and the last probe) / make what is missing
 huta monitor tick                        probe public health, watch windows, ping checks (huta-monitor.timer)
 huta watch <release>                     the release's watch window and why
+huta snapshot list|show|rm|sweep [id | project [target]]   data snapshots: records and their sweep
 huta data status|ensure|import|export <project> <target> [dir | path…]
 huta backup <project> <target>           consistent copy + ship (the timer runs it)
 huta job list|run <project> <target> [name]

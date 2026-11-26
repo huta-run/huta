@@ -22,6 +22,7 @@
   huta units <project> <target>                rewrite the job and backup timers
   huta egress sync                             refresh the egress daemon's policy
   huta stop|start|restart <project> <target>   the live slot (restart: picks up new secrets)
+  huta snapshot list|show|rm|sweep [id | project [target]]   data snapshots for dev boxes (records)
 """
 
 from __future__ import annotations
@@ -1673,6 +1674,30 @@ def cmd_watch(a):
     return 0
 
 
+def cmd_snapshot(a):
+    """Host side of data snapshots (docs/PLAN-snapshot.md); S0: the records and their sweep."""
+    from . import snapshot as SN
+    platform = load_platform()
+    st = S.Store(platform.state_dir)
+    if a.action == "list":
+        say(SN.list_text(st, a.args[0] if a.args else None, a.args[1] if len(a.args) > 1 else None,
+                         all_=a.all))
+        return 0
+    if a.action == "sweep":
+        SN.sweep(platform, st, a.args[0] if a.args else None,
+                 a.args[1] if len(a.args) > 1 else None, log=say)
+        return 0
+    if len(a.args) != 1:
+        raise ConfigError(f"huta snapshot {a.action} <id>")
+    if a.action == "show":
+        say(SN.show_text(st, a.args[0]))
+        return 0
+    sudo = os.environ.get("SUDO_USER", "")
+    who = sudo if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sudo) else "root"
+    say(f"{a.args[0]}: {SN.remove(platform, st, a.args[0], who, log=say)}")
+    return 0
+
+
 def cmd_monitor(a):
     from . import monitor as M
     if a.action == "tick":
@@ -2053,6 +2078,9 @@ def main(argv=None) -> int:
     s.add_argument("--from", dest="file"); s.set_defaults(f=cmd_secret)
     s = sub.add_parser("watch"); s.add_argument("release"); s.add_argument("--ack", action="store_true")
     s.set_defaults(f=cmd_watch)
+    s = sub.add_parser("snapshot"); s.add_argument("action", choices=["list", "show", "rm", "sweep"])
+    s.add_argument("args", nargs="*"); s.add_argument("--all", action="store_true")
+    s.set_defaults(f=cmd_snapshot)
     s = sub.add_parser("monitor"); s.add_argument("action", choices=["status", "ensure", "tick"])
     s.add_argument("project", nargs="?"); s.add_argument("target", nargs="?")
     s.set_defaults(f=cmd_monitor)

@@ -46,6 +46,9 @@ install -m 0644 -o root -g root systemd/huta-logs.timer /etc/systemd/system/huta
 # The monitoring tick: installed, kept current and enabled; it does nothing without [monitoring].
 install -m 0644 -o root -g root systemd/huta-monitor.service /etc/systemd/system/huta-monitor.service
 install -m 0644 -o root -g root systemd/huta-monitor.timer /etc/systemd/system/huta-monitor.timer
+# The snapshot sweep: installed, kept current and enabled; it does nothing without snapshots.
+install -m 0644 -o root -g root systemd/huta-snapshot.service /etc/systemd/system/huta-snapshot.service
+install -m 0644 -o root -g root systemd/huta-snapshot.timer /etc/systemd/system/huta-snapshot.timer
 # The pull transport's units, kept current where the operator installed them.
 for u in huta-intake.service huta-intake.path; do
   if [[ -f /etc/systemd/system/$u ]]; then
@@ -59,6 +62,7 @@ fi
 systemctl daemon-reload
 systemctl enable --now huta-logs.timer
 systemctl enable --now huta-monitor.timer
+systemctl enable --now huta-snapshot.timer
 if systemctl is-enabled --quiet huta-intake.path 2>/dev/null; then
   systemctl reset-failed huta-intake.service huta-intake.path 2>/dev/null || true
   systemctl restart huta-intake.path

@@ -358,7 +358,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta import-dev <project> <ref>` | import `huta-build/<project>:<sha12>` from the dev box by hand |
 | `huta submit <project> <target> <sha> <image> [--image <name>=<image> …]` | verify and plan by hand (`--image` for every image of a project with several) |
 | `huta show <release>` | print a plan |
-| `huta approve <id> [--via cli\|telegram] [--confirm-data-loss]` | re-check everything and run the release, or apply an edge or restore plan. `--via telegram` is what a button press runs (as a transient systemd unit); it only changes how the approval is recorded. A restore plan needs `--confirm-data-loss` on the CLI |
+| `huta approve <id> [--via cli\|telegram\|rollback-button] [--confirm-data-loss]` | re-check everything and run the release, or apply an edge or restore plan. `--via telegram` is what a button press runs (as a transient systemd unit), `rollback-button` what a ↩️ press's one-tap rollback runs; they only change how the approval is recorded. A restore plan needs `--confirm-data-loss` on the CLI |
 | `huta reject <release>` | reject a planned release |
 | `huta rollback <project> <target>` | **plan** a release of the previous image; it then needs `huta approve`. Refused when that code can't run on the data's current schema (its `runs_on` lacks it): then `huta restore` |
 | `huta postgres <project> <target> [status\|upgrade]` | the target's database: what runs, its schema, whether an upgrade is pending; `upgrade` **plans** applying a changed image, version or limits (the site is down meanwhile: the app stops, a dump is pinned, the new server starts, restored from the dump when the version changed; any failure puts the old one back). huta never applies such a change by itself |
@@ -375,6 +375,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta secret list\|set\|rm _platform [NAME]` | the host's own tokens (`GITHUB_TOKEN`, `CLOUDFLARE_API_TOKEN`, `BUGSINK_TOKEN`, `HEALTHCHECKS_API_KEY`, `MATOMO_TOKEN`); `set` reads the value from stdin; containers never get them |
 | `huta diag <project> <target> <name>` | as on dev; recorded with the operator's name |
 | `huta logs-collect` | store new slot output of every target, then apply the size caps (run every minute by `huta-logs.timer`) |
+| `huta snapshot list\|show\|rm\|sweep [id \| project [target]]` | data snapshots for dev boxes: the records, and the sweep that expires, deletes and cleans up after them (run hourly by `huta-snapshot.timer`). Asking for a snapshot from a box is *planned* (docs/PLAN-snapshot.md), so nothing creates one yet |
 | `huta log [release] [-n N]` | events (default 50) |
 | `huta intake` | pull: process the inbox (run by `huta-intake.service`, triggered by `huta-intake.path`) |
 | `huta push-request` | push: one request from `huta-ssh` (run by `huta-push.socket`). A refused request is answered and exits 0; only a huta error fails the unit |

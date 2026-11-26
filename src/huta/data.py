@@ -9,12 +9,14 @@ Paths (root-only, under the state dir):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .cfg import ConfigError, Platform, Project, Target, assert_root_dir
@@ -259,23 +261,68 @@ def copy_consistent(platform: Platform, t: Target, log, quiet: bool = False) -> 
     return _publish(base, nxt, t, t0, frozen, log)
 
 
+PUBLISH_WAIT = 3600       # seconds a rotation or a pin waits for the other
+
+
+@contextmanager
+def publish_lock(base: Path, wait: float | None = None):
+    """Held only while a generation rotates (_publish, recover_publish) or is pinned by a
+    snapshot (docs/PLAN-snapshot.md): a pin must never see a tree half-renamed or half-removed.
+    Short, and separate from the target lock, so a snapshot never waits for a release."""
+    fd = os.open(base / ".publish.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        end = time.monotonic() + (PUBLISH_WAIT if wait is None else wait)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > end:
+                    raise DataError(f"{base}: a backup generation is being rotated or pinned")
+                time.sleep(0.5)
+        yield
+    finally:
+        os.close(fd)
+
+
 def recover_publish(base: Path) -> None:
     """A crash between the two renames of _publish leaves no current/: the previous complete
     generation becomes current again (codex code review #13)."""
+    if not base.is_dir():
+        return
+    with publish_lock(base):
+        _recover(base)
+
+
+def _recover(base: Path) -> None:
+    """recover_publish's work; the caller holds publish_lock."""
     cur, prev = base / "current", base / "previous"
     if not cur.exists() and prev.is_dir() and not prev.is_symlink():
         os.rename(prev, cur)
+
+
+def copy_time(base: Path) -> float | None:
+    """When current/ was published: its directory's mtime, set by _publish (rsync keeps the
+    source's times on the tree; renames don't change it). None without a copy."""
+    cur = base / "current"
+    try:
+        st = os.lstat(cur)
+    except FileNotFoundError:
+        return None
+    return st.st_mtime if os.path.isdir(cur) and not cur.is_symlink() else None
 
 
 def _publish(base: Path, nxt: Path, t: Target, t0: float, frozen: float, log) -> Path:
     cur, prev = base / "current", base / "previous"
     os.chmod(nxt, 0o700)
     _run(["sync", "-f", str(nxt)], timeout=600)
-    if prev.exists():
-        _rmtree(prev)
-    if cur.exists():
-        os.rename(cur, prev)
-    os.rename(nxt, cur)
+    with publish_lock(base):
+        os.utime(nxt)                # the generation's time (copy_time), set last
+        if prev.exists():
+            _rmtree(prev)
+        if cur.exists():
+            os.rename(cur, prev)
+        os.rename(nxt, cur)
     log(f"backup copy of {t.project}/{t.name}: {time.monotonic() - t0:.1f} s"
         + (f", frozen {frozen:.2f} s" if frozen else ", quiet (nothing running)"))
     return cur
