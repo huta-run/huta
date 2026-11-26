@@ -90,5 +90,42 @@ class AskOwner(unittest.TestCase):
         self.assertEqual(self.failures(), [])
 
 
+class Edit(unittest.TestCase):
+    """History edits get a second try when Telegram is slow, within the caller's time."""
+
+    def run_edit(self, answers, timeout):
+        calls = []
+
+        def call(_token, method, payload, timeout=15):
+            calls.append(timeout)
+            a = answers.pop(0)
+            if isinstance(a, BaseException):
+                raise a
+            return a
+        with mock.patch.object(N, "_call", call), mock.patch.object(N.time, "sleep", lambda s: None):
+            N._edit("t", {"text": "x"}, timeout)
+        return calls
+
+    def test_slow_edit_is_tried_again(self):
+        calls = self.run_edit([TimeoutError("slow"), {"ok": True}], 25)
+        self.assertEqual(len(calls), 2)
+        self.assertLessEqual(calls[0], N.EDIT_TRY)
+
+    def test_no_second_try_without_time(self):
+        with self.assertRaises(TimeoutError):
+            self.run_edit([TimeoutError("slow"), {"ok": True}], 2)
+
+    def test_a_refusal_is_not_tried_again(self):
+        e = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b""))
+        e.tg_body = "message to edit not found"
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_edit([e, {"ok": True}], 25)
+
+    def test_not_modified_is_done(self):
+        e = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b""))
+        e.tg_body = "Bad Request: message is not modified"
+        self.assertEqual(len(self.run_edit([e], 25)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

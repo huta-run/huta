@@ -550,7 +550,8 @@ def tell(platform, st, rid: str, create: bool = True) -> None:
     """Update this release's history message (Telegram, edited in place) and, if the owner was
     DMed buttons for it, that DM too. Never fails."""
     from . import notify as N
-    N.history(platform, st, rid, create)
+    # 25 s: room for a second try of an edit when Telegram is slow (it was, now and then).
+    N.history(platform, st, rid, create, timeout=25)
     N.refresh_ask(platform, st, rid)
 
 

@@ -273,11 +273,11 @@ class Press(Base):
                                    " signals, policy, 'h', chat, ? FROM watches WHERE"
                                    " release_id=?", (old_row["message_id"], self.r2))
             if method == "editMessageText" and newer["n"] == 1:
-                newer["n"] = 2
-                raise TimeoutError("telegram too slow")
+                raise TimeoutError("telegram too slow")       # every try of this tick
             return real(token, method, payload, timeout)
-        with mock.patch.object(N, "_call", call):
-            self.assertFalse(W.drop_keyboard(self.platform, self.st, old_row))
+        with mock.patch.object(N, "_call", call), mock.patch.object(N.time, "sleep", lambda s: None):
+            self.assertFalse(W.drop_keyboard(self.platform, self.st, old_row, timeout=2))
+            newer["n"] = 2
             self.assertTrue(W.drop_keyboard(self.platform, self.st, old_row), "retried")
         self.assertEqual(self.sent[-1][0], "editMessageText")
 

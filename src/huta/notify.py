@@ -266,7 +266,7 @@ def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float
             if due:
                 payload["reply_markup"] = _rollback_markup(platform, st, due, row["chat"],
                                                            row["message_id"])
-            _call(token, "editMessageText", payload, timeout)
+            _edit(token, payload, timeout)
             st.db.execute("UPDATE tg_messages SET text=? WHERE release_id=?", (text, rid))
             return True
         if not create:
@@ -291,6 +291,33 @@ def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float
         except Exception:  # noqa: BLE001
             pass
         return False
+
+
+EDIT_TRY = 10          # seconds for one try of an edit; a retry needs at least 3 s left
+
+
+def _transient(e: Exception) -> bool:
+    """Worth trying again: no answer in time, a network error, Telegram busy (429, 5xx)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code == 429 or e.code >= 500
+    return isinstance(e, (TimeoutError, OSError))
+
+
+def _edit(token: str, payload: dict, timeout: float) -> None:
+    """editMessageText within `timeout`, tried again after a slow or failed try while time is
+    left (an edit is idempotent: a repeat that changes nothing is "not modified", done). A
+    sendMessage is never repeated: that would post the message twice."""
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            _call(token, "editMessageText", payload, min(EDIT_TRY, end - time.monotonic()))
+            return
+        except Exception as e:  # noqa: BLE001
+            if _not_modified(e):
+                return
+            if not _transient(e) or end - time.monotonic() < 3:
+                raise
+            time.sleep(min(1.0, end - time.monotonic() - 2))
 
 
 def _rollback_due(platform, st: S.Store, rid: str):
