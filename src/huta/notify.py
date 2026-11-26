@@ -111,6 +111,9 @@ def _call(token: str, method: str, payload: dict, timeout: float = 15) -> dict:
     return box[0][1]
 
 
+SNAPSHOT_TEXT = 1800      # characters of 📦 lines in one message (Telegram allows 4096)
+
+
 def history_note(p: dict) -> tuple[str, bool]:
     """How the plan's commit relates to the live one, in words, and whether it is a warning.
     ("", False) for a first release or a plan made before huta compared commits."""
@@ -168,11 +171,14 @@ def render(st: S.Store, rid: str) -> str:
     note, warn = history_note(p)
     if warn or note.startswith("rollback"):
         lines.append(esc(note))
+    budget = SNAPSHOT_TEXT       # all 📦 lines together, so the message stays under 4096
     for c in p.get("changes", []):
         # Secret-bearing jobs, Cloudflare publishing, snapshot commands: always shown.
         if c.startswith("📦"):         # commands in full when they fit, else said where
-            lines.append(esc(c) if len(c) <= 900 else
-                         esc(c[:880]) + f"… (whole: <code>sudo huta show {esc(rid)}</code>)")
+            room = max(80, min(900, budget))   # the head (name, digest) always shows
+            budget -= min(len(c), room)
+            lines.append(esc(c) if len(c) <= room else
+                         esc(c[:room - 20]) + f"… (whole: <code>sudo huta show {esc(rid)}</code>)")
         elif c.startswith(("🔑", "☁️")):
             lines.append(esc(c[:300]))
     state = r["state"]
