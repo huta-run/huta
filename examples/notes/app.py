@@ -8,7 +8,8 @@
 /secret       says whether the NOTES_KEY secret is set (never its value)
 /error        sends one test error to Bugsink (SENTRY_DSN, through the egress proxy), tagged
               with SENTRY_RELEASE and SENTRY_ENVIRONMENT. Loopback only: a request that came
-              through Cloudflare gets 404, so the public can't fill Bugsink.
+              through Cloudflare gets 404, so the public can't fill Bugsink. Ten of them in a
+              release's watch window make it degraded (a way to try ↩️ Roll back).
 
 Test switch (host env, to watch huta refuse or revert a release):
 NOTES_FAIL=cf     every request that came through Cloudflare gets 503: loopback checks pass,
