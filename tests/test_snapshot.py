@@ -280,6 +280,28 @@ class Sweep(unittest.TestCase):
         self.assertTrue((outside / sid / "keep").exists())
         self.assertEqual(self.h.state(sid), S.SNAP_NEEDS_HUMAN)
 
+    def test_symlinked_mount_or_image_is_never_touched(self):
+        for leaf in ("mnt", "scratch.img"):
+            with self.subTest(leaf=leaf):
+                sid = self.h.row(S.SNAP_FAILED)
+                w = SN.work_dir(self.h.platform, "hello", "prod", sid)
+                w.mkdir(parents=True)
+                (w / leaf).symlink_to(self.h.root)
+                self.h.calls.clear()
+                self.sweep()
+                self.assertEqual(self.h.state(sid), S.SNAP_NEEDS_HUMAN)
+                self.assertFalse([c for c in self.h.calls if c[0] in ("umount", "losetup")])
+                (w / leaf).unlink()
+                self.sweep()
+                self.assertEqual(self.h.state(sid), S.SNAP_DELETED)
+
+    def test_input_only_leftover_is_found(self):
+        i = SN.input_dir(self.h.platform, "hello", "prod", "deadbeef")
+        i.mkdir(parents=True)
+        (i / "db").write_text("production")
+        self.sweep()
+        self.assertFalse(i.exists())
+
     def test_many_rows_are_all_owned(self):
         ids = []
         for i in range(205):

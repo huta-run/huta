@@ -157,6 +157,21 @@ def _rm_strict(p: Path, parent: Path, root: Path) -> None:
         raise SnapshotError(f"could not remove {p}: {r.stderr.strip()[-200:]}")
 
 
+def _release_scratch(w: Path, root: Path) -> None:
+    """Unmount a work directory's scratch and detach its loop device, after checking that
+    neither `mnt` nor `scratch.img` (nor anything above them) is a symlink: umount and losetup
+    must only ever see this snapshot's own paths."""
+    _no_links(w / "mnt" / "x", root)              # w and mnt: real directories (or absent)
+    img = w / "scratch.img"
+    _no_links(img, root)
+    if os.path.islink(img):
+        raise SnapshotError(f"refusing {img}: a symlink")
+    if not os.path.isdir(w) or os.path.islink(w):
+        return
+    _unmount(w / "mnt")
+    _detach_loops(img)
+
+
 def remove_files(platform: Platform, project: str, target: str, sid: str) -> None:
     """Everything of one snapshot, in order: containers (verified gone), the scratch mount and
     its loop device, the work directory, the input links, the outbox copy. Raises
@@ -168,10 +183,7 @@ def remove_files(platform: Platform, project: str, target: str, sid: str) -> Non
             raise SnapshotError(f"bad name {name!r}")
     _containers_gone(sid)
     w = work_dir(platform, project, target, sid)
-    _no_links(w / "mnt", work_root(platform))
-    if w.is_dir() and not w.is_symlink():
-        _unmount(w / "mnt")
-        _detach_loops(w / "scratch.img")
+    _release_scratch(w, work_root(platform))
     _rm_strict(w, w.parent, work_root(platform))
     inp = input_dir(platform, project, target, sid)
     if inp is not None:
@@ -256,9 +268,7 @@ def _orphans(platform: Platform, st, project: str, target: str, log) -> None:
             try:
                 if d.name != "snaps":
                     _containers_gone(sid)
-                    if p.is_dir() and not p.is_symlink():
-                        _unmount(p / "mnt")
-                        _detach_loops(p / "scratch.img")
+                    _release_scratch(p, root)
                 _rm_strict(p, d, root)
                 log(f"removed leftover {p}")
             except (SnapshotError, OSError, subprocess.TimeoutExpired) as e:
@@ -271,10 +281,19 @@ def _targets(platform: Platform, st) -> set[tuple[str, str]]:
     out = {(r["project"], r["target"]) for r in st.db.execute(
         "SELECT DISTINCT project, target FROM snapshots WHERE state != ?", (S.SNAP_DELETED,))}
     root = work_root(platform)
-    if root.is_dir():
+    if root.is_dir() and not root.is_symlink():
         for p in root.iterdir():
             if p.is_dir() and not p.is_symlink():
                 out |= {(p.name, t.name) for t in p.iterdir() if t.is_dir() and not t.is_symlink()}
+    # Input links left with no row and no work directory are production data: found too.
+    broot = platform.backup["dir"] if platform.backup else None
+    if broot is not None and broot.is_dir() and not broot.is_symlink():
+        for p in broot.iterdir():
+            if p.is_dir() and not p.is_symlink():
+                for t in p.iterdir():
+                    sn = t / "snaps"
+                    if t.is_dir() and not t.is_symlink() and sn.is_dir() and not sn.is_symlink():
+                        out.add((p.name, t.name))
     return out
 
 
