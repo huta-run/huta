@@ -672,16 +672,22 @@ def drop_keyboard(platform: Platform, st, row, timeout: float = 10) -> bool:
     """Take a spent or retired ↩️ off its message, unless another episode of the same release
     has a live button on it. True when it is off (message_id cleared)."""
     from . import notify as N
-    live_button = ("SELECT 1 FROM watches WHERE release_id=? AND button_hash IS NOT NULL")
-    if st.db.execute(live_button, (row["release_id"],)).fetchone():
-        gone = True                   # the newer episode's keyboard replaced it
+    rid = row["release_id"]
+    live_button = "SELECT 1 FROM watches WHERE release_id=? AND button_hash IS NOT NULL"
+    repair = "SELECT 1 FROM tg_messages WHERE release_id=? AND text=''"
+    if st.db.execute(live_button, (rid,)).fetchone():
+        # A newer episode's keyboard replaced it; if an earlier clear may have taken that one
+        # off (marked by an emptied text), the message is posted again until that works.
+        gone = True
+        if st.db.execute(repair, (rid,)).fetchone():
+            gone = N.history(platform, st, rid, create=False, timeout=timeout)
     else:
         gone = N.clear_keyboard(platform, row["chat"], row["message_id"], timeout=timeout)
-        if st.db.execute(live_button, (row["release_id"],)).fetchone():
+        if st.db.execute(live_button, (rid,)).fetchone():
             # A newer episode posted its ↩️ meanwhile, and the clear may have come after it:
-            # post the message again, with a fresh keyboard.
-            st.db.execute("UPDATE tg_messages SET text='' WHERE release_id=?", (row["release_id"],))
-            N.history(platform, st, row["release_id"], create=False, timeout=timeout)
+            # post the message again, with a fresh keyboard (the emptied text is the marker).
+            st.db.execute("UPDATE tg_messages SET text='' WHERE release_id=?", (rid,))
+            gone = N.history(platform, st, rid, create=False, timeout=timeout)
     if gone:
         st.db.execute("UPDATE watches SET message_id=NULL WHERE release_id=? AND since=? AND"
                       " button_hash IS NULL", (row["release_id"], row["since"]))

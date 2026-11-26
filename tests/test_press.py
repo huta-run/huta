@@ -254,6 +254,33 @@ class Press(Base):
         W.retire_buttons(self.platform, self.st, time.monotonic() + 30)
         self.assertEqual(self.sent, [], "once off, left alone")
 
+    def test_a_newer_episodes_keyboard_is_put_back_after_a_clear(self):
+        """The clear of an old episode's keyboard races a newer episode's ↩️ on the same
+        message: the message is posted again, and retried until that works."""
+        import time
+        self.press(self.data)
+        old_row = self.row()
+        newer = {"n": 0}
+        real = self.fake_call
+
+        def call(token, method, payload, timeout=15):
+            if method == "editMessageReplyMarkup" and not newer["n"]:
+                newer["n"] = 1        # meanwhile: a newer episode of r2 gets its button
+                self.st.db.execute("INSERT INTO watches (release_id, since, project, target,"
+                                   " opened, until, state, reasons, coverage, signals, policy,"
+                                   " button_hash, chat, message_id) SELECT release_id, since + 1,"
+                                   " project, target, opened, until, state, reasons, coverage,"
+                                   " signals, policy, 'h', chat, ? FROM watches WHERE"
+                                   " release_id=?", (old_row["message_id"], self.r2))
+            if method == "editMessageText" and newer["n"] == 1:
+                newer["n"] = 2
+                raise TimeoutError("telegram too slow")
+            return real(token, method, payload, timeout)
+        with mock.patch.object(N, "_call", call):
+            self.assertFalse(W.drop_keyboard(self.platform, self.st, old_row))
+            self.assertTrue(W.drop_keyboard(self.platform, self.st, old_row), "retried")
+        self.assertEqual(self.sent[-1][0], "editMessageText")
+
     def test_cmd_press_starts_the_rollback_unit(self):
         """A ↩️ press never falls through to Reject; it starts `huta rollback --press`."""
         import socket
