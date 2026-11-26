@@ -80,12 +80,29 @@ def _token(platform) -> str | None:
     return d if isinstance(d, str) and d else None
 
 
-def _call(token: str, method: str, payload: dict) -> dict:
+def _call(token: str, method: str, payload: dict, timeout: float = 15) -> dict:
+    """One Bot API call, the whole exchange within `timeout` (the request runs in a thread
+    abandoned at the deadline: socket timeouts only bound each wait)."""
+    import threading
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}",
                                  data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read(65536))
+    box: list = []
+
+    def run():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                box.append(("ok", json.loads(r.read(65536))))
+        except BaseException as e:  # noqa: BLE001 — handed to the caller
+            box.append(("err", e))
+    th = threading.Thread(target=run, daemon=True, name="huta-telegram")
+    th.start()
+    th.join(timeout)
+    if not box:
+        raise TimeoutError("telegram too slow")
+    if box[0][0] == "err":
+        raise box[0][1]
+    return box[0][1]
 
 
 def history_note(p: dict) -> tuple[str, bool]:
@@ -192,7 +209,7 @@ def watch_reply(st: S.Store, row) -> str:
             f"{esc(W.line(row))}\n<code>sudo huta watch {esc(row['release_id'])}</code>")
 
 
-def reply(platform, st: S.Store, rid: str, text: str) -> bool:
+def reply(platform, st: S.Store, rid: str, text: str, timeout: float = 15) -> bool:
     """A reply to the release's history message, which notifies. True when sent, or when there
     is nothing to send it with (no Telegram configured, no history message); never raises."""
     try:
@@ -210,7 +227,7 @@ def reply(platform, st: S.Store, rid: str, text: str) -> bool:
         if row["chat"] == platform.telegram.get("history_chat") \
                 and platform.telegram.get("history_thread"):
             payload["message_thread_id"] = platform.telegram["history_thread"]
-        _call(token, "sendMessage", payload)
+        _call(token, "sendMessage", payload, timeout)
         return True
     except Exception as e:  # noqa: BLE001
         try:
@@ -220,7 +237,7 @@ def reply(platform, st: S.Store, rid: str, text: str) -> bool:
         return False
 
 
-def history(platform, st: S.Store, rid: str, create: bool = True) -> bool:
+def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float = 15) -> bool:
     """Send or edit this release's history message (create=False: only edit an existing one).
     Never raises. True when the message now says what render() says, or there is nothing to
     send it with (no Telegram configured); False when sending or editing failed."""
@@ -237,7 +254,7 @@ def history(platform, st: S.Store, rid: str, create: bool = True) -> bool:
         if row:
             _call(token, "editMessageText", {"chat_id": row["chat"], "message_id": row["message_id"],
                                              "text": text, "parse_mode": "HTML",
-                                             "disable_web_page_preview": True})
+                                             "disable_web_page_preview": True}, timeout)
             st.db.execute("UPDATE tg_messages SET text=? WHERE release_id=?", (text, rid))
             return True
         if not create:
@@ -246,7 +263,7 @@ def history(platform, st: S.Store, rid: str, create: bool = True) -> bool:
                    "disable_web_page_preview": True}
         if t.get("history_thread"):
             payload["message_thread_id"] = t["history_thread"]
-        res = _call(token, "sendMessage", payload)
+        res = _call(token, "sendMessage", payload, timeout)
         st.db.execute("INSERT OR REPLACE INTO tg_messages (release_id, chat, message_id, text)"
                       " VALUES (?,?,?,?)", (rid, t["history_chat"], res["result"]["message_id"], text))
         return True

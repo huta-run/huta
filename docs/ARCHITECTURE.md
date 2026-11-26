@@ -367,17 +367,25 @@ checks, the ↩️ button, `ready`/`blocks`/`--ack`) is *planned*.
 - **Watch window** (`watch.py`; targets with `watch`): a row in `watches` per serving episode
   (release id, `live.since`). `cmd_approve` opens it when the outcome is live, after its other
   steps; the tick opens one for a live episode that has none (as `unknown` if its window is
-  already over: nobody looked). Opening takes the local baseline in the same write. The tick
+  already over: nobody looked). Opening takes the local baseline in the same write: zero for
+  containers the release made (any restart or OOM kill of them counts), what an older container
+  shows for one from before. Sources come from what the release got (its plan's
+  `effective.monitor`), not from today's files. The tick
   evaluates open rows after the probes, within its deadline: `local` (the live slot's
   containers: restarts, OOM kills, stopped), `probe` (three failed samples of the episode in a
   row, each within 150 s), `errors` (Bugsink issues first seen since the switch; events since
   against the window before, per issue, at most 20 issues and 500 events), `checks` (the uptime
   check's flips, with healthchecks). A signal makes the row `degraded` at once; at the window's
   end it is `ok` if every source answered in each third of the window, else `unknown`. One
-  conditional transaction writes state, signals and events. Rows of an episode no longer live
+  transaction writes state, signals and events, only if the live episode and slot are the ones
+  looked at and no release of the target is approved or running; a look during which the episode
+  changed or a release started is dropped. Evidence that is incomplete (Docker or an OOM counter
+  not readable, a capped Bugsink count, an answer huta can't read) leaves that source without an
+  answer for the tick. Rows of an episode no longer live
   are `closed` by the tick, by approval and by every `reconcile`; `huta stop` closes the live
   one. The history message shows the watch line; `degraded` and `unknown` also send a reply
-  (retried until sent, so possibly twice); `watch.on_degraded` records `action = notified`
+  (retried until sent, so possibly twice; a missing history message is sent first; random order,
+  10 a tick, each Telegram call bounded by the tick's time; given up after 24 h with an event); `watch.on_degraded` records `action = notified`
   (the seam for automatic rollback). `huta status` and the box `status` op end with the line.
 - **Egress:** `<dsn_host>:443` is added only for a release that gets `SENTRY_DSN` (the repo
   asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and

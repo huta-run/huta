@@ -1402,7 +1402,9 @@ class Watch(unittest.TestCase):
         (d / "HUTA_SENTRY_DSN_PROD").write_text("https://k@bugs.example.org/1")
         self.fm = FM.FakeMonitoring(self.dir / "mon.json")
         self.pid = self.fm.add_project("huta_hello_prod")
-        self.local = {"web": {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": True}}
+        # Made by this release (created after it): local signals start from zero.
+        self.local = {"web": {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": True,
+                              "created": time.time() + 3600}}
         self.patches = [mock.patch.object(store, "assert_root_dir", lambda _p: None),
                         mock.patch.object(runtime, "_root_dir", _no_uid_root_dir),
                         mock.patch.object(M, "read_secret", _plain_read_secret),
@@ -1499,7 +1501,8 @@ class Watch(unittest.TestCase):
                             (("oom_kill", 3), "kernel OOM-killed")):
             with self.subTest(why=why):
                 self.st.db.execute("DELETE FROM watches")
-                self.local = {"web": {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": True}}
+                self.local = {"web": {"restarts": 0, "oomkilled": False, "oom_kill": 0,
+                                      "running": True, "created": time.time() + 3600}}
                 self.open()
                 self.look(60)
                 self.local["web"][change[0]] = change[1]
@@ -1608,7 +1611,7 @@ class Watch(unittest.TestCase):
         sent = []
         fail = [True]
 
-        def call(token, method, payload):
+        def call(token, method, payload, timeout=15):
             if method == "sendMessage" and fail[0]:
                 raise OSError("telegram down")
             sent.append((method, payload))
@@ -1679,7 +1682,7 @@ class WatchTickCrash(Watch):
                 op(f"evaluate {r}")
                 return r
 
-            def call(token, method, payload):
+            def call(token, method, payload, timeout=15):
                 replies = self.dir / "replies.json"
                 n = json.loads(replies.read_text()) if replies.exists() else []
                 if method == "sendMessage":
@@ -1720,7 +1723,7 @@ class WatchTickCrash(Watch):
                     self.local["web"]["restarts"] = 1
                     replies = self.dir / "replies.json"
                     with mock.patch.object(N, "_token", lambda p: "tok"), \
-                            mock.patch.object(N, "_call", lambda tok, m, p: (
+                            mock.patch.object(N, "_call", lambda tok, m, p, timeout=15: (
                                 replies.write_text(json.dumps(
                                     (json.loads(replies.read_text()) if replies.exists() else [])
                                     + ([p["text"]] if m == "sendMessage" else []))),
@@ -1836,7 +1839,7 @@ class WatchEvidence(Watch):
         self.look(60)
         sent = []
 
-        def call(token, method, payload):
+        def call(token, method, payload, timeout=15):
             sent.append(method)
             return {"result": {"message_id": 9}}
         self.platform = dataclasses.replace(self.platform, telegram={"history_chat": -100})
@@ -1893,3 +1896,141 @@ class LocalSampler(unittest.TestCase):
             got = self.run_sampler([self.container(sha="o" * 40)])     # another release's
             self.assertTrue(got["web"]["missing"])
             self.assertIsNone(self.run_sampler([self.container()], oom="garbage"))
+
+
+class _DbProbe:
+    """A connection that records a step after every write it makes (each autocommitted
+    statement, each committed transaction), so a crash test can die exactly there."""
+
+    WRITES = ("INSERT", "UPDATE", "DELETE")
+
+    def __init__(self, con, op):
+        self._con, self._op, self._depth = con, op, 0
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def execute(self, sql, *a):
+        head = sql.lstrip().split(None, 1)[0].upper()
+        if head == "BEGIN":
+            self._depth += 1
+        cur = self._con.execute(sql, *a)
+        if head in self.WRITES and self._depth == 0:
+            self._op(f"{head} {sql.split('(')[0].split()[2] if head == 'INSERT' else sql.split()[1]}")
+        return cur
+
+    def __enter__(self):
+        return self._con.__enter__()
+
+    def __exit__(self, *exc):
+        out = self._con.__exit__(*exc)
+        if self._depth:
+            self._depth = 0
+            if exc[0] is None:
+                self._op("COMMIT")
+        return out
+
+
+class WatchWriteCrash(Watch):
+    """(Watch's tests run here too.) The watch tick killed after every single database write
+    (each statement outside a transaction, each commit), then once more at the same point; the
+    next ticks end with one verdict, recorded and told once in the record."""
+
+    def test_crash_after_every_write(self):
+        from huta import notify as N, store as S
+        def call(token, method, payload, timeout=15):
+            replies = self.dir / "replies.json"     # self.dir is new for every case
+            if method == "sendMessage":
+                n = json.loads(replies.read_text()) if replies.exists() else []
+                replies.write_text(json.dumps(n + [payload["text"]]))
+            return {"result": {"message_id": 8}}
+
+        def run(crash_after):
+            steps_file = self.dir / "steps.json"
+            steps_file.write_text("[]")
+
+            def op(name):
+                steps = json.loads(steps_file.read_text()) + [name]
+                steps_file.write_text(json.dumps(steps))
+                if crash_after is not None and len(steps) == crash_after:
+                    os._exit(77)
+            pid = os.fork()
+            if pid == 0:
+                code = 0
+                try:
+                    st = S.Store(self.platform.state_dir)
+                    st.db = _DbProbe(st.db, op)
+                    self.st = st
+                    with mock.patch.object(N, "_token", lambda p: "tok"), \
+                            mock.patch.object(N, "_call", call):
+                        self.tick_at(60)
+                        self.local["web"]["restarts"] = 1
+                        self.tick_at(120)
+                except BaseException:  # noqa: BLE001
+                    import traceback
+                    (self.dir / "err.txt").write_text(traceback.format_exc())
+                    code = 1
+                os._exit(code)
+            _, status = os.waitpid(pid, 0)
+            return os.waitstatus_to_exitcode(status), json.loads(steps_file.read_text())
+
+        code, steps = run(None)
+        self.assertEqual(code, 0, (self.dir / "err.txt").read_text() if code else "")
+        self.assertGreaterEqual(len(steps), 4, steps)
+        for k in range(1, len(steps) + 1):
+            for twice in (False, True):
+                with self.subTest(after=f"{k}: {steps[k - 1]}", twice=twice):
+                    self.tearDown()
+                    self.setUp()
+                    self.assertEqual(run(k)[0], 77)
+                    if twice:
+                        self.local["web"]["restarts"] = 0
+                        run(k)
+                    self.local["web"]["restarts"] = 1
+                    with mock.patch.object(N, "_token", lambda p: "tok"), \
+                            mock.patch.object(N, "_call", call):
+                        self.tick_at(130)
+                        self.tick_at(140)
+                    r = self.row()
+                    self.assertEqual(r["state"], "degraded")
+                    self.assertEqual((r["notified"], r["action"]), ("degraded", "notified"),
+                                     [(e["kind"], e["msg"][:60]) for e in
+                                      self.st.events(limit=12)])
+                    kinds = [e["kind"] for e in self.st.events(self.rid, limit=50)]
+                    self.assertEqual(kinds.count("watch-degraded"), 1)
+                    self.assertEqual(kinds.count("watch-open"), 1)
+                    self.assertTrue((self.dir / "replies.json").exists())
+
+    def tick_at(self, at):
+        self.st.db.execute("INSERT OR IGNORE INTO tg_messages (release_id, chat, message_id,"
+                           " text) VALUES (?,?,?,?)", (self.rid, -100, 7, "old"))
+        with mock.patch.object(self.W.time, "time", lambda: self.T0 + at):
+            self.W.tick(self.platform, self.registry, self.st, time.monotonic() + 40,
+                        log=lambda m: (self.dir / "log.txt").open("a").write(m + "\n"))
+
+
+class WatchNoVerdictMidDeploy(Watch):
+    def test_approved_release_holds_the_verdict(self):
+        self.open()
+        self.look(30)
+        other = self.st.new_release(project="hello", target="prod", sha="b" * 40, image_id="i",
+                                    image_tag="t", app_toml=self.st.release(self.rid)["app_toml"],
+                                    plan={}, plan_hash="0", built_by="test")
+        self.st.transition(other, "planned", "approved")
+        self.local["web"]["restarts"] = 3
+        self.assertIsNone(self.look(60))
+        self.assertEqual(self.row()["state"], "watching")
+
+
+class WatchBaseline(Watch):
+    def test_restart_before_the_first_look_counts(self):
+        self.local["web"]["restarts"] = 2           # while huta wasn't looking
+        self.open()
+        self.assertEqual(self.look(60), "degraded")
+
+    def test_an_older_container_starts_from_what_it_shows(self):
+        self.local["web"].update(restarts=4, created=0.0)   # a slot from before (a rollback)
+        self.open()
+        self.assertIsNone(self.look(60))
+        self.local["web"]["restarts"] = 5
+        self.assertEqual(self.look(120), "degraded")

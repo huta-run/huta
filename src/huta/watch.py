@@ -75,7 +75,7 @@ def row_of(st, rid: str):
 # ------------------------------------------------------------------ open / close
 
 def open_watch(platform: Platform, st, project: Project, t: Target, rid: str, since: float,
-               now: float | None = None) -> bool:
+               now: float | None = None, end: float | None = None) -> bool:
     """Open the watch of an episode. Twice is a no-op. An episode first seen after its window
     ended gets a row in state unknown: it was live and nobody looked."""
     if not t.watch:
@@ -101,9 +101,9 @@ def open_watch(platform: Platform, st, project: Project, t: Target, rid: str, si
             live = st.live(project.name, t.name)
             if live and live["release_id"] == rid:
                 base = _local_sample(t, live["slot"], rel["sha"], policy["components"],
-                                     time.monotonic() + 15)
+                                     time.monotonic() + 15 if end is None else end)
                 if base is not None:
-                    signals["local_base"] = base
+                    signals["local_base"] = baseline(base, rel)
         except Exception:  # noqa: BLE001 — the first look takes it instead
             pass
     msg = reasons[0] if late else (f"watching {', '.join(policy['sources'])} until "
@@ -124,12 +124,13 @@ def open_watch(platform: Platform, st, project: Project, t: Target, rid: str, si
     return cur.rowcount == 1
 
 
-def open_live(platform: Platform, st, project: Project, t: Target) -> bool:
+def open_live(platform: Platform, st, project: Project, t: Target,
+              end: float | None = None) -> bool:
     """The live episode's watch, if the target has one and none exists yet."""
     live = st.live(project.name, t.name)
     if not (t.watch and live):
         return False
-    return open_watch(platform, st, project, t, live["release_id"], live["since"])
+    return open_watch(platform, st, project, t, live["release_id"], live["since"], end=end)
     # (on_degraded's record is written with the notified mark in _tell, one transaction)
 
 
@@ -200,8 +201,21 @@ def _local_sample(t: Target, slot: str, sha: str, expected: list[str], end: floa
                 return None
         out[comp] = {"restarts": int(c.get("RestartCount") or 0),
                      "oomkilled": bool(s.get("OOMKilled")), "oom_kill": oom,
-                     "running": bool(s.get("Running")), "missing": False}
+                     "running": bool(s.get("Running")), "missing": False,
+                     "created": _ts(c.get("Created")) or 0.0}
     return out
+
+
+ZERO = {"restarts": 0, "oomkilled": False, "oom_kill": 0}
+
+
+def baseline(sample: dict, rel) -> dict:
+    """What counts as 'before' for local signals. A container this release made (created after
+    the release was planned) starts from zero: any restart or OOM kill of it counts, even one
+    that happened while huta wasn't looking. A container from before (a rollback to a slot
+    still running) starts from what it shows when the watch opens."""
+    return {c: (dict(ZERO) if v.get("created", 0) >= rel["created"] or v.get("missing")
+                else {k: v[k] for k in ZERO}) for c, v in sample.items()}
 
 
 def _local_signals(base: dict, now_: dict) -> list[str]:
@@ -376,7 +390,7 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
     cur = _local_sample(t, live["slot"], rel["sha"], comps, end)
     if cur is not None:
         if "local_base" not in signals:
-            signals["local_base"] = cur
+            signals["local_base"] = baseline(cur, rel)
         for why in _local_signals(signals["local_base"], cur):
             fire("local", why)
         answered("local")
@@ -442,9 +456,14 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
         cur = st.db.execute(
             "UPDATE watches SET state=?, reasons=?, signals=?, coverage=?, last_tick=? WHERE"
             " release_id=? AND since=? AND state=? AND EXISTS (SELECT 1 FROM live WHERE"
-            " project=? AND target=? AND release_id=? AND since=?)",
+            " project=? AND target=? AND release_id=? AND since=? AND slot=?) AND NOT EXISTS"
+            " (SELECT 1 FROM releases WHERE project=? AND target=? AND state IN"
+            " ('approved', 'running'))",
+            # In the same write as the verdict: the live episode is the one looked at, and no
+            # release of the target was approved since (approval marks it before it runs
+            # anything), so a verdict never lands in the middle of a deployment.
             (state, json.dumps(reasons), json.dumps(signals), json.dumps(coverage), now, rid,
-             since, WATCHING, project.name, t.name, rid, since))
+             since, WATCHING, project.name, t.name, rid, since, snap[2], project.name, t.name))
         if cur.rowcount != 1:
             return None
         for r in new_fired:
@@ -542,7 +561,7 @@ def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None
                 close_stale(st, project.name, t.name)
                 if _snapshot(platform, st, t) is None:
                     continue                       # nothing live, or a release is at work
-                open_live(platform, st, project, t)
+                open_live(platform, st, project, t, end=work_end)
                 for row in st.db.execute("SELECT * FROM watches WHERE project=? AND target=? AND"
                                          " state=?", (project.name, t.name, WATCHING)).fetchall():
                     if time.monotonic() > work_end - 3:
@@ -562,12 +581,15 @@ def _tell(platform: Platform, st, end: float, log) -> None:
     given up. At most TELL_BATCH a call, within `end`."""
     from . import notify as N
     now = time.time()
+    # In random order, so rows whose delivery keeps failing can't hold back newer ones.
     rows = st.db.execute("SELECT * FROM watches WHERE state IN (?,?,?,?) AND"
-                         " (notified IS NULL OR notified != state) ORDER BY opened LIMIT ?",
+                         " (notified IS NULL OR notified != state) ORDER BY RANDOM() LIMIT ?",
                          (*VERDICTS, WATCHING, TELL_BATCH)).fetchall()
     for r in rows:
-        if time.monotonic() > end - 2:
+        left = end - time.monotonic()
+        if left < 3:
             return
+        per = min(10.0, (left - 1) / 2)         # two sends at most for this row
         try:
             told_at = r["last_tick"] or r["opened"]
             if r["state"] != WATCHING and now - told_at > NOTIFY_FOR:
@@ -581,10 +603,10 @@ def _tell(platform: Platform, st, end: float, log) -> None:
                                    "notify-failed", f"the {r['state']} verdict was never delivered"
                                                     " to Telegram; gave up after 24 h"))
                 continue
-            if not N.history(platform, st, r["release_id"], create=True):
+            if not N.history(platform, st, r["release_id"], create=True, timeout=per):
                 continue                       # not delivered: next tick
             if r["state"] in (DEGRADED, UNKNOWN):
-                if not N.reply(platform, st, r["release_id"], N.watch_reply(st, r)):
+                if not N.reply(platform, st, r["release_id"], N.watch_reply(st, r), timeout=per):
                     continue
             with st.db:                        # told, and (degraded) the hook's record: one write
                 st.db.execute("BEGIN IMMEDIATE")
