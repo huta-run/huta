@@ -325,16 +325,29 @@ def compose(platform: Platform, t: Target, *args: str) -> str:
     return sh(["docker", "compose", "-p", compose_name(t), "-f", str(compose_file(platform, t)), *args])
 
 
+def target_containers(t: Target, tries: int = 3) -> list[dict]:
+    """`docker inspect` of every container with this target's labels. A short-lived container
+    (a job of the same target, started with the same labels) can be removed between `ps` and
+    `inspect`, and `inspect` then fails on the whole list: list again rather than fail."""
+    for left in range(tries - 1, -1, -1):
+        ids = sh(["docker", "ps", "-aq", "--no-trunc",
+                  "--filter", f"label=run.huta.project={t.project}",
+                  "--filter", f"label=run.huta.target={t.name}"]).split()
+        if not ids:
+            return []
+        try:
+            return json.loads(sh(["docker", "inspect", *ids]))
+        except RecipeError as e:
+            if left == 0 or "no such object" not in str(e).lower():
+                raise
+    return []
+
+
 def slot_members(t: Target) -> dict[str, dict[str, dict]]:
     """What Docker actually runs for this target: slot -> component -> container. A container
     without a component label (a one-component target) is keyed "" (DESIGN-v2 §3)."""
-    ids = sh(["docker", "ps", "-aq", "--no-trunc",
-              "--filter", f"label=run.huta.project={t.project}",
-              "--filter", f"label=run.huta.target={t.name}"]).split()
     res: dict[str, dict[str, dict]] = {}
-    if not ids:
-        return res
-    for c in json.loads(sh(["docker", "inspect", *ids])):
+    for c in target_containers(t):
         labels = (c.get("Config") or {}).get("Labels") or {}
         if labels.get("com.docker.compose.project") != compose_name(t):
             continue  # same labels but another compose project: not ours to manage
