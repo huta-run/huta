@@ -39,16 +39,26 @@ def window_of(platform: Platform, t: Target) -> int:
     return int(t.watch.get("window") or (platform.monitoring.get("watch") or {}).get("window", 900))
 
 
-def sources(platform: Platform, project: Project, t: Target, app: dict) -> list[str]:
+def sources(platform: Platform, project: Project, t: Target, rel) -> list[str]:
+    """What this release is watched through. errors comes from what the release itself got,
+    as its plan recorded it (effective.monitor.env), or from a DSN the registry sets with
+    `crashes` naming its project; not from today's files (codex review of milestone 5, #2)."""
     out = ["local"]
     if "uptime" in t.monitor:
         out.append("probe")
-    if "errors" in t.monitor and platform.monitoring.get("bugsink") \
-            and "SENTRY_DSN" in M.env_for(platform, project, t, app, "", with_secrets=False)[0]:
+    plan = json.loads(rel["plan"] or "{}")
+    got = (((plan.get("effective") or {}).get("monitor") or {}).get("env")) or []
+    own = "SENTRY_DSN" in (set(t.env) | set(t.secrets))
+    if "errors" in t.monitor and ("SENTRY_DSN" in got or (own and t.crashes)):
         out.append("errors")
     if "uptime" in t.monitor and platform.monitoring.get("healthchecks"):
         out.append("checks")
     return out
+
+
+def expected_components(app: dict) -> list[str]:
+    from . import spec as SP
+    return list(app["order"]) if SP.several(app) else [SP.public_name(app)]
 
 
 def rows(st, project: str, target: str):
@@ -70,12 +80,16 @@ def open_watch(platform: Platform, st, project: Project, t: Target, rid: str, si
     ended gets a row in state unknown: it was live and nobody looked."""
     if not t.watch:
         return False
+    if st.db.execute("SELECT 1 FROM watches WHERE release_id=? AND since=?",
+                     (rid, since)).fetchone():
+        return False
     now = time.time() if now is None else now
     rel = st.release(rid)
     app = json.loads(rel["app_toml"])
     window = window_of(platform, t)
     until = since + window
-    policy = {**t.watch, "window": window, "sources": sources(platform, project, t, app)}
+    policy = {**t.watch, "window": window, "sources": sources(platform, project, t, rel),
+              "components": expected_components(app)}
     late = now >= until
     state = UNKNOWN if late else WATCHING
     reasons = ["not watched: huta first saw this release after its window"] if late else []
@@ -86,21 +100,28 @@ def open_watch(platform: Platform, st, project: Project, t: Target, rid: str, si
         try:
             live = st.live(project.name, t.name)
             if live and live["release_id"] == rid:
-                signals["local_base"] = _local_sample(t, live["slot"], rel["sha"])
+                base = _local_sample(t, live["slot"], rel["sha"], policy["components"],
+                                     time.monotonic() + 15)
+                if base is not None:
+                    signals["local_base"] = base
         except Exception:  # noqa: BLE001 — the first look takes it instead
             pass
-    cur = st.db.execute(
-        "INSERT OR IGNORE INTO watches (release_id, since, project, target, opened, until, state,"
-        " reasons, coverage, signals, last_tick, policy, notified) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (rid, since, project.name, t.name, now, until, state, json.dumps(reasons), "{}",
-         json.dumps(signals),
-         None, json.dumps(policy, sort_keys=True), None))
-    if cur.rowcount == 1:
-        st.event("watch-unknown" if late else "watch-open",
-                 reasons[0] if late else f"watching {', '.join(policy['sources'])} until "
-                 f"{time.strftime('%H:%M', time.localtime(until))}", rid, project.name, t.name)
-        return True
-    return False
+    msg = reasons[0] if late else (f"watching {', '.join(policy['sources'])} until "
+                                   f"{time.strftime('%H:%M', time.localtime(until))}")
+    with st.db:                       # the row and its event: one write
+        st.db.execute("BEGIN IMMEDIATE")
+        cur = st.db.execute(
+            "INSERT OR IGNORE INTO watches (release_id, since, project, target, opened, until,"
+            " state, reasons, coverage, signals, last_tick, policy, notified)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, since, project.name, t.name, now, until, state, json.dumps(reasons), "{}",
+             json.dumps(signals), None, json.dumps(policy, sort_keys=True), None))
+        if cur.rowcount == 1:
+            st.db.execute("INSERT INTO events (ts, release_id, project, target, kind, msg)"
+                          " VALUES (?,?,?,?,?,?)", (now, rid, project.name, t.name,
+                                                    "watch-unknown" if late else "watch-open",
+                                                    redact(msg)))
+    return cur.rowcount == 1
 
 
 def open_live(platform: Platform, st, project: Project, t: Target) -> bool:
@@ -109,6 +130,7 @@ def open_live(platform: Platform, st, project: Project, t: Target) -> bool:
     if not (t.watch and live):
         return False
     return open_watch(platform, st, project, t, live["release_id"], live["since"])
+    # (on_degraded's record is written with the notified mark in _tell, one transaction)
 
 
 def close_stale(st, project: str, target: str, why: str = "no longer live") -> int:
@@ -134,48 +156,66 @@ def close_stale(st, project: str, target: str, why: str = "no longer live") -> i
 
 # ------------------------------------------------------------------ signals
 
-def _local_sample(t: Target, slot: str, sha: str) -> dict:
-    """{component: {restarts, oomkilled, oom_kill, running}} of the live slot's containers."""
+def _local_sample(t: Target, slot: str, sha: str, expected: list[str], end: float) -> dict | None:
+    """{component: {restarts, oomkilled, oom_kill, running}} of the live slot's containers of
+    this release; an expected component with no container is {"running": False}. None when the
+    answer is incomplete (Docker didn't answer in time, or an OOM counter couldn't be read):
+    the tick's local evidence is then missing, never "all fine" (codex review of milestone 5)."""
     from .recipe import compose_name, sh
     from .runstate import cgroup_dir
-    ids = sh(["docker", "ps", "-aq", "--no-trunc", "--filter", f"label=run.huta.project={t.project}",
-              "--filter", f"label=run.huta.target={t.name}", "--filter", f"label=run.huta.slot={slot}"],
-             timeout=10).split()
-    out: dict = {}
-    if not ids:
-        return out
-    for c in json.loads(sh(["docker", "inspect", *ids], timeout=10)):
+
+    def left():
+        x = min(10.0, end - time.monotonic())
+        if x < 1:
+            raise TimeoutError("no time left")
+        return x
+    try:
+        ids = sh(["docker", "ps", "-aq", "--no-trunc",
+                  "--filter", f"label=run.huta.project={t.project}",
+                  "--filter", f"label=run.huta.target={t.name}",
+                  "--filter", f"label=run.huta.slot={slot}"], timeout=left()).split()[:32]
+        raw = sh(["docker", "inspect", *ids], timeout=left()) if ids else "[]"
+    except Exception:  # noqa: BLE001
+        return None
+    if len(raw) > 4 << 20:
+        return None
+    out: dict = {c: {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": False,
+                     "missing": True} for c in expected}
+    for c in json.loads(raw):
         labels = (c.get("Config") or {}).get("Labels") or {}
         if labels.get("com.docker.compose.project") != compose_name(t) \
                 or labels.get("run.huta.sha") != sha:
             continue
+        comp = labels.get("run.huta.component", "") or (expected[0] if len(expected) == 1 else "")
+        if comp not in out:
+            continue
         s = c.get("State") or {}
-        oom = None
+        oom = 0
         if s.get("Running"):
             d = cgroup_dir(c.get("Id", ""), s.get("Pid"))
             try:
-                ev = dict(x.split() for x in (d / "memory.events").read_text().splitlines()) if d else {}
-                oom = int(ev.get("oom_kill", 0))
-            except (OSError, ValueError):
-                oom = None
-        out[labels.get("run.huta.component", "") or "web"] = {
-            "restarts": int(c.get("RestartCount") or 0), "oomkilled": bool(s.get("OOMKilled")),
-            "oom_kill": oom, "running": bool(s.get("Running"))}
+                ev = dict(x.split() for x in (d / "memory.events").read_text().splitlines())
+                oom = int(ev["oom_kill"])
+            except (OSError, ValueError, KeyError, TypeError):
+                return None
+        out[comp] = {"restarts": int(c.get("RestartCount") or 0),
+                     "oomkilled": bool(s.get("OOMKilled")), "oom_kill": oom,
+                     "running": bool(s.get("Running")), "missing": False}
     return out
 
 
 def _local_signals(base: dict, now_: dict) -> list[str]:
     out = []
-    for comp, b in base.items():
-        n = now_.get(comp)
-        if n is None or not n["running"]:
-            out.append(f"{comp} is not running")
+    for comp, n in now_.items():
+        b = base.get(comp) or {"restarts": 0, "oomkilled": False, "oom_kill": 0}
+        if not n["running"]:
+            out.append(f"{comp} is not running" + (" (no container)" if n.get("missing") else ""))
             continue
         if n["restarts"] > b["restarts"]:
             out.append(f"{comp} restarted {n['restarts'] - b['restarts']} time(s)")
         if n["oomkilled"] and not b["oomkilled"]:
             out.append(f"{comp} was OOM-killed")
-        elif n["oom_kill"] is not None and b["oom_kill"] is not None and n["oom_kill"] > b["oom_kill"]:
+        elif n["oom_kill"] > b["oom_kill"]:
             out.append(f"{comp}: the kernel OOM-killed a process in it")
     return out
 
@@ -251,6 +291,10 @@ def _errors(platform: Platform, pid: int, since: float, window: float, now: floa
             raise M.MonitorError("Bugsink answered with no event list")
         older = False
         for e in ev["results"]:
+            if total >= EVENTS_CAP:
+                complete = False
+                older = True             # stop here: a lower bound
+                break
             ts = _ts(e.get("timestamp")) if isinstance(e, dict) else None
             if ts is None:
                 raise M.MonitorError("Bugsink listed an event huta can't read")
@@ -275,10 +319,16 @@ def _hc_down(platform: Platform, uuid: str, since: float, deadline: float) -> tu
                     M._hc_headers(platform), None, deadline, ok=(200,))
     if not isinstance(d, dict) or not isinstance(d.get("flips"), list):
         raise M.MonitorError("healthchecks answered with no flips")
-    went_down = any(isinstance(f, dict) and f.get("up") == 0 for f in d["flips"])
+    for f in d["flips"]:
+        if not (isinstance(f, dict) and f.get("up") in (0, 1) and not isinstance(f.get("up"), bool)
+                and _ts(f.get("timestamp")) is not None):
+            raise M.MonitorError("healthchecks listed a flip huta can't read")
+    went_down = any(f["up"] == 0 for f in d["flips"])
     _s, c = M._call("GET", f"{hc['url']}/api/v3/checks/{uuid}", M._hc_headers(platform), None,
                     deadline, ok=(200,))
     status = c.get("status") if isinstance(c, dict) else None
+    if status not in M.HC_STATES:
+        raise M.MonitorError("healthchecks gave no check status huta can read")
     already = status == "down" and not d["flips"]
     return went_down, already
 
@@ -307,6 +357,9 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
     if not live or (live["release_id"], live["since"]) != (rid, since):
         close_stale(st, project.name, t.name)
         return CLOSED
+    snap = _snapshot(platform, st, t)
+    if snap is None:
+        return None                   # a release or recovery is at work: look next tick
 
     def fire(kind: str, why: str):
         r = f"{kind}: {redact(why)[:200]}"
@@ -319,15 +372,14 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
         coverage[src] = coverage[src][-COVERAGE_KEEP:]
 
     # local
-    try:
-        cur = _local_sample(t, live["slot"], rel["sha"])
+    comps = policy.get("components") or expected_components(json.loads(rel["app_toml"]))
+    cur = _local_sample(t, live["slot"], rel["sha"], comps, end)
+    if cur is not None:
         if "local_base" not in signals:
             signals["local_base"] = cur
         for why in _local_signals(signals["local_base"], cur):
             fire("local", why)
         answered("local")
-    except Exception as e:  # noqa: BLE001 — a source that can't answer is uncovered, not fatal
-        log(f"{project.name}/{t.name} watch local: {type(e).__name__}")
     # probe
     if "probe" in srcs:
         times, why = _probe_signal(M.samples(platform, t), rid, since)
@@ -338,9 +390,10 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
     if "errors" in srcs and time.monotonic() < end - 2:
         mon = st.monitor(project.name, t.name, "errors", M.name(platform, t))
         try:
-            if mon is None:
+            pid = int(mon["remote_id"]) if mon else t.crashes
+            if not pid:
                 raise M.MonitorError("no Bugsink project")
-            new, before, after, complete = _errors(platform, int(mon["remote_id"]), since,
+            new, before, after, complete = _errors(platform, pid, since,
                                                    policy["window"], now, end)
             if policy.get("new_issues") and new >= policy["new_issues"]:
                 fire("new-issues", f"{new} new Bugsink issue(s) since the release")
@@ -370,6 +423,8 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
         except Exception as e:  # noqa: BLE001
             log(f"{project.name}/{t.name} watch checks: {type(e).__name__}")
     signals["fired"] = fired
+    if _snapshot(platform, st, t) != snap:
+        return None                   # the episode changed while huta looked: drop this look
     state = WATCHING
     reasons: list[str] = []
     if fired:
@@ -386,9 +441,10 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
         st.db.execute("BEGIN IMMEDIATE")
         cur = st.db.execute(
             "UPDATE watches SET state=?, reasons=?, signals=?, coverage=?, last_tick=? WHERE"
-            " release_id=? AND since=? AND state=?",
+            " release_id=? AND since=? AND state=? AND EXISTS (SELECT 1 FROM live WHERE"
+            " project=? AND target=? AND release_id=? AND since=?)",
             (state, json.dumps(reasons), json.dumps(signals), json.dumps(coverage), now, rid,
-             since, WATCHING))
+             since, WATCHING, project.name, t.name, rid, since))
         if cur.rowcount != 1:
             return None
         for r in new_fired:
@@ -402,6 +458,16 @@ def evaluate(platform: Platform, st, project: Project, t: Target, row, end: floa
                                                     redact("; ".join(reasons) or
                                                            "quiet for the whole window")[:2000]))
     return state if state != WATCHING else None
+
+
+def _snapshot(platform: Platform, st, t: Target):
+    """What must not change while a watch looks: the live episode, and no release or recovery
+    at work (a phase file). None when one is at work."""
+    from .recipe import _phase_file
+    live = st.live(t.project, t.name)
+    if not live or _phase_file(platform, t).exists():
+        return None
+    return (live["release_id"], live["since"], live["slot"])
 
 
 def on_degraded(platform: Platform, st, row) -> None:
@@ -456,49 +522,76 @@ def text(st, rid: str) -> str:
 
 # ------------------------------------------------------------------ the tick's part
 
-NOTIFY_FOR = 24 * 3600     # seconds a verdict's message is retried
+NOTIFY_FOR = 24 * 3600     # seconds a verdict's message is retried after the verdict
+TELL_BATCH = 10            # verdict messages per tick
+TELL_RESERVE = 8           # seconds of the tick kept for telling
 
 
 def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None) -> None:
-    """Open, evaluate, close and tell, for every target with a watch. Bounded by `end`."""
+    """Tell what is pending, then open, evaluate and close for every target with a watch, then
+    tell what changed. Bounded by `end`; time is kept for telling."""
+    _tell(platform, st, end, log)
+    work_end = end - TELL_RESERVE
     for project in registry.values():
         for t in project.targets.values():
             if not t.watch or t.kind == "gateway":
                 continue
+            if time.monotonic() > work_end - 3:
+                break
             try:
-                from .recipe import _phase_file
                 close_stale(st, project.name, t.name)
-                if _phase_file(platform, t).exists():
-                    continue                       # a release is at work: it opens its own
+                if _snapshot(platform, st, t) is None:
+                    continue                       # nothing live, or a release is at work
                 open_live(platform, st, project, t)
                 for row in st.db.execute("SELECT * FROM watches WHERE project=? AND target=? AND"
                                          " state=?", (project.name, t.name, WATCHING)).fetchall():
-                    if time.monotonic() > end - 3:
-                        return
-                    new = evaluate(platform, st, project, t, row, end, log=log)
+                    if time.monotonic() > work_end - 3:
+                        break
+                    new = evaluate(platform, st, project, t, row, work_end, log=log)
                     if new:
                         log(f"{project.name}/{t.name} watch {row['release_id']}: {new}")
             except Exception as e:  # noqa: BLE001 — one target never stops the others
                 log(f"{project.name}/{t.name} watch: {type(e).__name__}")
-    _tell(platform, st, log)
+    _tell(platform, st, end, log)
 
 
-def _tell(platform: Platform, st, log) -> None:
-    """Every verdict reaches the history message; degraded and unknown also send a reply, so
-    the owner is notified. Retried (notified trails state), so it may come twice."""
+def _tell(platform: Platform, st, end: float, log) -> None:
+    """Every state reaches the history message; degraded and unknown also send a reply, so the
+    owner is notified. A row is marked told only when every send it needs worked (a missing
+    history message is sent first). Retried for NOTIFY_FOR after the verdict, then recorded as
+    given up. At most TELL_BATCH a call, within `end`."""
     from . import notify as N
+    now = time.time()
     rows = st.db.execute("SELECT * FROM watches WHERE state IN (?,?,?,?) AND"
-                         " (notified IS NULL OR notified != state) AND opened > ?",
-                         (*VERDICTS, WATCHING, time.time() - NOTIFY_FOR)).fetchall()
+                         " (notified IS NULL OR notified != state) ORDER BY opened LIMIT ?",
+                         (*VERDICTS, WATCHING, TELL_BATCH)).fetchall()
     for r in rows:
+        if time.monotonic() > end - 2:
+            return
         try:
-            N.history(platform, st, r["release_id"], create=False)
+            told_at = r["last_tick"] or r["opened"]
+            if r["state"] != WATCHING and now - told_at > NOTIFY_FOR:
+                with st.db:
+                    st.db.execute("BEGIN IMMEDIATE")
+                    st.db.execute("UPDATE watches SET notified=? WHERE release_id=? AND since=?",
+                                  (r["state"], r["release_id"], r["since"]))
+                    st.db.execute("INSERT INTO events (ts, release_id, project, target, kind, msg)"
+                                  " VALUES (?,?,?,?,?,?)",
+                                  (now, r["release_id"], r["project"], r["target"],
+                                   "notify-failed", f"the {r['state']} verdict was never delivered"
+                                                    " to Telegram; gave up after 24 h"))
+                continue
+            if not N.history(platform, st, r["release_id"], create=True):
+                continue                       # not delivered: next tick
             if r["state"] in (DEGRADED, UNKNOWN):
                 if not N.reply(platform, st, r["release_id"], N.watch_reply(st, r)):
-                    continue                   # not sent: try again next tick
+                    continue
+            with st.db:                        # told, and (degraded) the hook's record: one write
+                st.db.execute("BEGIN IMMEDIATE")
+                st.db.execute("UPDATE watches SET notified=? WHERE release_id=? AND since=?",
+                              (r["state"], r["release_id"], r["since"]))
                 if r["state"] == DEGRADED:
-                    on_degraded(platform, st, r)
-            st.db.execute("UPDATE watches SET notified=? WHERE release_id=? AND since=?",
-                          (r["state"], r["release_id"], r["since"]))
+                    st.db.execute("UPDATE watches SET action=? WHERE release_id=? AND since=? AND"
+                                  " action IS NULL", ("notified", r["release_id"], r["since"]))
         except Exception as e:  # noqa: BLE001
             log(f"watch notify: {type(e).__name__}")

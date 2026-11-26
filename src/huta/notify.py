@@ -197,10 +197,12 @@ def reply(platform, st: S.Store, rid: str, text: str) -> bool:
     is nothing to send it with (no Telegram configured, no history message); never raises."""
     try:
         token = _token(platform)
+        if not token:
+            return True                  # no Telegram: nothing to send it with
         row = st.db.execute("SELECT chat, message_id FROM tg_messages WHERE release_id=?",
                             (rid,)).fetchone()
-        if not token or not row:
-            return True
+        if not row:
+            return False                 # the history message must exist first (history())
         payload = {"chat_id": row["chat"], "text": text, "parse_mode": "HTML",
                    "disable_web_page_preview": True,
                    "reply_parameters": {"message_id": row["message_id"],
@@ -218,27 +220,28 @@ def reply(platform, st: S.Store, rid: str, text: str) -> bool:
         return False
 
 
-def history(platform, st: S.Store, rid: str, create: bool = True) -> None:
+def history(platform, st: S.Store, rid: str, create: bool = True) -> bool:
     """Send or edit this release's history message (create=False: only edit an existing one).
-    Never raises."""
+    Never raises. True when the message now says what render() says, or there is nothing to
+    send it with (no Telegram configured); False when sending or editing failed."""
     try:
         token = _token(platform)
         if not token:
-            return
+            return True
         t = platform.telegram
         text = render(st, rid)
         row = st.db.execute("SELECT chat, message_id, text FROM tg_messages WHERE release_id=?",
                             (rid,)).fetchone()
         if row and row["text"] == text:
-            return
+            return True
         if row:
             _call(token, "editMessageText", {"chat_id": row["chat"], "message_id": row["message_id"],
                                              "text": text, "parse_mode": "HTML",
                                              "disable_web_page_preview": True})
             st.db.execute("UPDATE tg_messages SET text=? WHERE release_id=?", (text, rid))
-            return
+            return True
         if not create:
-            return
+            return True
         payload = {"chat_id": t["history_chat"], "text": text, "parse_mode": "HTML",
                    "disable_web_page_preview": True}
         if t.get("history_thread"):
@@ -246,11 +249,13 @@ def history(platform, st: S.Store, rid: str, create: bool = True) -> None:
         res = _call(token, "sendMessage", payload)
         st.db.execute("INSERT OR REPLACE INTO tg_messages (release_id, chat, message_id, text)"
                       " VALUES (?,?,?,?)", (rid, t["history_chat"], res["result"]["message_id"], text))
+        return True
     except Exception as e:  # noqa: BLE001 — telling the owner must never break a release
         try:
             st.event("notify-failed", f"telegram: {type(e).__name__}", rid)
         except Exception:  # noqa: BLE001
             pass
+        return False
 
 
 # ------------------------------------------------------------------ one-tap approval

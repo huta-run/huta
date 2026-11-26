@@ -1410,7 +1410,8 @@ class Watch(unittest.TestCase):
                         mock.patch.object(cfg, "_SECRETS", []),
                         mock.patch.object(M, "transport", self.fm.handle),
                         mock.patch.object(W, "_local_sample",
-                                          lambda t, slot, sha: json.loads(json.dumps(self.local)))]
+                                          lambda t, slot, sha, expected, end:
+                                          json.loads(json.dumps(self.local)))]
         for p in self.patches:
             p.start()
         self.st = store.Store(self.platform.state_dir)
@@ -1418,9 +1419,11 @@ class Watch(unittest.TestCase):
         from tests._util import app_toml
         app = app_toml("hello")
         app["monitor"] = {"env": ["sentry"]}
+        # The plan records that this release got SENTRY_DSN (milestone 2's effective.monitor).
         self.rid = self.st.new_release(project="hello", target="prod", sha="a" * 40,
                                        image_id="i", image_tag="t", app_toml=json.dumps(app),
-                                       plan={}, plan_hash="0", built_by="test")
+                                       plan={"effective": {"monitor": {"env": ["SENTRY_DSN"]}}},
+                                       plan_hash="0", built_by="test")
         self.st.set_state(self.rid, "live")
         self.st.db.execute("INSERT INTO live (project, target, release_id, slot, since)"
                            " VALUES (?,?,?,?,?)", ("hello", "prod", self.rid, "a", self.T0))
@@ -1513,11 +1516,9 @@ class Watch(unittest.TestCase):
 
     def test_probe_failures_far_apart_dont_fire(self):
         self.open()
-        for at in (60, 300, 540):
-            self.probe_ok = False
+        self.probe_ok = False
+        for at in (60, 300, 540, 780):            # failing, but each over 150 s from the last
             self.look(at)
-            self.probe_ok = True
-            self.look(at + 30)
         self.assertEqual(self.row()["state"], "watching")
 
     def test_new_issue_degrades(self):
@@ -1613,11 +1614,12 @@ class Watch(unittest.TestCase):
             sent.append((method, payload))
             return {"result": {"message_id": 8}}
         with mock.patch.object(N, "_token", lambda p: "tok"), mock.patch.object(N, "_call", call):
-            self.W._tell(self.platform, self.st, lambda m: None)
+            end = time.monotonic() + 30
+            self.W._tell(self.platform, self.st, end, lambda m: None)
             self.assertIsNone(self.row()["notified"])          # not sent: tried again
             fail[0] = False
-            self.W._tell(self.platform, self.st, lambda m: None)
-            self.W._tell(self.platform, self.st, lambda m: None)
+            self.W._tell(self.platform, self.st, end, lambda m: None)
+            self.W._tell(self.platform, self.st, end, lambda m: None)
         replies = [p for m, p in sent if m == "sendMessage"]
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0]["reply_parameters"]["message_id"], 7)
@@ -1665,7 +1667,7 @@ class WatchTickCrash(Watch):
                 steps_file.write_text(json.dumps(steps))
                 if crash_after is not None and len(steps) == crash_after:
                     os._exit(77)
-            real_open, real_eval, real_deg = self.W.open_watch, self.W.evaluate, self.W.on_degraded
+            real_open, real_eval = self.W.open_watch, self.W.evaluate
 
             def open_(*a, **k):
                 r = real_open(*a, **k)
@@ -1676,10 +1678,6 @@ class WatchTickCrash(Watch):
                 r = real_eval(*a, **k)
                 op(f"evaluate {r}")
                 return r
-
-            def deg(*a, **k):
-                real_deg(*a, **k)
-                op("action")
 
             def call(token, method, payload):
                 replies = self.dir / "replies.json"
@@ -1695,7 +1693,6 @@ class WatchTickCrash(Watch):
                     self.st = S.Store(self.platform.state_dir)
                     with mock.patch.object(self.W, "open_watch", open_), \
                             mock.patch.object(self.W, "evaluate", ev), \
-                            mock.patch.object(self.W, "on_degraded", deg), \
                             mock.patch.object(N, "_token", lambda p: "tok"), \
                             mock.patch.object(N, "_call", call):
                         self.tick_at(60)
@@ -1744,3 +1741,155 @@ class WatchTickCrash(Watch):
                            " text) VALUES (?,?,?,?)", (self.rid, -100, 7, "old"))
         with mock.patch.object(self.W.time, "time", lambda: self.T0 + at):
             self.W.tick(self.platform, self.registry, self.st, time.monotonic() + 30)
+
+
+class WatchEvidence(Watch):
+    """(Watch's tests run here too.) Codex's review of milestone 5: evidence must be complete."""
+
+    def test_errors_source_from_the_plan(self):
+        from huta import store as S
+        rel = self.st.release(self.rid)
+        self.assertIn("errors", self.W.sources(self.platform, self.project, self.t, rel))
+        # Today's DSN file going away doesn't remove the source the release had.
+        (self.etc / "secrets" / "hello" / "HUTA_SENTRY_DSN_PROD").unlink()
+        self.assertIn("errors", self.W.sources(self.platform, self.project, self.t, rel))
+        # A release whose plan didn't give it the DSN isn't watched through errors.
+        self.st.db.execute("UPDATE releases SET plan='{}' WHERE id=?", (self.rid,))
+        rel = self.st.release(self.rid)
+        self.assertNotIn("errors", self.W.sources(self.platform, self.project, self.t, rel))
+        t = dataclasses.replace(self.t, env={**self.t.env, "SENTRY_DSN": "https://k@x.example.org/9"},
+                                crashes=9)
+        self.assertIn("errors", self.W.sources(self.platform, self.project, t, rel))
+
+    def test_missing_container_degrades(self):
+        self.open()
+        self.look(30)
+        self.local["web"] = {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": False,
+                             "missing": True}
+        self.assertEqual(self.look(60), "degraded")
+        self.assertIn("no container", self.row()["reasons"])
+
+    def test_incomplete_local_is_uncovered(self):
+        self.open()
+        with mock.patch.object(self.W, "_local_sample", lambda *a: None):
+            for at in (60, 360, 660, 901):
+                out = self.look(at)
+        self.assertEqual(out, "unknown")
+        self.assertIn("local: no answer", self.row()["reasons"])
+
+    def test_episode_change_during_a_look_drops_it(self):
+        self.open()
+        real = self.W._local_sample
+
+        def switch(*a):
+            import sqlite3
+            con = sqlite3.connect(self.platform.state_dir / "huta.db")
+            con.execute("UPDATE live SET slot='b'")
+            con.commit()
+            con.close()
+            return real(*a)
+        self.local["web"]["restarts"] = 5
+        with mock.patch.object(self.W, "_local_sample", switch):
+            self.assertIsNone(self.look(60))
+        self.assertEqual(self.row()["state"], "watching")
+
+    def test_phase_file_skips(self):
+        from huta import recipe
+        self.open()
+        f = recipe._phase_file(self.platform, self.t)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("{}")
+        self.local["web"]["restarts"] = 5
+        self.assertIsNone(self.look(60))
+        self.assertEqual(self.row()["state"], "watching")
+
+    def test_malformed_checks_answer_is_uncovered(self):
+        for flips, check in (({"flips": [{}]}, {"status": "up"}), ({"flips": []}, {}),
+                             ({"flips": [{"up": True, "timestamp": "2026-01-01T00:00:00"}]},
+                              {"status": "up"})):
+            with self.subTest(flips=flips, check=check):
+                answers = iter([flips, check])
+                with mock.patch.object(self.M, "_call", lambda *a, **k: (200, next(answers))), \
+                        mock.patch.object(self.M, "_hc_headers", lambda p: {}):
+                    self.platform.monitoring["healthchecks"] = {"url": "http://127.0.0.1:9"}
+                    with self.assertRaises(self.M.MonitorError):
+                        self.W._hc_down(self.platform, "0" * 8 + "-0000-0000-0000-" + "0" * 12,
+                                        self.T0, time.monotonic() + 10)
+        self.platform.monitoring["healthchecks"] = None
+
+    def test_event_cap_inside_a_page(self):
+        self.t.watch["new_issues"] = 0
+        self.open()
+        for i in range(600):
+            self.fm.add_event(self.pid, "x", self.T0 + 10 + i * 0.1)
+        new, before, after, complete = self.W._errors(self.platform, self.pid, self.T0,
+                                                      self.WINDOW, self.T0 + 300,
+                                                      time.monotonic() + 30)
+        self.assertEqual(after, self.W.EVENTS_CAP)
+        self.assertFalse(complete)
+
+    def test_missing_history_message_is_sent_first(self):
+        from huta import notify as N
+        self.open()
+        self.look(30)
+        self.local["web"]["restarts"] = 1
+        self.look(60)
+        sent = []
+
+        def call(token, method, payload):
+            sent.append(method)
+            return {"result": {"message_id": 9}}
+        self.platform = dataclasses.replace(self.platform, telegram={"history_chat": -100})
+        with mock.patch.object(N, "_token", lambda p: "tok"), mock.patch.object(N, "_call", call):
+            self.W._tell(self.platform, self.st, time.monotonic() + 30, lambda m: None)
+        self.assertEqual(sent, ["sendMessage", "sendMessage"])     # the history, then the reply
+        self.assertEqual(self.row()["notified"], "degraded")
+
+    def test_gives_up_after_a_day_and_says_so(self):
+        from huta import notify as N
+        self.open()
+        self.look(30)
+        self.local["web"]["restarts"] = 1
+        self.look(60)
+        self.st.db.execute("UPDATE watches SET last_tick=?", (time.time() - 2 * 86400,))
+        with mock.patch.object(N, "_token", lambda p: "tok"), \
+                mock.patch.object(N, "_call", side_effect=OSError("down")):
+            self.W._tell(self.platform, self.st, time.monotonic() + 30, lambda m: None)
+        self.assertEqual(self.row()["notified"], "degraded")
+        self.assertIn("gave up", " ".join(e["msg"] for e in self.st.events(self.rid, limit=10)))
+
+
+class LocalSampler(unittest.TestCase):
+    """The production sampler against made-up Docker answers."""
+
+    def run_sampler(self, containers, expected=("web",), oom="oom 0\noom_kill 0\n"):
+        from huta import watch as W
+        t = mock.Mock(project="p", name="t")
+        t.name = "t"
+        answers = iter(["\n".join(c["Id"] for c in containers), json.dumps(containers)])
+        cg = Path(tempfile.mkdtemp())
+        try:
+            (cg / "memory.events").write_text(oom)
+            with mock.patch("huta.recipe.sh", lambda cmd, timeout=600, **k: next(answers)), \
+                    mock.patch("huta.runstate.cgroup_dir", lambda cid, pid: cg):
+                return W._local_sample(t, "a", "s" * 40, list(expected), time.monotonic() + 20)
+        finally:
+            shutil.rmtree(cg, ignore_errors=True)
+
+    def container(self, comp="", running=True, restarts=0, sha="s" * 40):
+        labels = {"com.docker.compose.project": "huta_p_t", "run.huta.sha": sha}
+        if comp:
+            labels["run.huta.component"] = comp
+        return {"Id": "c" * 64, "RestartCount": restarts, "Config": {"Labels": labels},
+                "State": {"Running": running, "Pid": 1, "OOMKilled": False}}
+
+    def test_reads_and_marks_missing(self):
+        with mock.patch("huta.recipe.compose_name", lambda t: "huta_p_t"):
+            got = self.run_sampler([self.container(restarts=2)])
+            self.assertEqual(got["web"]["restarts"], 2)
+            got = self.run_sampler([self.container(comp="api")], expected=("web", "api"))
+            self.assertTrue(got["web"]["missing"])
+            self.assertFalse(got["api"]["missing"])
+            got = self.run_sampler([self.container(sha="o" * 40)])     # another release's
+            self.assertTrue(got["web"]["missing"])
+            self.assertIsNone(self.run_sampler([self.container()], oom="garbage"))
