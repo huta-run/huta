@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -34,6 +35,7 @@ from . import store as S
 from .cfg import Platform
 
 ID_RE = re.compile(r"[0-9a-f]{8}")
+NAME_RE = re.compile(r"[a-z][a-z0-9-]*")      # project and target names (cfg's rule)
 START_BUDGET = 120        # seconds a new prepare's unit has to start and take its lock
 PLAN_TTL = 30 * 60        # a ready snapshot's plan expires as release plans do
 TERMINAL = (S.SNAP_FAILED, S.SNAP_REJECTED, S.SNAP_EXPIRED)
@@ -119,11 +121,33 @@ def _detach_loops(img: Path) -> None:
                 raise SnapshotError(f"could not detach {dev}: {d.stderr.strip()[-200:]}")
 
 
-def _rm_strict(p: Path, parent: Path) -> None:
+def _no_links(p: Path, root: Path) -> None:
+    """p must lie under root, and nothing from root down to p's parent may be a symlink (or
+    anything but a directory): cleanup never acts through a redirected ancestor."""
+    try:
+        rel = p.relative_to(root)
+    except ValueError:
+        raise SnapshotError(f"refusing {p}: not under {root}") from None
+    if ".." in rel.parts:
+        raise SnapshotError(f"refusing {p}")
+    cur = root
+    for part in (None, *rel.parts[:-1]):
+        cur = cur if part is None else cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return                       # nothing below a missing directory to act on
+        if not stat.S_ISDIR(st.st_mode):
+            raise SnapshotError(f"refusing {p}: {cur} is a symlink or not a directory")
+
+
+def _rm_strict(p: Path, parent: Path, root: Path) -> None:
     """Remove p (a file or tree) only if it sits directly in `parent`, is named like a snapshot
-    id, and is not a symlink; never crosses into another filesystem."""
+    id, is not a symlink and has no symlinked ancestor below `root`; never crosses into another
+    filesystem."""
     if p.parent != parent or not ID_RE.fullmatch(p.name.lstrip(".").removesuffix(".tmp")):
         raise SnapshotError(f"refusing to remove {p}")
+    _no_links(p, root)
     if not os.path.lexists(p):
         return
     if p.is_symlink():
@@ -139,18 +163,22 @@ def remove_files(platform: Platform, project: str, target: str, sid: str) -> Non
     SnapshotError when something can't be removed; what is left stays for the next sweep."""
     if not ID_RE.fullmatch(sid):
         raise SnapshotError(f"bad snapshot id {sid!r}")
+    for name in (project, target):
+        if not NAME_RE.fullmatch(name):
+            raise SnapshotError(f"bad name {name!r}")
     _containers_gone(sid)
     w = work_dir(platform, project, target, sid)
+    _no_links(w / "mnt", work_root(platform))
     if w.is_dir() and not w.is_symlink():
         _unmount(w / "mnt")
         _detach_loops(w / "scratch.img")
-    _rm_strict(w, w.parent)
+    _rm_strict(w, w.parent, work_root(platform))
     inp = input_dir(platform, project, target, sid)
     if inp is not None:
-        _rm_strict(inp, inp.parent)
+        _rm_strict(inp, inp.parent, platform.backup["dir"])
     out = outbox_dir(platform, sid)
     if out is not None:
-        _rm_strict(out, out.parent)
+        _rm_strict(out, out.parent, Path(platform.pull["outbox"]))
 
 
 # ------------------------------------------------------------------ sweep
@@ -210,11 +238,15 @@ def sweep_row(platform: Platform, st, row, now: float, log) -> None:
 def _orphans(platform: Platform, st, project: str, target: str, log) -> None:
     """Leftovers of this target that no open row owns: work directories, input links."""
     owned = {r["id"] for r in st.snapshots(project, target, states=S.SNAP_OPEN + (
-        S.SNAP_DELIVERED, S.SNAP_NEEDS_HUMAN, *TERMINAL))}
-    dirs = [work_root(platform) / project / target]
+        S.SNAP_DELIVERED, S.SNAP_NEEDS_HUMAN, *TERMINAL), limit=None)}
+    dirs = [(work_root(platform) / project / target, work_root(platform))]
     if platform.backup:
-        dirs.append(platform.backup["dir"] / project / target / "snaps")
-    for d in dirs:
+        dirs.append((platform.backup["dir"] / project / target / "snaps", platform.backup["dir"]))
+    for d, root in dirs:
+        try:
+            _no_links(d / "x", root)
+        except SnapshotError:
+            continue
         if not d.is_dir() or d.is_symlink():
             continue
         for p in sorted(d.iterdir()):
@@ -224,9 +256,10 @@ def _orphans(platform: Platform, st, project: str, target: str, log) -> None:
             try:
                 if d.name != "snaps":
                     _containers_gone(sid)
-                    _unmount(p / "mnt")
-                    _detach_loops(p / "scratch.img")
-                _rm_strict(p, d)
+                    if p.is_dir() and not p.is_symlink():
+                        _unmount(p / "mnt")
+                        _detach_loops(p / "scratch.img")
+                _rm_strict(p, d, root)
                 log(f"removed leftover {p}")
             except (SnapshotError, OSError, subprocess.TimeoutExpired) as e:
                 st.event("snapshot-cleanup-failed", f"leftover {p.name}: {e}"[:300], None,
@@ -253,12 +286,15 @@ def sweep(platform: Platform, st, project: str | None = None, target: str | None
     for p, t in sorted(_targets(platform, st)):
         if (project and p != project) or (target and t != target):
             continue
+        if not (NAME_RE.fullmatch(p) and NAME_RE.fullmatch(t)):
+            continue                      # not a name huta made
         fd = _try_lock(st, p, t)
         if fd is None:
             continue
         try:
             for row in st.snapshots(p, t, states=S.SNAP_OPEN + (S.SNAP_DELIVERED,
-                                                                 S.SNAP_NEEDS_HUMAN, *TERMINAL)):
+                                                                 S.SNAP_NEEDS_HUMAN, *TERMINAL),
+                                    limit=None):
                 try:
                     sweep_row(platform, st, row, now, log)
                 except Exception as e:  # noqa: BLE001 — one row never stops the rest

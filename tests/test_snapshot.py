@@ -268,6 +268,34 @@ class Sweep(unittest.TestCase):
         self.assertTrue((outside / "keep").exists())
         self.assertEqual(self.h.state(sid), S.SNAP_NEEDS_HUMAN)
 
+    def test_a_symlinked_ancestor_is_never_followed(self):
+        sid = self.h.row(S.SNAP_FAILED)
+        outside = self.h.root / "outside"
+        (outside / sid).mkdir(parents=True)
+        (outside / sid / "keep").write_text("x")
+        snaps = SN.input_dir(self.h.platform, "hello", "prod", sid).parent
+        snaps.parent.mkdir(parents=True)
+        snaps.symlink_to(outside)
+        self.sweep()
+        self.assertTrue((outside / sid / "keep").exists())
+        self.assertEqual(self.h.state(sid), S.SNAP_NEEDS_HUMAN)
+
+    def test_many_rows_are_all_owned(self):
+        ids = []
+        for i in range(205):
+            sid = self.st.new_snapshot(project="hello", target="prod", name="db", box="dev",
+                                       transport="pull", release_id="r", definition={},
+                                       reason="", per_day=1000)
+            self.st.snapshot_transition(sid, S.SNAP_PREPARING, S.SNAP_READY)
+            self.st.db.execute("UPDATE snapshots SET state=?, delete_after=?, created=? WHERE"
+                               " id=?", (S.SNAP_DELIVERED, time.time() + 3600, i, sid))
+            ids.append(sid)
+        oldest = ids[0]
+        w = SN.work_dir(self.h.platform, "hello", "prod", oldest)
+        w.mkdir(parents=True)
+        self.sweep()
+        self.assertTrue(w.exists(), "the 201st row still owns its files")
+
     def test_works_for_a_target_no_longer_in_the_registry(self):
         sid = self.st.new_snapshot(project="gone", target="old", name="db", box="dev",
                                    transport="push", release_id="r", definition={}, reason="",
@@ -282,8 +310,8 @@ class Sweep(unittest.TestCase):
         real = SN._rm_strict
         n = {"k": 0}
 
-        def die_after_first(p, parent):
-            real(p, parent)
+        def die_after_first(p, parent, root):
+            real(p, parent, root)
             n["k"] += 1
             os._exit(77)
         pid = os.fork()

@@ -360,7 +360,8 @@ class Store:
         return self.db.execute("SELECT * FROM snapshots WHERE id=?", (sid,)).fetchone()
 
     def snapshots(self, project: str | None = None, target: str | None = None,
-                  states=None, limit: int = 200) -> list:
+                  states=None, limit: int | None = 200) -> list:
+        """limit None: every row (recovery must see them all)."""
         q, a = "SELECT * FROM snapshots WHERE 1=1", []
         if project:
             q, a = q + " AND project=?", a + [project]
@@ -369,6 +370,8 @@ class Store:
         if states:
             q += f" AND state IN ({','.join('?' * len(states))})"
             a += list(states)
+        if limit is None:
+            return self.db.execute(q + " ORDER BY created DESC", a).fetchall()
         return self.db.execute(q + " ORDER BY created DESC LIMIT ?", (*a, limit)).fetchall()
 
     def snapshot_transition(self, sid: str, frm: str, to: str, msg: str = "",
