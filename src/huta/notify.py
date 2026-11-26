@@ -175,7 +175,8 @@ def render(st: S.Store, rid: str) -> str:
     for c in p.get("changes", []):
         # Secret-bearing jobs, Cloudflare publishing, snapshot commands: always shown.
         if c.startswith("📦"):         # commands in full when they fit, else said where
-            room = max(80, min(900, budget))   # the head (name, digest) always shows
+            head = c.split("): ", 1)[0] + "): "      # name, new/changed, digest: always whole
+            room = max(len(head) + 20, min(900, budget))
             budget -= min(len(c), room)
             lines.append(esc(c) if len(c) <= room else
                          esc(c[:room - 20]) + f"… (whole: <code>sudo huta show {esc(rid)}</code>)")

@@ -555,13 +555,14 @@ class Contract(unittest.TestCase):
             self.assertIn("📦 snapshot db (new, x): runs node s.mjs", text)
             self.assertIn(f"(whole: <code>sudo huta show {rid}</code>)", text)
             self.assertNotIn("changed: env", text)
-            five = [f"📦 snapshot s{i} (new, d{i}): runs python " + "q" * 950 for i in range(5)]
+            five = [f"📦 snapshot {'s' * 31}{i} (changed, {'d' * 11}{i}): runs python "
+                    + "q" * 950 for i in range(5)]
             st.db.execute("UPDATE releases SET plan=? WHERE id=?",
                           (__import__("json").dumps({**plan, "changes": five}), rid))
             text = N.render(st, rid)
             self.assertLess(len(text), 4096)
             for i in range(5):
-                self.assertIn(f"📦 snapshot s{i} (new, d{i})", text)
+                self.assertIn(f"📦 snapshot {'s' * 31}{i} (changed, {'d' * 11}{i}): ", text)
         finally:
             shutil.rmtree(st.dir, ignore_errors=True)
 
