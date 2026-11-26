@@ -170,7 +170,10 @@ def render(st: S.Store, rid: str) -> str:
         lines.append(esc(note))
     for c in p.get("changes", []):
         # Secret-bearing jobs, Cloudflare publishing, snapshot commands: always shown.
-        if c.startswith(("🔑", "☁️", "📦")):
+        if c.startswith("📦"):         # commands in full when they fit, else said where
+            lines.append(esc(c) if len(c) <= 900 else
+                         esc(c[:880]) + f"… (whole: <code>sudo huta show {esc(rid)}</code>)")
+        elif c.startswith(("🔑", "☁️")):
             lines.append(esc(c[:300]))
     state = r["state"]
     head = STATE_LINE.get(state, state)

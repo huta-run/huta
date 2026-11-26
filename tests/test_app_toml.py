@@ -264,6 +264,7 @@ class Snapshot(unittest.TestCase):
             "duplicate": (NOTES, "notes", SNAP + SNAP, "unique"),
             "bad name": (NOTES, "notes", SNAP.replace('"db"', '"DB"'), "unique lowercase"),
             "no component": (NOTES, "notes", SNAP + 'component = "api"\n', "no component"),
+            "component type": (NOTES, "notes", SNAP + 'component = []\n', "no component"),
             "six": (NOTES, "notes", "".join(SNAP.replace('"db"', f'"s{i}"') for i in range(6)),
                     "1 to 5"),
             "overlap": (NOTES.replace('data = "/data"', 'data = "/snapshot/db"'), "notes", SNAP,

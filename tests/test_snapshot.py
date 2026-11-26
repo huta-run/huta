@@ -433,6 +433,7 @@ class Contract(unittest.TestCase):
                 ('snapshot = { per_day = true }', "1..24"),
                 ('snapshot = { shell = true }', "snapshot = "),
                 ('snapshot = { canaries = ["lower"] }', "canaries"),
+                ('snapshot = { canaries = [{}] }', "canaries"),
                 ('snapshot = { canaries = ["NOTES_TOKEN"] }', "also used by a target"),
                 ('snapshot = { canaries = ["ROTATE_KEY"] }', "also used by a target"),
                 ('snapshot = { canaries = ["PRICE"] }', "also used by a target")):
@@ -478,11 +479,20 @@ class Contract(unittest.TestCase):
         self.assertEqual(cli.snapshot_lines([a], [a]), [])
         new = cli.snapshot_lines([], [a])
         self.assertEqual(len(new), 1)
-        self.assertTrue(new[0].startswith("📦 snapshot db (new): runs node s.mjs"))
+        self.assertTrue(new[0].startswith("📦 snapshot db (new, "))
+        self.assertTrue(new[0].endswith("runs node s.mjs"))
         self.assertIn("10 min", new[0])
         changed = cli.snapshot_lines([a], [b])[0]
-        self.assertIn("(changed): runs node s2.mjs; check node v.mjs", changed)
+        self.assertIn("(changed, ", changed)
+        self.assertTrue(changed.endswith("runs node s2.mjs; check node v.mjs"))
         self.assertIn("90 s", changed)
+        # Argument boundaries show, and long commands that differ late differ up front.
+        q = cli.snapshot_lines([], [{**a, "cmd": ["sh", "-c", "a b"]}])[0]
+        self.assertTrue(q.endswith("runs sh -c 'a b'"))
+        x = {**a, "cmd": ["x" * 400, "safe"]}
+        y = {**a, "cmd": ["x" * 400, "unsafe"]}
+        lx, ly = cli.snapshot_lines([], [x])[0], cli.snapshot_lines([], [y])[0]
+        self.assertNotEqual(lx[:40], ly[:40])
         self.assertEqual(cli.snapshot_lines([a], []), ["📦 snapshot db removed"])
 
     def test_a_release_adding_a_snapshot_is_infra(self):
@@ -519,9 +529,9 @@ class Contract(unittest.TestCase):
                 p2 = json_plan(h.st, r2)
                 self.assertEqual(p2["class"], "infra")
                 self.assertEqual([c for c in p2["changes"] if c.startswith("📦")],
-                                 ["📦 snapshot db (new): runs python /app/app.py sanitize; "
-                                  "component web, at most 10 min, on a backup copy, no network, "
-                                  "no secrets"])
+                                 cli.snapshot_lines([], p2["effective"]["snapshot"]))
+                self.assertTrue(any(c.endswith("runs python /app/app.py sanitize")
+                                    for c in p2["changes"]))
                 self.assertFalse([c for c in p2["changes"] if "changed:" in c and "snapshot" in c])
             finally:
                 for c in ctx:
@@ -535,13 +545,15 @@ class Contract(unittest.TestCase):
             st = S.Store(Path(tempfile.mkdtemp(prefix="huta-snap-st-")))
         try:
             plan = {"project": "notes", "target": "prod", "sha": "a" * 40, "class": "infra",
-                    "changes": ["changed: env", "📦 snapshot db (new): runs node s.mjs"],
+                    "changes": ["changed: env", "📦 snapshot db (new, x): runs node s.mjs",
+                                "📦 snapshot big (new, y): runs " + "z" * 2000],
                     "checks": {}, "effective": {}, "from": None}
             rid = st.new_release(project="notes", target="prod", sha="a" * 40, image_id="i",
                                  image_tag="t", app_toml="{}", plan=plan, plan_hash="0",
                                  built_by="dev")
             text = N.render(st, rid)
-            self.assertIn("📦 snapshot db (new): runs node s.mjs", text)
+            self.assertIn("📦 snapshot db (new, x): runs node s.mjs", text)
+            self.assertIn(f"(whole: <code>sudo huta show {rid}</code>)", text)
             self.assertNotIn("changed: env", text)
         finally:
             shutil.rmtree(st.dir, ignore_errors=True)

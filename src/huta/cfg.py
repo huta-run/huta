@@ -1550,7 +1550,8 @@ def _snapshot_cfg(v, where: str) -> dict:
     if "max_age" in v:
         out["max_age"] = _long_duration(v["max_age"], f"{where} snapshot.max_age", 90 * 86400)
     can = v.get("canaries", [])
-    if not isinstance(can, list) or len(can) > 20 or len(set(can)) != len(can):
+    if not isinstance(can, list) or len(can) > 20 or not all(isinstance(c, str) for c in can) \
+            or len(set(can)) != len(can):
         raise ConfigError(f"{where}: snapshot.canaries must be a list of distinct secret names")
     for c in can:
         _env_name(c, f"{where} snapshot.canaries")
@@ -1603,7 +1604,7 @@ def _snapshot_app(items, comps: dict, order: list, st_kind: str) -> list[dict]:
             raise ConfigError(f"{w}: name must be a unique lowercase name")
         names.add(name)
         comp = j.get("component", default)
-        if comp not in comps:
+        if not isinstance(comp, str) or comp not in comps:
             raise ConfigError(f"{w}: no component {comp!r}")
         if comps[comp].get("kind", "http") not in ("http", "worker"):
             raise ConfigError(f"{w}: component {comp!r} can't run it")

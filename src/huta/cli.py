@@ -33,6 +33,7 @@ import html
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -285,10 +286,14 @@ def snapshot_lines(old: list, new: list) -> list[str]:
             out.append(f"📦 snapshot {name} removed")
             continue
         what = "new" if a is None else "changed"
-        out.append(f"📦 snapshot {name} ({what}): runs {' '.join(b['cmd'])[:300]}"
-                   + (f"; check {' '.join(b['check'])[:200]}" if b.get("check") else "")
-                   + f"; component {b['component']}, at most {_secs(b['timeout'])}, on a "
-                   "backup copy, no network, no secrets")
+        # Whole argv, quoted so argument boundaries show; a digest up front, so even a message
+        # cut for Telegram tells two different commands apart (codex review of S1).
+        q = lambda argv: " ".join(shlex.quote(x) for x in argv)      # noqa: E731
+        digest = hashlib.sha256(json.dumps([b["cmd"], b.get("check"), b["component"],
+                                            b["timeout"]]).encode()).hexdigest()[:12]
+        out.append(f"📦 snapshot {name} ({what}, {digest}): component {b['component']}, at "
+                   f"most {_secs(b['timeout'])}, on a backup copy, no network, no secrets; "
+                   f"runs {q(b['cmd'])}" + (f"; check {q(b['check'])}" if b.get("check") else ""))
     return out
 
 
