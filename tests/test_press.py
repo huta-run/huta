@@ -333,6 +333,8 @@ class Unit(Base):
         self.assertEqual(self.row()["action"], W.PLANNED_PREFIX + r3["id"])
         msgs = [e["msg"] for e in self.st.events(r3["id"], limit=20)]
         self.assertIn("approved with ↩️ in Telegram", msgs)
+        self.assertFalse([p for m, p in self.sent if "✅" in json.dumps(p, ensure_ascii=False)
+                          and m == "editMessageReplyMarkup"], "no Deploy buttons on a one-tap plan")
         self.assertEqual(self.host.running(self.t), {"a": SHA1})
 
     def test_rolled_away_release_is_never_picked_again(self):
@@ -348,6 +350,17 @@ class Unit(Base):
         r3 = self.newest()
         self.assertEqual(r3["state"], S.PLANNED)
         self.assertEqual(self.state(self.r2), S.LIVE)
+
+    def test_approval_refusing_leaves_the_plan_its_buttons(self):
+        def refuse(*a):
+            raise cli.ConfigError("CI is red")
+        with mock.patch.object(cli, "_gates", refuse), \
+                self.assertRaisesRegex(cli.ConfigError, "CI"):
+            self.run_unit()
+        r3 = self.newest()
+        self.assertEqual(r3["state"], S.PLANNED)
+        self.assertIsNotNone(self.st.db.execute("SELECT 1 FROM approvals WHERE release_id=?",
+                                                (r3["id"],)).fetchone())
 
     def test_refused_when_no_longer_live(self):
         r3 = self.host.plan(self.project, self.t, app_toml("hello"), "3" * 40)

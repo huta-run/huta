@@ -398,8 +398,9 @@ for unattended releases (`ready`, `blocks`, `--ack`). Job checks (milestone 3) a
   `cmd_press` starts `huta rollback <p> <t> --press <release>` as a transient unit, which under
   the target and secrets locks refuses unless that episode is still live and the fixed release
   is still retired with its images on the host, else plans the rollback of exactly that release
-  and records `action = rollback-planned:<id>`. Then the plan is posted with its buttons, and
-  approved at once (`cmd_approve`, "approved with ↩️ in Telegram") only if it is one-tap clean
+  and records `action = rollback-planned:<id>`. Then the plan's message is posted, and the plan
+  approved at once (`cmd_approve`, "approved with ↩️ in Telegram"; it gets ✅ / ❌ only if that
+  approval refuses without deciding it) only if it is one-tap clean
   (`watch.one_tap_clean`: no one-writer data, no database, code-only, no migration, staged
   secret or external publishing, the commit comparison known); otherwise it waits for its
   buttons. A refusal (`action = refused: <why>`) replies with the reason and the
