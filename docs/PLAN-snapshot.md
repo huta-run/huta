@@ -236,7 +236,7 @@ This is the one feature that moves production data off the host on a box's reque
 | Sanitize prints data instead of writing it | Its output stays root-only; the box sees fixed codes. |
 | A box asks for another project's data | Same `boxes` check and same answer as a missing project. List, fetch and rm only by the requesting box, re-checked each time. |
 | The owner approves A, gets B | The plan binds the artifact's sha256 and everything it was made from; delivery hashes the fd it sends. |
-| A forged press (the relay knows the button secrets) | The relay is trusted with the presser's id (as for releases), and here a forged press exports data. Owner's call: see question 10. |
+| A forged press (the relay knows the button secrets) | The relay is trusted with the presser's id, as for releases (decided, question 10). A forged press can send only an artifact that is ready, already validated and bound by hash, and only to the box that asked for it. |
 | Misleading text in the approval | Only huta's facts; the reason is escaped, prefixed and stripped of control and bidi characters. |
 | Needle scan as a guessing oracle | A box can still learn yes/no per request (a release can print a guess). Refusals don't name the secret, count toward `per_day`, and repeated `secret-found` raises an alert. Staged values never enter the needle set, so a box can't choose needles. |
 | Other agents on the dev box read the outbox | File is group-readable by the dev user only. Every agent sharing that user (also ones granted other projects) can read it: accepted, said in the docs. |
@@ -373,10 +373,30 @@ The reviewers' answers are in brackets.
     snapshots (no button)? [codex: prefer a receiver only huta controls; agy: call it out, and
     consider an opt-in]
 
+## Decided
+
+The owner decided the open questions on 2026-11-26:
+
+1. **Prepare first**; the owner approves the exact artifact.
+2. **Keep `reason`**, escaped, prefixed "box says:", one line, no control or bidi characters.
+3. **Defaults** `max` 200m, `keep` 24h, `per_day` 4, sanitize ceiling 30m; `scratch` ceiling
+   16 GiB and at least `max`.
+4. **Canaries** as secret files, never used or stageable by a target, failing closed.
+5. **A throwaway Postgres server** per snapshot.
+6. **The last backup copy**, its age shown (⚠️ past 24 h), an optional registry `max_age`; no
+   `--fresh`.
+7. **A tap every time**, on every target.
+8. **Push fetch streams through `huta-ssh`**, as a separate binary path.
+9. **No encryption** of the delivered file.
+10. **A button, as for releases**: snapshot plans get "✅ Send" on their history message. The
+    relay's trust limit (it can forge a press) is accepted as for releases and said in the
+    docs next to the approval buttons: here a forged press sends one approved artifact to the
+    box that asked, nothing else.
+
 ## How to build this (next session)
 
-1. Done: reviews by codex, grok and agy (2026-11-26), findings folded in above. Next: the
-   owner's answers to the questions above, recorded under "Decided".
+1. Done: reviews by codex, grok and agy (2026-11-26), findings folded in above, the owner's
+   answers under "Decided".
 2. Then S0 → S5 in order. S4 and S5 don't depend on each other.
 3. Rules:
    - run the test suite (`python3 -I tests/run.py`) before every commit;
