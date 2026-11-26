@@ -549,7 +549,9 @@ TELL_RESERVE = 8           # seconds of the tick kept for telling
 def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None) -> None:
     """Tell what is pending, then open, evaluate and close for every target with a watch, then
     tell what changed. Bounded by `end`; time is kept for telling."""
-    _tell(platform, st, end, log)
+    # Leftovers from earlier ticks get a small share first, so failing deliveries can't eat the
+    # time evaluation needs (codex, third look at milestone 5); the rest is told at the end.
+    _tell(platform, st, min(end, time.monotonic() + TELL_RESERVE), log)
     work_end = end - TELL_RESERVE
     for project in registry.values():
         for t in project.targets.values():

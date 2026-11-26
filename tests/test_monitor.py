@@ -2034,3 +2034,37 @@ class WatchBaseline(Watch):
         self.assertIsNone(self.look(60))
         self.local["web"]["restarts"] = 5
         self.assertEqual(self.look(120), "degraded")
+
+
+class WatchTellBudget(Watch):
+    def test_failing_deliveries_leave_time_to_evaluate(self):
+        from huta import notify as N
+        app = self.st.release(self.rid)["app_toml"]
+        for i in range(10):                         # ten old verdicts whose delivery hangs
+            old = self.st.new_release(project="hello", target="prod", sha="c" * 40, image_id="i",
+                                      image_tag="t", app_toml=app, plan={}, plan_hash="0",
+                                      built_by="test")
+            self.st.db.execute("INSERT INTO tg_messages (release_id, chat, message_id, text)"
+                               " VALUES (?,?,?,?)", (old, -100, 100 + i, "x"))
+            self.st.db.execute(
+                "INSERT INTO watches (release_id, since, project, target, opened, until, state,"
+                " reasons, coverage, signals, policy) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (old, 1.0, "hello", "prod", time.time(), 2.0, "degraded", "[]", "{}", "{}", "{}"))
+        clock = [0.0]
+        tried = []
+
+        def hang(token, method, payload, timeout=15):
+            tried.append(timeout)
+            clock[0] += timeout
+            raise TimeoutError("telegram")
+        self.st.db.execute("UPDATE live SET since=?", (time.time() - 60,))
+        with mock.patch.object(N, "_token", lambda p: "tok"), mock.patch.object(N, "_call", hang), \
+                mock.patch.object(self.W.time, "monotonic", lambda: clock[0]):
+            self.W.tick(self.platform, self.registry, self.st, 40.0)
+        live = self.st.live("hello", "prod")
+        r = self.st.db.execute("SELECT * FROM watches WHERE release_id=? AND since=?",
+                               (live["release_id"], live["since"])).fetchone()
+        self.assertIsNotNone(r)                      # opened
+        self.assertIsNotNone(r["last_tick"])         # and evaluated
+        self.assertTrue(tried)                       # the deliveries were really attempted
+        self.assertLessEqual(clock[0], 40.0)
