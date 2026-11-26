@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -907,6 +908,7 @@ def cmd_approve(a):
         who = os.environ.get("SUDO_USER", "") if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}",
                                                               os.environ.get("SUDO_USER", "")) else ""
         via = ("with the Telegram button" if a.via == "telegram"
+               else "with ↩️ in Telegram" if a.via == "rollback-button"
                else f"on the host by {who}" if who else "on the host (as root)")
         st.transition(a.release, S.PLANNED, S.APPROVED, f"approved {via}")
         retire_buttons(platform, st, a.release)
@@ -977,6 +979,9 @@ def cmd_reject(a):
 def cmd_rollback(a):
     platform, project, st = ctx(a.project)
     t = target_of(project, a.target)
+    if getattr(a, "press", None):
+        return _rollback_press(platform, project, st, t, a.press)
+    from . import watch as W
     with st.lock(project.name, t.name), st.lock(project.name, R.SECRETS_LOCK, wait=60):
         recipe.reconcile(platform, st, project, t, say)
         settle_journal(platform, st, project)
@@ -984,26 +989,89 @@ def cmd_rollback(a):
         if not live:
             raise ConfigError("nothing is live")
         cur = st.release(live["release_id"])
-        # A release differs by any of its images (a rollback that only changes a worker counts).
-        prev = [r for r in st.releases(project.name, limit=500)
-                if r["target"] == t.name and r["state"] == S.RETIRED
-                and st.images(r) != st.images(cur)]
-        if not prev:
+        # A release differs by any of its images (a rollback that only changes a worker counts);
+        # one a ↩️ press rolled away from is never picked (docs/PLAN-monitoring.md §6).
+        p = W.rollback_target(st, project.name, t.name, cur)
+        if p is None:
             raise ConfigError("no earlier release to roll back to")
-        p = prev[0]
-        # The historical identity must still be on this host, exactly (codex #9).
-        p_images = st.images(p)
-        for iid in p_images.values():
-            recipe.check_image(iid, p["sha"], project.name)
-        rid = plan_release(platform, project, st, t, p["sha"], p["image_id"], p["image_tag"],
-                           GitHub(platform), note=f"rollback to {p['id']}",
-                           images=p_images if len(p_images) > 1 else None)
+        rid = _plan_rollback(platform, project, st, t, p, note=f"rollback to {p['id']}")
     st.event("submitted-by", f"rollback on {platform.host}", rid, project.name, t.name)
     tell(platform, st, rid)
     ask(platform, st, rid)
     print_plan(st, rid)
     say(f"\nrollback planned; approve with: huta approve {rid}")
     return 0
+
+
+def _plan_rollback(platform, project, st, t, p, note: str) -> str:
+    """Plan a release of exactly `p`'s images. The historical identity must still be on this
+    host, exactly (codex #9). Caller holds the target and secrets locks."""
+    p_images = st.images(p)
+    for iid in p_images.values():
+        recipe.check_image(iid, p["sha"], project.name)
+    return plan_release(platform, project, st, t, p["sha"], p["image_id"], p["image_tag"],
+                        GitHub(platform), note=note,
+                        images=p_images if len(p_images) > 1 else None)
+
+
+def _rollback_press(platform, project, st, t, rid: str) -> int:
+    """`huta rollback <p> <t> --press <release>`: the unit a ↩️ press starts
+    (docs/PLAN-monitoring.md §6). Under the target lock: refuse unless the pressed episode is
+    still live and the release fixed when the button was made is still retired with its images
+    here; else plan the rollback of exactly that release and record it on the watch row. After
+    the lock: post the plan with its buttons, and approve it at once only if it is one-tap
+    clean. A unit that dies before planning leaves the press spent and nothing changed; after
+    planning, a plan that waits for its buttons."""
+    from . import notify as N
+    from . import watch as W
+    refused = ""
+    with st.lock(project.name, t.name, wait=300), \
+            st.lock(project.name, R.SECRETS_LOCK, wait=300):
+        recipe.reconcile(platform, st, project, t, say)
+        settle_journal(platform, st, project)
+        row = W.pressed_row(st, rid)
+        if row is None or (row["project"], row["target"]) != (project.name, t.name):
+            raise ConfigError(f"no ↩️ press of {rid} waits on {project.name}/{t.name}")
+        live = st.live(project.name, t.name)
+        to = None
+        try:
+            to = st.release(row["button_target"]) if row["button_target"] else None
+        except KeyError:
+            pass
+        if not live or (live["release_id"], live["since"]) != (rid, row["since"]):
+            refused = "the release is no longer the live one"
+        elif to is None or to["state"] != S.RETIRED or to["project"] != project.name \
+                or to["target"] != t.name:
+            refused = "the release to go back to is no longer a retired release of this target"
+        else:
+            try:
+                new = _plan_rollback(platform, project, st, t, to,
+                                     note=f"rollback to {to['id']} (↩️ from {rid})")
+            except (ConfigError, recipe.RecipeError, ExtError, DataError) as e:
+                refused = redact(str(e))
+        if refused:
+            W.set_action(st, row, W.REFUSED_PREFIX + refused[:300])
+            st.event("rollback-refused", f"↩️ refused: {refused}", rid, project.name, t.name)
+        else:
+            W.set_action(st, row, W.PLANNED_PREFIX + new)
+            st.event("submitted-by", "↩️ in Telegram", new, project.name, t.name)
+    if refused:
+        N.reply(platform, st, rid, f"↩️ not rolled back: {html.escape(refused)}\n"
+                                   f"<code>sudo huta rollback {project.name} {t.name}</code> plans "
+                                   "the previous image; <code>sudo huta restore</code> brings data "
+                                   "back from a copy")
+        tell(platform, st, rid, create=False)
+        say(f"↩️ refused: {refused}")
+        return 1
+    tell(platform, st, rid, create=False)                  # the ↩️ keyboard goes
+    tell(platform, st, new)
+    ask(platform, st, new)
+    clean, why = W.one_tap_clean(t, st.release(new))
+    if not clean:
+        say(f"rollback {new} planned; it waits for approval ({why})")
+        return 0
+    return cmd_approve(argparse.Namespace(release=new, via="rollback-button",
+                                          confirm_data_loss=False))
 
 
 def handle_request(platform, registry, st, req: dict, transport: str, box: str) -> dict:
@@ -1341,7 +1409,18 @@ def cmd_press(a):
         pr = st.plan_row(rid)
         r = pr or st.release(rid)
         name = f"{r['project']} → {r['target']}"
-        if kind == "a":
+        if kind == "b":
+            # ↩️: the rollback is planned (and, if one-tap clean, approved) by its own unit, so
+            # the button gets its answer at once (docs/PLAN-monitoring.md §6).
+            st.event("button", "↩️ pressed in Telegram", rid, r["project"], r["target"])
+            subprocess.run(["systemd-run", f"--unit=huta-rollback-{rid}-{int(time.time())}",
+                            "--collect", "--quiet",
+                            f"--property=TimeoutStartSec={approve_minutes(r) + 10}min",
+                            "/usr/local/sbin/huta", "rollback", r["project"], r["target"],
+                            "--press", rid],
+                           check=True, capture_output=True, timeout=20)
+            toast, ok = f"Rolling {name} back…", True
+        elif kind == "a":
             st.event("button", "Deploy pressed in Telegram", rid, r["project"], r["target"])
             subprocess.run(["systemd-run", f"--unit=huta-approve-{rid}", "--collect", "--quiet",
                             f"--property=TimeoutStartSec={approve_minutes(r)}min",
@@ -1565,11 +1644,24 @@ def _platform_secret(a):
 
 def cmd_watch(a):
     from . import watch as W
-    if getattr(a, "ack", False):
-        raise ConfigError("huta watch --ack is planned (milestone 6)")
     platform = load_platform()
     st = S.Store(platform.state_dir)
+    if getattr(a, "ack", False):
+        # Root on the host only: never a Telegram button or a box request (§7).
+        if os.geteuid() != 0:
+            raise ConfigError("huta watch --ack runs as root on the host")
+        if W.row_of(st, a.release) is None:
+            raise ConfigError(f"no watch for {a.release}")
+        sudo = os.environ.get("SUDO_USER", "")
+        who = sudo if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sudo) else "root"
+        n = W.ack(st, a.release, who)
+        say(f"acknowledged {n} verdict(s) of {a.release}" if n else "nothing to acknowledge")
     say(W.text(st, a.release))
+    row = W.row_of(st, a.release)
+    if row is not None:
+        why = W.blocks(st, row["project"], row["target"])
+        say(f"unattended releases of {row['project']}/{row['target']}: "
+            + (f"blocked: {why}" if why else "not blocked"))
     return 0
 
 
@@ -1916,7 +2008,7 @@ def main(argv=None) -> int:
     s.set_defaults(f=cmd_submit)
     s = sub.add_parser("show"); s.add_argument("release"); s.set_defaults(f=cmd_show)
     s = sub.add_parser("approve"); s.add_argument("release")
-    s.add_argument("--via", choices=["cli", "telegram"], default="cli")
+    s.add_argument("--via", choices=["cli", "telegram", "rollback-button"], default="cli")
     s.add_argument("--confirm-data-loss", action="store_true",
                    help="required to approve a restore plan on the CLI")
     s.set_defaults(f=cmd_approve)
@@ -1932,6 +2024,7 @@ def main(argv=None) -> int:
     s.set_defaults(f=cmd_restore)
     s = sub.add_parser("reject"); s.add_argument("release"); s.set_defaults(f=cmd_reject)
     s = sub.add_parser("rollback"); s.add_argument("project"); s.add_argument("target")
+    s.add_argument("--press", metavar="RELEASE", help=argparse.SUPPRESS)   # the ↩️ unit
     s.set_defaults(f=cmd_rollback)
     s = sub.add_parser("reconcile"); s.add_argument("project"); s.add_argument("target")
     s.set_defaults(f=cmd_reconcile)

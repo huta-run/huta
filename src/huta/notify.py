@@ -257,10 +257,16 @@ def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float
                             (rid,)).fetchone()
         if row and row["text"] == text:
             return True
+        # An edit without reply_markup takes the keyboard off: a live release whose ↩️ is due
+        # gets a fresh one with every edit (docs/PLAN-monitoring.md §6).
+        due = _rollback_due(platform, st, rid)
         if row:
-            _call(token, "editMessageText", {"chat_id": row["chat"], "message_id": row["message_id"],
-                                             "text": text, "parse_mode": "HTML",
-                                             "disable_web_page_preview": True}, timeout)
+            payload = {"chat_id": row["chat"], "message_id": row["message_id"], "text": text,
+                       "parse_mode": "HTML", "disable_web_page_preview": True}
+            if due:
+                payload["reply_markup"] = _rollback_markup(platform, st, due, row["chat"],
+                                                           row["message_id"])
+            _call(token, "editMessageText", payload, timeout)
             st.db.execute("UPDATE tg_messages SET text=? WHERE release_id=?", (text, rid))
             return True
         if not create:
@@ -269,9 +275,15 @@ def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float
                    "disable_web_page_preview": True}
         if t.get("history_thread"):
             payload["message_thread_id"] = t["history_thread"]
+        if due:             # the message id is known only after sending: recorded right after
+            payload["reply_markup"] = _rollback_markup(platform, st, due, t["history_chat"], None)
         res = _call(token, "sendMessage", payload, timeout)
+        mid = res["result"]["message_id"]
         st.db.execute("INSERT OR REPLACE INTO tg_messages (release_id, chat, message_id, text)"
-                      " VALUES (?,?,?,?)", (rid, t["history_chat"], res["result"]["message_id"], text))
+                      " VALUES (?,?,?,?)", (rid, t["history_chat"], mid, text))
+        if due:
+            st.db.execute("UPDATE watches SET message_id=? WHERE release_id=? AND since=? AND"
+                          " message_id IS NULL", (mid, rid, due[0]["since"]))
         return True
     except Exception as e:  # noqa: BLE001 — telling the owner must never break a release
         try:
@@ -279,6 +291,33 @@ def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float
         except Exception:  # noqa: BLE001
             pass
         return False
+
+
+def _rollback_due(platform, st: S.Store, rid: str):
+    try:
+        from . import watch as W
+        return W.button_due(platform, st, rid)
+    except Exception:  # noqa: BLE001 — a database from before watches: no ↩️
+        return None
+
+
+def _rollback_markup(platform, st: S.Store, due, chat: int, message_id: int | None) -> dict:
+    from . import watch as W
+    tok = W.make_button(platform, st, due, chat, message_id)
+    return {"inline_keyboard": [[{"text": "↩️ Roll back", "callback_data": f"{PREFIX}b:{tok}"}]]}
+
+
+def clear_keyboard(platform, chat: int, message_id: int, timeout: float = 10) -> bool:
+    """Take the keyboard off a message. Never raises."""
+    try:
+        token = _token(platform)
+        if not token or timeout < 1:
+            return False
+        _call(token, "editMessageReplyMarkup", {"chat_id": chat, "message_id": message_id,
+                                                "reply_markup": {"inline_keyboard": []}}, timeout)
+        return True
+    except Exception as e:  # noqa: BLE001
+        return _not_modified(e)
 
 
 # ------------------------------------------------------------------ one-tap approval
@@ -389,8 +428,9 @@ def refresh_ask(platform, st: S.Store, rid: str) -> None:
 
 def take_press(platform, st: S.Store, data: str, from_id: int, chat_id: int,
                message_id: int | None = None) -> tuple[str, str]:
-    """Check and consume a button press. Returns (action, release id), action "a" or "r".
-    Raises ValueError with a short, safe reason otherwise."""
+    """Check and consume a button press. Returns (action, release id), action "a" (Deploy),
+    "r" (Reject) or "b" (↩️ Roll back: the watch row is marked pressed). Raises ValueError with
+    a short, safe reason otherwise."""
     owner = platform.telegram.get("owner_id")
     if not owner or from_id != owner:
         raise ValueError("only the owner can approve")
@@ -399,9 +439,12 @@ def take_press(platform, st: S.Store, data: str, from_id: int, chat_id: int,
     if not (isinstance(data, str) and data.startswith(PREFIX) and len(data) <= 64):
         raise ValueError("not a huta button")
     kind, _, tok = data[len(PREFIX):].partition(":")
-    if kind not in ("a", "r") or not (16 <= len(tok) <= 32):
+    if kind not in ("a", "r", "b") or not (16 <= len(tok) <= 32):
         raise ValueError("not a huta button")
     h = _h(tok)
+    if kind == "b":                 # its own table: never the approvals' Reject
+        from . import watch as W
+        return "b", W.take_button(st, h, chat_id, message_id)
     col = "approve_hash" if kind == "a" else "reject_hash"
     with st.db:
         st.db.execute("BEGIN IMMEDIATE")

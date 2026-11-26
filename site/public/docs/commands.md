@@ -370,7 +370,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta logs <project> <target> [options]` | the target's logs, same options and redaction as on dev; collects first, so it is up to the moment |
 | `huta egress-log` / `traffic` / `crashes <project> <target> [--since …]` | as on dev |
 | `huta monitor status\|ensure <project> <target>` | monitoring hooks: what is wired up for the target (a Bugsink project and its DSN, a Matomo site, a healthchecks check), and `ensure` makes what is missing. Failures are events, never release outcomes. `status` also shows the last probe |
-| `huta watch <release>` | the release's watch window: state, sources, reasons, how many answers each source gave. `--ack` is *planned* |
+| `huta watch <release>` | the release's watch window: state, sources, reasons, how many answers each source gave, and whether unattended releases of the target are blocked. `--ack` (root on the host) acknowledges its `degraded` / `unknown` verdicts and ↩️ presses |
 | `huta monitor tick` | run every minute by `huta-monitor.timer` (does nothing without `[monitoring]`): probes the public health URL of every target with `monitor.uptime` (`ok: true` and the live sha), keeps the last 60 results, records `probe-down` / `probe-up` events, and pings healthchecks checks when configured |
 | `huta secret list\|set\|rm _platform [NAME]` | the host's own tokens (`GITHUB_TOKEN`, `CLOUDFLARE_API_TOKEN`, `BUGSINK_TOKEN`, `HEALTHCHECKS_API_KEY`, `MATOMO_TOKEN`); `set` reads the value from stdin; containers never get them |
 | `huta diag <project> <target> <name>` | as on dev; recorded with the operator's name |

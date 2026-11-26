@@ -161,6 +161,14 @@ Configured by the operator, all available:
   in a row, a container restarting, OOM-killed or stopped), or `❔ watch unknown: <why>` when
   a source didn't answer through the window. A `⚠️` or `❔` verdict also sends a reply to the
   message, which notifies. `sudo huta watch <release>` shows the details.
+- **↩️ Roll back** (with buttons turned on): while the watch is open and for 2 hours after it,
+  the live release's message also carries `↩️ Roll back` (unless the live release is itself a
+  rollback, or there is nothing to go back to). One press by the owner plans a rollback to the
+  release before it, fixed when the button was shown, and approves it at once when the target
+  keeps no one-writer data or database and the plan is code-only with nothing else to warn
+  about; otherwise the plan waits with its own ✅ / ❌ buttons. A press is single-use. When the
+  old code can't run any more (the release is no longer live, or its schema moved on), the
+  reply says why and points to `huta rollback` / `huta restore`.
 - **Fallback** `platform.notify` (an argv that gets a plain-text message on stdin when a plan
   waits), used only when no Telegram history is configured.
 

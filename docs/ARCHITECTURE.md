@@ -317,9 +317,9 @@ content.
 
 ## Monitoring (`monitor.py`)
 
-Built so far (docs/PLAN-monitoring.md milestones 1, 2, 4 and 5): the remote resources, the
-variables they give containers, the probe and the watch window. The rest of the plan (job
-checks, the ↩️ button, `ready`/`blocks`/`--ack`) is *planned*.
+Built so far (docs/PLAN-monitoring.md milestones 1, 2, 4, 5 and 6): the remote resources, the
+variables they give containers, the probe, the watch window, the ↩️ button and the interface
+for unattended releases (`ready`, `blocks`, `--ack`). Job checks (milestone 3) are *planned*.
 
 - `ensure` makes what a target's `monitor` grants, once, and finds it again by name
   (`<prefix>_<project>_<target>`): a Bugsink project and its DSN (`errors`; `crashes = <id>`
@@ -387,6 +387,35 @@ checks, the ↩️ button, `ready`/`blocks`/`--ack`) is *planned*.
   (retried until sent, so possibly twice; a missing history message is sent first; random order,
   10 a tick, each Telegram call bounded by the tick's time; given up after 24 h with an event); `watch.on_degraded` records `action = notified`
   (the seam for automatic rollback). `huta status` and the box `status` op end with the line.
+- **↩️ Roll back** (with Telegram buttons on): while a watch is open and for `button_ttl` (2 h)
+  after its window, the live release's history message carries `↩️ Roll back`, if there is a
+  release to go back to and the live one isn't itself a rollback. Every history edit posts a
+  fresh token (an edit without `reply_markup` would take the keyboard off); its SHA-256, the
+  release it rolls back to (the one `huta rollback` would pick, fixed now) and the message go on
+  the watch row before the keyboard is posted. `notify.take_press` checks owner and chat before
+  touching the database, then (`watch.take_button`, one transaction) spends the button whatever
+  the outcome and marks the row `pressed` only on its own message, in time, not spent before.
+  `cmd_press` starts `huta rollback <p> <t> --press <release>` as a transient unit, which under
+  the target and secrets locks refuses unless that episode is still live and the fixed release
+  is still retired with its images on the host, else plans the rollback of exactly that release
+  and records `action = rollback-planned:<id>`. Then the plan is posted with its buttons, and
+  approved at once (`cmd_approve`, "approved with ↩️ in Telegram") only if it is one-tap clean
+  (`watch.one_tap_clean`: no one-writer data, no database, code-only, no migration, staged
+  secret or external publishing, the commit comparison known); otherwise it waits for its
+  buttons. A refusal (`action = refused: <why>`) replies with the reason and the
+  `huta rollback` / `huta restore` lines. A press spends the episode's button; `huta rollback`
+  never picks a release that ↩️ rolled away from. The tick takes the keyboard off when the
+  button is no longer due (the hash goes first). Crash: the unit dead before planning leaves the
+  press spent and nothing changed; after planning, a plan waiting with its buttons; during the
+  approval, a release like any other. Known limit as for the approval buttons: the relay is
+  trusted with the presser's id; one-tap only for clean plans bounds a forged press to rolling
+  code back one release.
+- **Interface for unattended releases** (plan 3): `monitor.ready` (every source the watch needs
+  is configured and made, and the live release got the DSN); `watch.blocks` (a watch still
+  open, a live episode of a watched target with no row, or any `degraded` / `unknown` verdict
+  or ↩️ press not acknowledged; a newer `ok` doesn't clear an older failure);
+  `sudo huta watch <release> --ack` acknowledges (root on the host only, recorded with who and
+  when). Reasons carry their kind (`new-issues`, `event-rate`, `check`, `probe`, `local`).
 - **Egress:** `<dsn_host>:443` is added only for a release that gets `SENTRY_DSN` (the repo
   asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and
   compose (proxy variables, the egress host), and in the egress policy only while such a

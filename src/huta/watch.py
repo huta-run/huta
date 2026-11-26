@@ -29,6 +29,7 @@ from . import monitor as M
 from .cfg import Platform, Project, Target, redact
 
 WATCHING, OK, DEGRADED, UNKNOWN, CLOSED = "watching", "ok", "degraded", "unknown", "closed"
+RETIRED = "retired"                      # store.RETIRED (store isn't imported here)
 VERDICTS = (OK, DEGRADED, UNKNOWN)
 ISSUES_CAP, EVENTS_CAP = 20, 500
 PROBE_GAP = 150            # seconds: three failed samples in a row, each this close
@@ -490,9 +491,229 @@ def _snapshot(platform: Platform, st, t: Target):
 
 
 def on_degraded(platform: Platform, st, row) -> None:
-    """The seam for automatic rollback (plan 3). Here it only records that the owner was told."""
+    """The seam for automatic rollback (plan 3). Here it only records that the owner was told.
+    The caller runs it in the transaction that marks the verdict told."""
     st.db.execute("UPDATE watches SET action=? WHERE release_id=? AND since=? AND action IS NULL",
                   ("notified", row["release_id"], row["since"]))
+
+
+# ------------------------------------------------------------------ ↩️ (docs/PLAN-monitoring.md §6)
+#
+# While a watch is open, and for button_ttl after, the live release's history message carries
+# ↩️ Roll back. Its callback_data is "huta:b:<token>"; only the token's hash is kept, on the
+# watch row, with the release the press would roll back to, fixed when the button is made. A
+# new token is made each time the keyboard is posted (every history edit), so a keyboard an
+# edit replaced can't be pressed. A press spends the button for that episode.
+
+PRESSED = "pressed"                      # action: the press was taken, the unit not done yet
+PLANNED_PREFIX = "rollback-planned:"     # action: rollback-planned:<release id>
+REFUSED_PREFIX = "refused: "             # action: the press was refused, with why
+SPENT = (PRESSED, PLANNED_PREFIX, REFUSED_PREFIX)
+
+
+def is_rollback(rel) -> bool:
+    """A release planned by huta rollback (or ↩️): no ↩️ on it, so presses can't walk back
+    through every retired release."""
+    try:
+        return str(json.loads(rel["plan"]).get("note", "")).startswith("rollback to ")
+    except (TypeError, ValueError):
+        return False
+
+
+def rolled_away(st, rid: str) -> bool:
+    """A ↩️ press planned a rollback away from this release."""
+    return st.db.execute("SELECT 1 FROM watches WHERE release_id=? AND action LIKE ?",
+                         (rid, PLANNED_PREFIX + "%")).fetchone() is not None
+
+
+def rollback_target(st, project: str, target: str, cur):
+    """The release `huta rollback` picks: the newest retired release of the target whose images
+    differ from the live one's, never one a ↩️ press rolled away from. None if there is none."""
+    have = st.images(cur)
+    for r in st.releases(project, limit=500):
+        if r["target"] == target and r["state"] == RETIRED and st.images(r) != have \
+                and not rolled_away(st, r["id"]):
+            return r
+    return None
+
+
+def button_ttl(platform: Platform) -> int:
+    return int(((platform.monitoring or {}).get("watch") or {}).get("button_ttl", 2 * 3600))
+
+
+def button_due(platform: Platform, st, rid: str, now: float | None = None):
+    """The watch row whose episode gets ↩️ on its history message now, or None: Telegram buttons
+    on, the release live in that episode, not a rollback itself, the window open or ended less
+    than button_ttl ago, the button not spent, and an earlier release to go back to."""
+    tg = platform.telegram or {}
+    if not (tg.get("owner_id") and tg.get("buttons") is True):
+        return None
+    row = row_of(st, rid)
+    if row is None or row["state"] == CLOSED:
+        return None
+    if (row["action"] or "").startswith(SPENT):
+        return None
+    now = time.time() if now is None else now
+    if now >= row["until"] + button_ttl(platform):
+        return None
+    live = st.live(row["project"], row["target"])
+    if not live or (live["release_id"], live["since"]) != (rid, row["since"]):
+        return None
+    cur = st.release(rid)
+    if is_rollback(cur):
+        return None
+    to = rollback_target(st, row["project"], row["target"], cur)
+    return (row, to) if to is not None else None
+
+
+def make_button(platform: Platform, st, due, chat: int, message_id: int | None) -> str:
+    """A fresh ↩️ token for this episode; its hash, the release it rolls back to and where the
+    keyboard goes are written before the keyboard is posted (a press faster than our write, or
+    an answer lost on the way back, still finds them). Returns the token."""
+    import base64
+    import hashlib
+    import secrets
+    row, to = due
+    tok = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
+    st.db.execute("UPDATE watches SET button_hash=?, button_target=?, button_expires=?, chat=?,"
+                  " message_id=? WHERE release_id=? AND since=?",
+                  (hashlib.sha256(tok.encode()).hexdigest(), to["id"],
+                   row["until"] + button_ttl(platform), chat, message_id,
+                   row["release_id"], row["since"]))
+    return tok
+
+
+def take_button(st, h: str, chat_id: int, message_id: int | None, now: float | None = None) -> str:
+    """Consume a ↩️ press by its token's hash: the button is spent whatever the outcome; the row
+    is marked pressed only if the press is on the keyboard's own message and in time. Returns
+    the release id; raises ValueError with a short reason."""
+    import hmac
+    now = time.time() if now is None else now
+    why = ""
+    with st.db:                       # a refusal is decided inside, raised after the commit
+        st.db.execute("BEGIN IMMEDIATE")
+        rows = st.db.execute("SELECT release_id, since, button_hash, button_expires, chat,"
+                             " message_id, action FROM watches WHERE button_hash IS NOT NULL"
+                             ).fetchall()
+        m = next((x for x in rows if hmac.compare_digest(x["button_hash"], h)), None)
+        if m is not None:
+            st.db.execute("UPDATE watches SET button_hash=NULL WHERE release_id=? AND since=?",
+                          (m["release_id"], m["since"]))
+            if m["chat"] != chat_id or m["message_id"] is None or m["message_id"] != message_id:
+                why = "this button doesn't belong to this chat"
+            elif now > m["button_expires"]:
+                why = "this button expired"
+            elif (m["action"] or "").startswith(SPENT):
+                why = "this button was already used"
+            else:
+                st.db.execute("UPDATE watches SET action=? WHERE release_id=? AND since=?",
+                              (PRESSED, m["release_id"], m["since"]))
+    if m is None:
+        raise ValueError("this button is no longer valid")
+    if why:
+        raise ValueError(why)
+    return m["release_id"]
+
+
+def pressed_row(st, rid: str):
+    """The episode of `rid` whose ↩️ was pressed and not acted on yet, or None."""
+    return st.db.execute("SELECT * FROM watches WHERE release_id=? AND action=? ORDER BY since"
+                         " DESC LIMIT 1", (rid, PRESSED)).fetchone()
+
+
+def set_action(st, row, action: str) -> bool:
+    """pressed → planned or refused, once."""
+    return st.db.execute("UPDATE watches SET action=? WHERE release_id=? AND since=? AND action=?",
+                         (action, row["release_id"], row["since"], PRESSED)).rowcount == 1
+
+
+def one_tap_clean(t: Target, rel) -> tuple[bool, str]:
+    """Whether a ↩️ rollback plan may be approved at once (Decided 1): the target is
+    concurrent-safe, the plan is code-only with no migration, staged secret or external
+    publishing, and the commit comparison is known. Otherwise the plan waits for its buttons."""
+    plan = json.loads(rel["plan"])
+    if t.data and not t.data.get("concurrent"):
+        return False, "the target has one-writer data"
+    if t.postgres:
+        return False, "the target has a database"
+    if plan.get("class") != "code-only" or plan.get("changes"):
+        return False, "the plan changes more than code"
+    if (plan.get("migration") or {}).get("run"):
+        return False, "the plan migrates data"
+    if plan.get("staged_secrets"):
+        return False, "the plan applies staged secrets"
+    if plan.get("external"):
+        return False, "the plan publishes external content"
+    if (plan.get("history") or {}).get("status") not in ("identical", "ahead", "behind", "diverged"):
+        return False, "the commit comparison is unknown"
+    return True, ""
+
+
+def retire_buttons(platform: Platform, st, end: float, log=lambda _m: None) -> None:
+    """Take ↩️ off messages whose button is no longer due (window + button_ttl over, episode
+    gone, verdict closed). The hash goes first, so a press in between is refused; the keyboard
+    edit is best effort (a stale keyboard's token matches nothing)."""
+    from . import notify as N
+    for r in st.db.execute("SELECT release_id, since, chat, message_id FROM watches WHERE"
+                           " button_hash IS NOT NULL").fetchall():
+        if end - time.monotonic() < 3:
+            return
+        due = button_due(platform, st, r["release_id"])
+        if due is not None and due[0]["since"] == r["since"]:
+            continue
+        st.db.execute("UPDATE watches SET button_hash=NULL WHERE release_id=? AND since=?",
+                      (r["release_id"], r["since"]))
+        if r["message_id"]:
+            N.clear_keyboard(platform, r["chat"], r["message_id"],
+                             timeout=min(10.0, end - time.monotonic() - 1))
+
+
+# ------------------------------------------------------------------ the unattended interface
+# (docs/PLAN-monitoring.md §7; plan 3 uses it.)
+
+def needs_ack(row) -> bool:
+    return row["acked"] is None and (row["state"] in (DEGRADED, UNKNOWN)
+                                     or (row["action"] or "").startswith(SPENT))
+
+
+def blocks(st, project: str, target: str, watched: bool = True) -> str | None:
+    """Why an unattended release of this target must wait, or None. One rule: a watch still
+    watching; a live episode of a watched target with no row; any degraded or unknown verdict,
+    or any ↩️ press, not acknowledged with `huta watch <release> --ack`. A newer ok does not
+    clear an older failure."""
+    rs = rows(st, project, target)
+    for r in rs:
+        if r["state"] == WATCHING:
+            return f"the watch of {r['release_id']} is still open"
+    live = st.live(project, target)
+    if watched and live and not any((r["release_id"], r["since"]) == (live["release_id"],
+                                                                      live["since"]) for r in rs):
+        return f"the live release {live['release_id']} has no watch yet"
+    for r in rs:
+        if needs_ack(r):
+            what = "↩️ was pressed" if (r["action"] or "").startswith(SPENT) else r["state"]
+            return (f"{r['release_id']}: {what}, not acknowledged "
+                    f"(huta watch {r['release_id']} --ack)")
+    return None
+
+
+def ack(st, rid: str, who: str) -> int:
+    """Acknowledge every verdict and press of `rid` that needs it. Returns how many."""
+    now = time.time()
+    n = 0
+    with st.db:
+        st.db.execute("BEGIN IMMEDIATE")
+        for r in st.db.execute("SELECT * FROM watches WHERE release_id=?", (rid,)).fetchall():
+            if needs_ack(r):
+                st.db.execute("UPDATE watches SET acked=?, acked_by=? WHERE release_id=? AND"
+                              " since=?", (now, who, r["release_id"], r["since"]))
+                n += 1
+        if n:
+            row = row_of(st, rid)
+            st.db.execute("INSERT INTO events (ts, release_id, project, target, kind, msg)"
+                          " VALUES (?,?,?,?,?,?)", (now, rid, row["project"], row["target"],
+                                                    "watch-ack", f"acknowledged by {who}"))
+    return n
 
 
 # ------------------------------------------------------------------ text
@@ -577,6 +798,10 @@ def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None
             except Exception as e:  # noqa: BLE001 — one target never stops the others
                 log(f"{project.name}/{t.name} watch: {type(e).__name__}")
     _tell(platform, st, end, log)
+    try:
+        retire_buttons(platform, st, end, log)
+    except Exception as e:  # noqa: BLE001
+        log(f"watch buttons: {type(e).__name__}")
 
 
 def _tell(platform: Platform, st, end: float, log) -> None:
@@ -618,7 +843,6 @@ def _tell(platform: Platform, st, end: float, log) -> None:
                 st.db.execute("UPDATE watches SET notified=? WHERE release_id=? AND since=?",
                               (r["state"], r["release_id"], r["since"]))
                 if r["state"] == DEGRADED:
-                    st.db.execute("UPDATE watches SET action=? WHERE release_id=? AND since=? AND"
-                                  " action IS NULL", ("notified", r["release_id"], r["since"]))
+                    on_degraded(platform, st, r)
         except Exception as e:  # noqa: BLE001
             log(f"watch notify: {type(e).__name__}")

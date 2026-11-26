@@ -601,6 +601,30 @@ def secret_names(platform: Platform, project: Project, t: Target, app: dict) -> 
 
 # ------------------------------------------------------------------ status
 
+def ready(platform: Platform, st, project: Project, t: Target) -> tuple[bool, str]:
+    """Whether every source the target's watch needs is there (docs/PLAN-monitoring.md §7):
+    configured, its remote resource made, and (errors) the live release got the DSN. Resource
+    existence is the minimum; plan 3 may ask for more."""
+    from . import watch as W
+    if not platform.monitoring:
+        return False, "monitoring is off on this host"
+    if not t.watch:
+        return False, f"{project.name}/{t.name} has no watch"
+    live = st.live(project.name, t.name)
+    if not live:
+        return False, "nothing is live"
+    have = W.sources(platform, project, t, st.release(live["release_id"]))
+    rows = {r["kind"]: r for r in st.monitors(project.name, t.name)}
+    if "errors" in t.monitor and "errors" not in have:
+        if "errors" not in rows or not rows["errors"]["remote_id"]:
+            return False, "errors: the Bugsink project isn't made yet"
+        return False, "errors: the live release didn't get SENTRY_DSN"
+    if "uptime" in t.monitor and platform.monitoring.get("healthchecks") \
+            and "uptime" not in rows:
+        return False, "uptime: the healthchecks check isn't made yet"
+    return True, ""
+
+
 def status_lines(platform: Platform, st, project: Project, t: Target) -> list[str]:
     """What is wired up, for `huta monitor status`. Check uuids are capabilities: never shown."""
     if not platform.monitoring:
