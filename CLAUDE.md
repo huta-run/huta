@@ -37,7 +37,10 @@ It lives at https://github.com/huta-run/huta, and every commit and commit messag
   "planned".
 - Write docs with Edit/Write, not through shell quoting.
 - **Run the tests before every commit:** `python3 -I -m unittest discover -s tests -t .`
-  (standard library only). `tests/golden/` holds what huta generates today for v1 targets
+  (standard library only), or the same tests in parallel: `python3 -I tests/run.py`
+  (`-j N` workers, default all cores; `-v` prints each unit's time; a pattern argument keeps
+  matching test ids). Serially the suite takes about four and a half minutes, almost all of it
+  `tests/test_crash.py`; in parallel about one. `tests/golden/` holds what huta generates today for v1 targets
   (compose, vhost, the plan's `effective`, names). Those snapshots are the compatibility
   contract: a target that uses no new feature must run exactly as before. Rewrite them
   (`HUTA_UPDATE_GOLDEN=1`) only for an intended change, and say why in the commit. Test
@@ -50,5 +53,5 @@ It lives at https://github.com/huta-run/huta, and every commit and commit messag
   can't resolve). Add a crash scenario for it in `tests/test_crash.py`.
 - Site docs: `site/public/llms-full.{txt,md}` contain every page in `site/public/docs/` plus
   `host.md` and `install.md` verbatim, and `llms.txt` equals `llms.md`. Edit a page and its copies
-  in the same change (a test checks it). The full suite takes about three minutes.
+  in the same change (a test checks it).
 - Commits: small, present-tense subject, why in the body.

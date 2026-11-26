@@ -20,6 +20,7 @@ Invariants (check):
 """
 
 import json
+import os
 import unittest
 
 from tests._util import app_toml
@@ -31,6 +32,13 @@ from huta import store as S
 SHA1 = "1" * 40
 SHA2 = "2" * 40
 LIVE, NA, RB, NH = S.LIVE, S.NOTHING_ACTIVATED, S.ROLLED_BACK, S.NEEDS_HUMAN
+
+
+def shard(steps):
+    """(k, step) pairs this run covers. tests/run.py splits the step loops over several workers
+    with HUTA_CRASH_SHARD="i/n" (steps with k % n == i); unset, every step runs."""
+    i, _, n = os.environ.get("HUTA_CRASH_SHARD", "0/1").partition("/")
+    return [(k, s) for k, s in enumerate(steps, 1) if k % int(n) == int(i)]
 
 
 class Scenario:
@@ -227,7 +235,7 @@ class Scenario:
 
     def test_crash_after_every_step(self):
         _out, steps = self.clean_steps()
-        for k, step in enumerate(steps, 1):
+        for k, step in shard(steps):
             where = f"crash after step {k} ({step})"
             with self.subTest(step=where):
                 host, project, t, r1, r2, before = self.setup_host()
@@ -241,7 +249,7 @@ class Scenario:
 
     def test_reconcile_crashes_too(self):
         _out, steps = self.clean_steps()
-        for k, step in enumerate(steps, 1):
+        for k, step in shard(steps):
             j = 1
             while True:
                 where = f"crash after step {k} ({step}), then reconcile dies after its step {j}"

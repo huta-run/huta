@@ -1341,9 +1341,14 @@ class TickLimits(Tick):
             "channels": "*", "self": True}
         self.t = dataclasses.replace(self.t, monitor={})       # only the self check this time
         self.registry["hello"].targets["prod"] = self.t
-        with self.M._ensure_lock(self.platform):
-            with mock.patch.object(self.M.time, "sleep", lambda s: None):
-                self.tick()                                    # lock held: nothing made
+        # The wait is real time (half the self check's budget): let each sleep move the clock
+        # instead of spinning through it.
+        clock, real = [0.0], self.M.time.monotonic
+        with self.M._ensure_lock(self.platform), \
+                mock.patch.object(self.M.time, "monotonic", lambda: real() + clock[0]), \
+                mock.patch.object(self.M.time, "sleep",
+                                  lambda s: clock.__setitem__(0, clock[0] + s)):
+            self.tick()                                        # lock held: nothing made
         self.assertEqual(self.fm.creates("hc"), 0)
 
 
