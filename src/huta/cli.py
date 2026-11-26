@@ -1055,6 +1055,7 @@ def _rollback_press(platform, project, st, t, rid: str) -> int:
         else:
             W.set_action(st, row, W.PLANNED_PREFIX + new)
             st.event("submitted-by", "↩️ in Telegram", new, project.name, t.name)
+    W.drop_keyboard(platform, st, row)                  # spent: the ↩️ keyboard goes
     if refused:
         N.reply(platform, st, rid, f"↩️ not rolled back: {html.escape(refused)}\n"
                                    f"<code>sudo huta rollback {project.name} {t.name}</code> plans "
@@ -1063,7 +1064,6 @@ def _rollback_press(platform, project, st, t, rid: str) -> int:
         tell(platform, st, rid, create=False)
         say(f"↩️ refused: {refused}")
         return 1
-    tell(platform, st, rid, create=False)                  # the ↩️ keyboard goes
     tell(platform, st, new)
     ask(platform, st, new)
     clean, why = W.one_tap_clean(t, st.release(new))

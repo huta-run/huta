@@ -404,14 +404,17 @@ for unattended releases (`ready`, `blocks`, `--ack`). Job checks (milestone 3) a
   secret or external publishing, the commit comparison known); otherwise it waits for its
   buttons. A refusal (`action = refused: <why>`) replies with the reason and the
   `huta rollback` / `huta restore` lines. A press spends the episode's button; `huta rollback`
-  never picks a release that ↩️ rolled away from. The tick takes the keyboard off when the
-  button is no longer due (the hash goes first). Crash: the unit dead before planning leaves the
-  press spent and nothing changed; after planning, a plan waiting with its buttons; during the
-  approval, a release like any other. Known limit as for the approval buttons: the relay is
+  never picks a release that ↩️ rolled away from, and a press needs its own `--ack` (an older
+  ack of the verdict doesn't cover it). The unit takes the spent keyboard off; the tick does it
+  for any button no longer due or spent (the hash goes first, the keyboard edit is retried until
+  Telegram takes it). Crash: the unit dead before planning leaves the press spent and nothing
+  changed; after planning, a plan waiting for approval, whose message and buttons the tick posts
+  if the unit didn't; during the approval, a release like any other. Known limit as for the approval buttons: the relay is
   trusted with the presser's id; one-tap only for clean plans bounds a forged press to rolling
   code back one release.
 - **Interface for unattended releases** (plan 3): `monitor.ready` (every source the watch needs
-  is configured and made, and the live release got the DSN); `watch.blocks` (a watch still
+  is configured and made: `[crashes]` url and the Bugsink project for errors, and the live
+  release got the DSN); `watch.blocks` (a watch still
   open, a live episode of a watched target with no row, or any `degraded` / `unknown` verdict
   or ↩️ press not acknowledged; a newer `ok` doesn't clear an older failure);
   `sudo huta watch <release> --ack` acknowledges (root on the host only, recorded with who and

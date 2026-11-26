@@ -237,6 +237,23 @@ class Press(Base):
         self.tell()
         self.assertIsNone(self.keyboard())
 
+    def test_a_press_needs_its_own_ack(self):
+        self.st.db.execute("UPDATE watches SET state=?, acked=1, acked_by='owner' WHERE"
+                           " release_id=?", (W.DEGRADED, self.r2))
+        self.press(self.data)
+        self.assertTrue(W.needs_ack(self.row()), "an older ack doesn't cover the press")
+
+    def test_spent_keyboard_is_taken_off_by_the_tick(self):
+        import time
+        self.press(self.data)
+        self.sent.clear()
+        W.retire_buttons(self.platform, self.st, time.monotonic() + 30)
+        self.assertEqual([m for m, _ in self.sent], ["editMessageReplyMarkup"])
+        self.assertIsNone(self.row()["message_id"])
+        self.sent.clear()
+        W.retire_buttons(self.platform, self.st, time.monotonic() + 30)
+        self.assertEqual(self.sent, [], "once off, left alone")
+
     def test_cmd_press_starts_the_rollback_unit(self):
         """A ↩️ press never falls through to Reject; it starts `huta rollback --press`."""
         import socket
@@ -280,7 +297,9 @@ class Unit(Base):
         return self.st.releases(self.project.name, limit=1)[0]
 
     def test_stateless_target_rolls_back_in_one_press(self):
+        self.sent.clear()
         self.assertEqual(self.run_unit(), 0)
+        self.assertEqual(self.sent[0][0], "editMessageReplyMarkup", "the spent ↩️ goes first")
         r3 = self.newest()
         self.assertEqual(r3["state"], S.LIVE)
         self.assertEqual(r3["sha"], SHA1)
@@ -394,9 +413,25 @@ class Unattended(Base):
         from huta import monitor as M
         self.assertEqual(M.ready(self.platform, self.st, self.project, self.t)[0], True)
         t = dataclasses.replace(self.t, monitor={"errors": True})
-        ok, why = M.ready(self.platform, self.st, self.project, t)
-        self.assertFalse(ok)
-        self.assertIn("errors", why)
+        for crashes, monitors, env, want in (
+                ({}, True, True, "no \\[crashes\\] url"),
+                ({"url": "http://127.0.0.1:8000"}, False, True, "isn't made yet"),
+                ({"url": "http://127.0.0.1:8000"}, True, False, "didn't get SENTRY_DSN"),
+                ({"url": "http://127.0.0.1:8000"}, True, True, None)):
+            with self.subTest(crashes=crashes, monitors=monitors, env=env):
+                plat = dataclasses.replace(self.platform, crashes=crashes)
+                self.st.db.execute("DELETE FROM monitors")
+                if monitors:
+                    self.st.set_monitor("hello", "prod", "errors", "huta_hello_prod", "7", None)
+                plan = {"effective": {"monitor": {"env": ["SENTRY_DSN"] if env else []}}}
+                self.st.db.execute("UPDATE releases SET plan=? WHERE id=?",
+                                   (json.dumps(plan), self.r2))
+                ok, why = M.ready(plat, self.st, self.project, t)
+                if want is None:
+                    self.assertEqual((ok, why), (True, ""))
+                else:
+                    self.assertFalse(ok)
+                    self.assertRegex(why, want)
 
 
 class WatchRollback(Base):
@@ -458,6 +493,24 @@ class WatchRollback(Base):
         r3 = self.st.releases(self.project.name, limit=1)[0]
         self.assertEqual(r3["state"], S.PLANNED, "a plan the owner can approve")
         self.assertEqual(self.state(self.r2), S.LIVE)
+
+    def test_dies_after_planning_then_the_tick_posts_the_plan(self):
+        import time
+        real = cli._plan_rollback
+
+        def plan_then_die(*a, **k):
+            rid = real(*a, **k)
+            W.set_action(self.host.store(), W.pressed_row(self.host.store(), self.r2),
+                         W.PLANNED_PREFIX + rid)
+            os._exit(CRASH_EXIT)
+        with mock.patch.object(cli, "_plan_rollback", plan_then_die):
+            self.child(self.unit)
+        r3 = self.st.releases(self.project.name, limit=1)[0]["id"]
+        self.assertIsNone(self.message(r3))
+        W.post_planned(self.platform, self.st, time.monotonic() + 30)
+        self.assertIsNotNone(self.message(r3), "its history message is posted")
+        self.assertIsNotNone(self.st.db.execute("SELECT 1 FROM approvals WHERE release_id=?",
+                                                (r3,)).fetchone(), "with its buttons")
 
     def test_dies_during_the_approval(self):
         base = len(self.host.ops())

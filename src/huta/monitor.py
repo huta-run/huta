@@ -615,10 +615,13 @@ def ready(platform: Platform, st, project: Project, t: Target) -> tuple[bool, st
         return False, "nothing is live"
     have = W.sources(platform, project, t, st.release(live["release_id"]))
     rows = {r["kind"]: r for r in st.monitors(project.name, t.name)}
-    if "errors" in t.monitor and "errors" not in have:
-        if "errors" not in rows or not rows["errors"]["remote_id"]:
+    if "errors" in t.monitor:
+        if not (platform.crashes or {}).get("url"):
+            return False, "errors: no [crashes] url to read Bugsink from"
+        if not (("errors" in rows and rows["errors"]["remote_id"]) or t.crashes):
             return False, "errors: the Bugsink project isn't made yet"
-        return False, "errors: the live release didn't get SENTRY_DSN"
+        if "errors" not in have:
+            return False, "errors: the live release didn't get SENTRY_DSN"
     if "uptime" in t.monitor and platform.monitoring.get("healthchecks") \
             and "uptime" not in rows:
         return False, "uptime: the healthchecks check isn't made yet"

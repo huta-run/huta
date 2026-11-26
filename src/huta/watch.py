@@ -606,8 +606,9 @@ def take_button(st, h: str, chat_id: int, message_id: int | None, now: float | N
             elif (m["action"] or "").startswith(SPENT):
                 why = "this button was already used"
             else:
-                st.db.execute("UPDATE watches SET action=? WHERE release_id=? AND since=?",
-                              (PRESSED, m["release_id"], m["since"]))
+                # A press is acknowledged on its own: an older ack of the verdict doesn't cover it.
+                st.db.execute("UPDATE watches SET action=?, acked=NULL, acked_by=NULL WHERE"
+                              " release_id=? AND since=?", (PRESSED, m["release_id"], m["since"]))
     if m is None:
         raise ValueError("this button is no longer valid")
     if why:
@@ -651,21 +652,57 @@ def one_tap_clean(t: Target, rel) -> tuple[bool, str]:
 
 def retire_buttons(platform: Platform, st, end: float, log=lambda _m: None) -> None:
     """Take ↩️ off messages whose button is no longer due (window + button_ttl over, episode
-    gone, verdict closed). The hash goes first, so a press in between is refused; the keyboard
-    edit is best effort (a stale keyboard's token matches nothing)."""
-    from . import notify as N
-    for r in st.db.execute("SELECT release_id, since, chat, message_id FROM watches WHERE"
-                           " button_hash IS NOT NULL").fetchall():
+    gone, verdict closed) or was spent (pressed, burned). The hash goes first, so a press in
+    between is refused; then the keyboard, retried every tick until Telegram took it off (the
+    row's message_id is cleared then). A stale keyboard's token matches nothing meanwhile."""
+    for r in st.db.execute("SELECT release_id, since FROM watches WHERE button_hash IS NOT NULL"
+                           ).fetchall():
+        due = button_due(platform, st, r["release_id"])
+        if due is None or due[0]["since"] != r["since"]:
+            st.db.execute("UPDATE watches SET button_hash=NULL WHERE release_id=? AND since=?",
+                          (r["release_id"], r["since"]))
+    for r in st.db.execute("SELECT * FROM watches WHERE button_hash IS NULL AND message_id IS"
+                           " NOT NULL").fetchall():
         if end - time.monotonic() < 3:
             return
-        due = button_due(platform, st, r["release_id"])
-        if due is not None and due[0]["since"] == r["since"]:
+        drop_keyboard(platform, st, r, timeout=min(10.0, end - time.monotonic() - 1))
+
+
+def drop_keyboard(platform: Platform, st, row, timeout: float = 10) -> bool:
+    """Take a spent or retired ↩️ off its message, unless another episode of the same release
+    has a live button on it. True when it is off (message_id cleared)."""
+    from . import notify as N
+    if st.db.execute("SELECT 1 FROM watches WHERE release_id=? AND button_hash IS NOT NULL",
+                     (row["release_id"],)).fetchone():
+        gone = True                   # the newer episode's keyboard replaced it
+    else:
+        gone = N.clear_keyboard(platform, row["chat"], row["message_id"], timeout=timeout)
+    if gone:
+        st.db.execute("UPDATE watches SET message_id=NULL WHERE release_id=? AND since=? AND"
+                      " button_hash IS NULL", (row["release_id"], row["since"]))
+    return gone
+
+
+def post_planned(platform: Platform, st, end: float, log=lambda _m: None) -> None:
+    """A ↩️ unit that died after planning leaves a plan nobody was shown: post its history
+    message and its buttons (each tick, while it waits and has no buttons)."""
+    from . import notify as N
+    for r in st.db.execute("SELECT action FROM watches WHERE action LIKE ?",
+                           (PLANNED_PREFIX + "%",)).fetchall():
+        if end - time.monotonic() < 5:
+            return
+        rid = r["action"][len(PLANNED_PREFIX):]
+        try:
+            rel = st.release(rid)
+        except KeyError:
             continue
-        st.db.execute("UPDATE watches SET button_hash=NULL WHERE release_id=? AND since=?",
-                      (r["release_id"], r["since"]))
-        if r["message_id"]:
-            N.clear_keyboard(platform, r["chat"], r["message_id"],
-                             timeout=min(10.0, end - time.monotonic() - 1))
+        if rel["state"] != "planned" or time.time() - rel["created"] > 30 * 60:
+            continue
+        if st.db.execute("SELECT 1 FROM approvals WHERE release_id=?", (rid,)).fetchone():
+            continue
+        per = min(10.0, (end - time.monotonic() - 1) / 2)
+        if N.history(platform, st, rid, create=True, timeout=per):
+            N.ask_owner(platform, st, rid)
 
 
 # ------------------------------------------------------------------ the unattended interface
@@ -798,10 +835,11 @@ def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None
             except Exception as e:  # noqa: BLE001 — one target never stops the others
                 log(f"{project.name}/{t.name} watch: {type(e).__name__}")
     _tell(platform, st, end, log)
-    try:
-        retire_buttons(platform, st, end, log)
-    except Exception as e:  # noqa: BLE001
-        log(f"watch buttons: {type(e).__name__}")
+    for step in (post_planned, retire_buttons):
+        try:
+            step(platform, st, end, log)
+        except Exception as e:  # noqa: BLE001
+            log(f"watch buttons: {type(e).__name__}")
 
 
 def _tell(platform: Platform, st, end: float, log) -> None:
