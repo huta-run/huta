@@ -287,14 +287,15 @@ A watch is a row, not a process: nothing waits on it and no lock is held.
   and `revert_live` start a new episode. `live.since` is written in the same transaction as the
   switch is recorded, after the vhost switch; a recovery that records it later makes the
   episode start later than the traffic, and the watch says "started at recovery".
-- **Open.** `recipe.run` opens the watch where it returns `live`, after all its steps (not at
+- **Open.** `recipe.run` (as built: `cmd_approve`, right after the outcome) opens the watch where it returns `live`, after all its steps (not at
   `make_live`, which comes before the public checks). The tick opens one for every live episode
   of a target with `watch` that has no row, when no phase file exists and the target lock is
   free. An episode first seen after its window ended gets a row in state `unknown` ("not
   watched: huta wasn't running"). Opening twice is a no-op (primary key).
 - **Close.** A watch whose episode is no longer live becomes `closed` (keeping its signals and
-  any verdict for `blocks`): in the tick, in `make_live`/`revert_live` (same transaction), and
-  on every return path of `reconcile`. `huta stop` closes it with reason "stopped".
+  any verdict for `blocks`): in the tick, after an approval's outcome, and on every return path
+  of `reconcile` (as built: not inside `make_live`/`revert_live`, which stay unchanged; a crash
+  between them leaves a row the next tick closes). `huta stop` closes it with reason "stopped".
 - **Signals** (sticky: once fired, kept), all from timestamps, so no baseline is captured at the
   switch:
   - *new issues*: Bugsink issues of the target's project with `first_seen` ≥ switch
@@ -446,7 +447,7 @@ Each is one install; each leaves every target working. The rules of `BUILD-v2.md
 | 2 | Env injection, one effective egress list, `[monitor] env` and `monitor_env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: new case `notes-monitored` (compose and effective), old cases byte-identical; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: a monitored release with every service down plans and goes live | built; gate passed on a test host: the release's plan showed the variables and the egress line, and its test event reached Bugsink tagged with the release sha |
 | 3 | Job checks (tick convergence, OnCalendar schedules) and pings | a job run turns its check up; a failing job turns it down; removing a job pauses it | unit: schedule, fallback period and grace (weekday schedule), exit code mapping; ping failure doesn't change the exit; crash: tick killed after a convergence call | |
 | 4 | Tick: timer, budget, probe, self-ping; `public_check` requires `ok` | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip and revalidation rules, sample ring, budget; `test_monitor_tick` | built; gate passed on a test host: the live container stopped by hand gave `probe-down` (502) within a minute, started again gave `probe-up` |
-| 5 | Watch: episodes, signals (local included), coverage, verdicts, history lines, `huta watch`, `status` | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, coverage thirds, re-evaluation from rows; crash: tick killed after each write, twice (`WatchTick`) | |
+| 5 | Watch: episodes, signals (local included), coverage, verdicts, history lines, `huta watch`, `status` | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, coverage thirds, re-evaluation from rows; crash: tick killed after each write, twice (`WatchTick`) | built (tests); gate on a test host pending |
 | 6 | ↩️ button and the press; `ready`, `blocks`, `--ack`, the `on_degraded` hook | one press rolls a stateless test target back; a forged, reused, foreign or expired press is refused; a one-writer target gets a plan with buttons, not a rollback | `test_press` (as the approval-button tests); crash: `WatchRollback` (unit dies before planning, after planning, after approval) | |
 
 New durable steps become fake-host steps by wrapping `monitor.ensure`'s writes, the tick's

@@ -259,6 +259,7 @@ class Target:
     matomo: int | None = None
     # Set by load_registry from the host's [monitoring]: <dsn_host>:443 when errors is on.
     monitor_egress: list = field(default_factory=list)
+    watch: dict = field(default_factory=dict)       # the watch window's thresholds (§6)
 
     @property
     def egress_allow(self) -> list[str]:
@@ -480,8 +481,52 @@ def _monitoring_cfg(v, crashes: bool) -> dict:
         if host and (not isinstance(host, str) or not HOST_RE.match(host)):
             raise ConfigError(f"{w} host must be a hostname")
         out["matomo"] = {"url": _service_url(mt.get("url"), f"{w} url"), "host": host}
-    if "watch" in v:
-        raise ConfigError("[monitoring.watch] is planned (the watch window), not built yet")
+    w = v.get("watch", {})
+    if not isinstance(w, dict) or set(w) - {"window", "button_ttl"}:
+        raise ConfigError("[monitoring.watch] accepts window and button_ttl")
+    out["watch"] = {"window": _window_s(w.get("window", "15m"), "[monitoring.watch] window"),
+                    "button_ttl": duration_s(w.get("button_ttl", "2h"),
+                                             "[monitoring.watch] button_ttl", 48 * 3600)}
+    return out
+
+
+def _window_s(v, where: str) -> int:
+    n = duration_s(v, where, 2 * 3600)
+    if n < 300:
+        raise ConfigError(f"{where}: at least 5m (three probes and a third of the window)")
+    return n
+
+
+WATCH_DEFAULTS = {"new_issues": 1, "events": 10, "factor": 3.0, "on_degraded": "notify"}
+
+
+def _watch_cfg(v, where: str) -> dict:
+    """watch = { window, new_issues, events, factor, on_degraded }: a watch window after each
+    release (docs/PLAN-monitoring.md §6). window: the host's default unless set."""
+    if v is None:
+        return {}
+    if not isinstance(v, dict) or set(v) - {"window", *WATCH_DEFAULTS}:
+        raise ConfigError(f"{where}: watch = {{ window, new_issues, events, factor, on_degraded }}")
+    out = dict(WATCH_DEFAULTS)
+    if "window" in v:
+        out["window"] = _window_s(v["window"], f"{where} watch.window")
+    for k in ("new_issues", "events"):
+        if k in v:
+            x = v[k]
+            if not isinstance(x, int) or isinstance(x, bool) or not 0 <= x <= 100000:
+                raise ConfigError(f"{where}: watch.{k} must be 0..100000 (0: off)")
+            out[k] = x
+    if "factor" in v:
+        f = v["factor"]
+        if isinstance(f, bool) or not isinstance(f, (int, float)) or not 1 <= f <= 1000:
+            raise ConfigError(f"{where}: watch.factor must be 1..1000")
+        out["factor"] = float(f)
+    od = v.get("on_degraded", "notify")
+    if od == "rollback":
+        raise ConfigError(f"{where}: watch.on_degraded = \"rollback\" is planned (automatic "
+                          "rollback); only \"notify\" for now")
+    if od != "notify":
+        raise ConfigError(f"{where}: watch.on_degraded must be \"notify\"")
     return out
 
 
@@ -956,8 +1001,6 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             if not isinstance(egress, list) or not egress or len(egress) > 64:
                 raise ConfigError(f"{tw}: egress is \"none\" or a list of host:port entries")
             egress = sorted({egress_entry(e, f"{tw} egress") for e in egress})
-        if "watch" in t:
-            raise ConfigError(f"{tw}: watch is planned (docs/PLAN-monitoring.md), not built yet")
         approve = t.get("approve", "always")
         if approve != "always":
             # Unattended prod needs CI-attested images (planned); until then every release asks.
@@ -975,7 +1018,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
                             "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
                             "components", "worker_liveness", "postgres", "external",
-                            "migrate_online", "monitor", "matomo"}
+                            "migrate_online", "monitor", "matomo", "watch"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -1056,6 +1099,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             migrate_online=_bool(t.get("migrate_online", False), f"{tw} migrate_online"),
             monitor=_monitor_cfg(t.get("monitor"), tw),
             matomo=_matomo_id(t.get("matomo"), tw),
+            watch=_watch_cfg(t.get("watch"), tw),
         )
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
@@ -1116,6 +1160,11 @@ def load_registry(etc: Path = ETC, platform: "Platform | None" = None) -> dict[s
                 if "errors" in t.monitor:
                     p.targets[t.name] = t = dataclasses.replace(
                         t, monitor_egress=[f"{mon['bugsink']['dsn_host']}:443"])
+                if t.watch and not t.monitor:
+                    raise ConfigError(f"{p.name}/{t.name}: watch needs monitor (its sources)")
+                if t.watch and "window" not in t.watch:
+                    p.targets[t.name] = t = dataclasses.replace(
+                        t, watch={**t.watch, "window": (mon.get("watch") or {}).get("window", 900)})
                 if t.matomo is not None and "analytics" not in t.monitor:
                     raise ConfigError(f"{p.name}/{t.name}: matomo = <id> needs monitor.analytics")
                 if t.data and not platform.backup:

@@ -406,8 +406,8 @@ Targets with several components need the firewall fragment's `huta_intra` set (i
 
 Monitoring hooks (optional; built so far: the remote resources, the variables they give
 containers (`[monitor]` in the contract), and a probe of each monitored site every minute
-(`huta-monitor.timer`, installed and enabled by `install.sh`); job checks and watch windows are
-planned):
+(`huta-monitor.timer`, installed and enabled by `install.sh`), and a watch window after each
+release of targets with `watch`; job checks are planned):
 if the human already runs healthchecks, Bugsink or Matomo, huta can make a check, a project or
 a site per target that asks for it (`monitor = { … }` in the registry). Each table is
 optional; leave out the services they don't run.
@@ -424,6 +424,8 @@ team = "<team uuid>"
 [monitoring.matomo]
 url = "http://127.0.0.1:8081"
 host = "stats.example.org"
+[monitoring.watch]                     # optional
+window = "15m"                         # default for targets' watch windows, 5m..2h
 ```
 
 The human sets the tokens (a healthchecks project's read-write API key, Bugsink's token,

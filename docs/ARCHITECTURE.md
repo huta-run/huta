@@ -113,6 +113,7 @@ edge = { body = "1g", timeout = "10m" }   # v2: request body limit, upstream tim
 # Monitoring hooks (docs/PLAN-monitoring.md; built: remote resources and the variables):
 monitor = { uptime = true, errors = true, analytics = true }   # jobs = true: planned
 matomo = 7                     # optional: adopt this Matomo site instead of creating one
+watch = { window = "15m", new_issues = 1, events = 10, factor = 3.0 }   # after each release
 # [targets.prod.components.api] monitor_env = true   also gives that component the variables
 
 # v2: a gateway, a hostname for a service huta doesn't run (DESIGN-v2 §1). No slots, uid or repo.
@@ -186,6 +187,8 @@ team = "<team uuid>"           # the Bugsink team new projects belong to
 [monitoring.matomo]            # token: MATOMO_TOKEN (superuser, to create sites)
 url = "http://127.0.0.1:8081"
 host = "stats.example.org"
+[monitoring.watch]
+window = "15m"                 # default watch window for targets, 5m..2h
 [upstreams.vpn-exit]           # a host service containers may reach (opt-in per target)
 to = "127.0.0.1:1080"
 port = 4881                    # 4881..4899
@@ -314,9 +317,9 @@ content.
 
 ## Monitoring (`monitor.py`)
 
-Built so far (docs/PLAN-monitoring.md milestones 1, 2 and 4): the remote resources, the
-variables they give containers, and the probe. The rest of the plan (job checks, the watch
-window, the ↩️ button) is *planned*.
+Built so far (docs/PLAN-monitoring.md milestones 1, 2, 4 and 5): the remote resources, the
+variables they give containers, the probe and the watch window. The rest of the plan (job
+checks, the ↩️ button, `ready`/`blocks`/`--ack`) is *planned*.
 
 - `ensure` makes what a target's `monitor` grants, once, and finds it again by name
   (`<prefix>_<project>_<target>`): a Bugsink project and its DSN (`errors`; `crashes = <id>`
@@ -361,6 +364,21 @@ window, the ↩️ button) is *planned*.
   is also pinged to the target's uptime check (made by the tick if missing, at most hourly), and
   with `self = true` huta pings its own check every tick.
 - `recipe.public_check` (after a switch) now also requires `ok: true`, as the slot check does.
+- **Watch window** (`watch.py`; targets with `watch`): a row in `watches` per serving episode
+  (release id, `live.since`). `cmd_approve` opens it when the outcome is live, after its other
+  steps; the tick opens one for a live episode that has none (as `unknown` if its window is
+  already over: nobody looked). Opening takes the local baseline in the same write. The tick
+  evaluates open rows after the probes, within its deadline: `local` (the live slot's
+  containers: restarts, OOM kills, stopped), `probe` (three failed samples of the episode in a
+  row, each within 150 s), `errors` (Bugsink issues first seen since the switch; events since
+  against the window before, per issue, at most 20 issues and 500 events), `checks` (the uptime
+  check's flips, with healthchecks). A signal makes the row `degraded` at once; at the window's
+  end it is `ok` if every source answered in each third of the window, else `unknown`. One
+  conditional transaction writes state, signals and events. Rows of an episode no longer live
+  are `closed` by the tick, by approval and by every `reconcile`; `huta stop` closes the live
+  one. The history message shows the watch line; `degraded` and `unknown` also send a reply
+  (retried until sent, so possibly twice); `watch.on_degraded` records `action = notified`
+  (the seam for automatic rollback). `huta status` and the box `status` op end with the line.
 - **Egress:** `<dsn_host>:443` is added only for a release that gets `SENTRY_DSN` (the repo
   asks, the registry grants `errors`, the DSN exists): `runtime.egress_for` for its env and
   compose (proxy variables, the egress host), and in the egress policy only while such a
@@ -430,7 +448,8 @@ huta client-bundle                       the client as a .tar.gz on stdout
 huta secret list|set|import|rm|discard <project> [NAME…] [--from <env file>]   set/import drop a staged value
 huta secret list|set|rm _platform [NAME]   the host's own tokens (never given to a container)
 huta monitor status|ensure <project> <target>   what is wired up (and the last probe) / make what is missing
-huta monitor tick                        probe public health, ping checks (huta-monitor.timer, every minute)
+huta monitor tick                        probe public health, watch windows, ping checks (huta-monitor.timer)
+huta watch <release>                     the release's watch window and why
 huta data status|ensure|import|export <project> <target> [dir | path…]
 huta backup <project> <target>           consistent copy + ship (the timer runs it)
 huta job list|run <project> <target> [name]

@@ -589,6 +589,9 @@ def reconcile(platform: Platform, st: S.Store, project: Project, t: Target, log)
     try:
         _reconcile(platform, st, project, t, log)
     finally:
+        if t.watch and st is not None:
+            from . import watch as W
+            W.close_stale(st, project.name, t.name)     # never raises
         if t.monitor_egress:
             # The Bugsink grant follows the target's releases (docs/PLAN-monitoring.md §3):
             # after recovery it may have to go (codex review of milestone 2, second look).

@@ -1,6 +1,6 @@
 # huta
 
-> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v2. Available: the `web` recipe (one HTTP container, or several components per target, below), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, gateways (a public hostname for a service huta doesn't run), and Postgres per target (huta runs it: pinned image, own volume and networks, app and migrate roles, dumps, planned upgrades). and publishing to Cloudflare Pages and Workers as a step of a release (files copied out of the image without running it, a pinned wrangler with egress to Cloudflare only). Migrations can also run online (the old release serving) when the repo, the host and the old release's runs_on all allow it. Monitoring hooks, in part: a Bugsink project and Matomo site per target, made by the host, and their variables (`SENTRY_DSN`, `SENTRY_RELEASE`, `SENTRY_ENVIRONMENT`, `MATOMO_SITE_ID`) when app.toml asks (`[monitor] env`). Planned, not available: unattended releases, `huta snapshot`, the rest of monitoring (job checks, a watch window after each release; the per-minute probe of each site is available), plain-HTTP egress.
+> huta releases projects to one server you own. An agent or person builds a container image on a dev box and asks for a release; the host verifies the commit (on `main`, and CI green when the target requires it), reads `deploy/app.toml` from git at that sha, checks the image's labels, user and platform, writes a plan, and waits for a human to approve. Then it starts the new release on an idle slot, checks that `/healthz` reports the sha, switches the vhost in one graceful reload, and stops the old slot after a short drain (long requests, streams and websockets can be cut). Status: v2. Available: the `web` recipe (one HTTP container, or several components per target, below), with what the host's operator grants per target: secrets and settings as environment variables (a dev box can send a secret's value; it goes live with the next release the owner approves); outbound HTTPS through an allowlisting proxy by hostname, and named host services (upstreams), with no DNS or other route out; a data volume of a fixed size mounted at one path, with consistent backups shipped off the server; scheduled jobs in the live release's image, optionally also run after each release; smoke checks on the new slot before the switch and public checks after it, with an automatic switch back; adopting a live site's vhost at the first release. Two transports (pull: a dev box on the same host with a shared inbox; push: any dev box over an ssh forced command plus a registry on the host), approval by the owner with one tap (✅ Deploy / ❌ Reject buttons on the release's Telegram history message, single-use secrets) or with `huta approve` on the host's command line (the fallback), and a Telegram history message per release, edited as it moves. Read-only debug access from a box: `huta status` (releases, and each slot's state, memory, pids and cpu against the limits, health now, data, backups, egress connections), `huta log`, `huta jobs`, `huta logs` (the target's container output, redacted by the host, kept 7 days, including a slot that never became healthy), `huta egress-log` (what the egress proxy refused), `huta traffic` (requests per minute by status class, each 5xx), `huta crashes` (Bugsink issues), and `huta diag` (a `[[diag]]` from app.toml, run without network or secrets against the last backup copy). Also available (v2): several containers per target (a web, an API, workers; one slot is the whole set), schema migrations that run exclusive with a pinned restore point and restore plans to go back, gateways (a public hostname for a service huta doesn't run), and Postgres per target (huta runs it: pinned image, own volume and networks, app and migrate roles, dumps, planned upgrades). and publishing to Cloudflare Pages and Workers as a step of a release (files copied out of the image without running it, a pinned wrangler with egress to Cloudflare only). Migrations can also run online (the old release serving) when the repo, the host and the old release's runs_on all allow it. Monitoring hooks, in part: a Bugsink project and Matomo site per target, made by the host, and their variables (`SENTRY_DSN`, `SENTRY_RELEASE`, `SENTRY_ENVIRONMENT`, `MATOMO_SITE_ID`) when app.toml asks (`[monitor] env`). Planned, not available: unattended releases, `huta snapshot`, the rest of monitoring (job checks, the ↩️ roll-back button; available: the per-minute probe of each site and a watch window after each release), plain-HTTP egress.
 
 If you are an agent running on an empty server and asked to **set it up as a huta host**, follow https://huta.run/host.md step by step (it diagnoses the server first, then asks the human before each change). If you are an agent asked to **install the huta client** on a machine, follow https://huta.run/install.md step by step (it tells you what to ask the human and what to confirm before touching the server). If you are an agent asked to deploy a project with huta, read the start page first, check its prerequisites, then follow it in order. Everything is also in one file: https://huta.run/llms-full.md
 
@@ -439,8 +439,8 @@ Targets with several components need the firewall fragment's `huta_intra` set (i
 
 Monitoring hooks (optional; built so far: the remote resources, the variables they give
 containers (`[monitor]` in the contract), and a probe of each monitored site every minute
-(`huta-monitor.timer`, installed and enabled by `install.sh`); job checks and watch windows are
-planned):
+(`huta-monitor.timer`, installed and enabled by `install.sh`), and a watch window after each
+release of targets with `watch`; job checks are planned):
 if the human already runs healthchecks, Bugsink or Matomo, huta can make a check, a project or
 a site per target that asks for it (`monitor = { … }` in the registry). Each table is
 optional; leave out the services they don't run.
@@ -457,6 +457,8 @@ team = "<team uuid>"
 [monitoring.matomo]
 url = "http://127.0.0.1:8081"
 host = "stats.example.org"
+[monitoring.watch]                     # optional
+window = "15m"                         # default for targets' watch windows, 5m..2h
 ```
 
 The human sets the tokens (a healthchecks project's read-write API key, Bugsink's token,
@@ -1432,6 +1434,7 @@ see each other: the box is the unit huta can tell apart.
 | `crashes` | int | | the target's Bugsink project id (`huta crashes`); with `monitor.errors` huta uses this project instead of making one |
 | `monitor` | table | | `{ uptime, jobs, errors, analytics }` booleans: what huta wires the target into (needs `[monitoring]` in `huta.toml`; `errors` needs `[monitoring.bugsink]`, `jobs` `[monitoring.healthchecks]`; `jobs` and the uptime probe are *planned*). With `errors`, a release that gets `SENTRY_DSN` may also reach the Bugsink host on 443 |
 | `matomo` | int | | a Matomo site id to use instead of making one (needs `monitor.analytics`) |
+| `watch` | table | | a watch window after each release (needs `monitor`): `window` (5m..2h, default the host's, 15m), `new_issues` (default 1; 0: off), `events` (default 10; 0: off), `factor` (default 3.0), `on_degraded` (`"notify"` only; `"rollback"` is *planned*) |
 | `components.<name>.monitor_env` | bool | `false` | this component also gets the monitoring variables (the public one always does) |
 | `legacy.<name>` | table | | project level: `unit` (`*.service`), `env_file` (absolute; required), `crashes` (optional); the name may not also be a target |
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
@@ -1560,7 +1563,10 @@ them, get:
 - Events go out through the egress proxy to the Bugsink host on 443 (`HTTPS_PROXY` is set; no
   DNS). Most Sentry SDKs honour `HTTPS_PROXY`; check yours.
 - Migrations and diagnostics never get these variables.
-- Planned: per-release watch windows that read Bugsink, checks and probes after a release.
+- With `watch` on the target, each release is watched after it goes live; new Bugsink issues
+  and a jump in error events count against it ([Approval](approval.md#notifications)).
+  Errors your app reports before a release don't: only those after the switch, against the
+  rate before it.
 
 ## Egress
 
@@ -2417,6 +2423,7 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta logs <project> <target> [options]` | the target's logs, same options and redaction as on dev; collects first, so it is up to the moment |
 | `huta egress-log` / `traffic` / `crashes <project> <target> [--since …]` | as on dev |
 | `huta monitor status\|ensure <project> <target>` | monitoring hooks: what is wired up for the target (a Bugsink project and its DSN, a Matomo site, a healthchecks check), and `ensure` makes what is missing. Failures are events, never release outcomes. `status` also shows the last probe |
+| `huta watch <release>` | the release's watch window: state, sources, reasons, how many answers each source gave. `--ack` is *planned* |
 | `huta monitor tick` | run every minute by `huta-monitor.timer` (does nothing without `[monitoring]`): probes the public health URL of every target with `monitor.uptime` (`ok: true` and the live sha), keeps the last 60 results, records `probe-down` / `probe-up` events, and pings healthchecks checks when configured |
 | `huta secret list\|set\|rm _platform [NAME]` | the host's own tokens (`GITHUB_TOKEN`, `CLOUDFLARE_API_TOKEN`, `BUGSINK_TOKEN`, `HEALTHCHECKS_API_KEY`, `MATOMO_TOKEN`); `set` reads the value from stdin; containers never get them |
 | `huta diag <project> <target> <name>` | as on dev; recorded with the operator's name |
@@ -2807,6 +2814,13 @@ Configured by the operator, all available:
   activated / needs a human / rejected / expired (with the reason), and replaced when a newer
   release goes live. With buttons turned on, this same message carries ✅ Deploy / ❌ Reject
   while the plan waits (above).
+- **Watch window** (targets with `watch` in the registry): after a release goes live, the
+  host watches it for a while (15 minutes by default) and adds a line to its history message:
+  `👀 watching until 14:32`, then `✓ quiet for 15 min`, or `⚠️ <reasons>` as soon as something
+  is wrong (new Bugsink issues, a jump in error events, the public health failing three times
+  in a row, a container restarting, OOM-killed or stopped), or `❔ watch unknown: <why>` when
+  a source didn't answer through the window. A `⚠️` or `❔` verdict also sends a reply to the
+  message, which notifies. `sudo huta watch <release>` shows the details.
 - **Fallback** `platform.notify` (an argv that gets a plain-text message on stdin when a plan
   waits), used only when no Telegram history is configured.
 

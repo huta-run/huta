@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,17 +36,23 @@ class PlannedKeysRefused(unittest.TestCase):
             load(self.etc)
 
     def test_still_planned(self):
-        self.refused(self.etc / "huta.toml",
-                     '\n[monitoring]\n[monitoring.watch]\nwindow = "15m"\n',
-                     r"\[monitoring.watch\] is planned")
-
-    def test_target_watch(self):
         f = self.etc / "projects.d" / "hello.toml"
         head, sep, tail = f.read_text().partition("[targets.prod]\n")
-        f.write_text(head + sep + 'watch = { window = "15m" }\n' + tail)
-        with self.assertRaisesRegex(ConfigError, "watch is planned"):
+        f.write_text(head + sep + 'watch = { on_degraded = "rollback" }\n' + tail)
+        with self.assertRaisesRegex(ConfigError, "rollback.* is planned"):
             load(self.etc)
 
+    def test_window_bounds(self):
+        f = self.etc / "projects.d" / "hello.toml"
+        text = f.read_text()
+        for bad in ('watch = { window = "2m" }', 'watch = { window = "3h" }',
+                    'watch = { factor = 0.5 }', 'watch = { events = -1 }', 'watch = { x = 1 }'):
+            with self.subTest(bad=bad):
+                head, sep, tail = text.partition("[targets.prod]\n")
+                f.write_text(head + sep + bad + "\n" + tail)
+                with self.assertRaises(ConfigError):
+                    load(self.etc)
+        f.write_text(text)
 
 
 class FakeShapes(unittest.TestCase):
@@ -1357,3 +1364,383 @@ class PublicCheck(unittest.TestCase):
                 else:
                     with self.assertRaises(recipe.RecipeError):
                         recipe.public_check("x.example.org", "/healthz", "a" * 40, timeout=0.2)
+
+
+# ------------------------------------------------------------------ milestone 5
+
+class Watch(unittest.TestCase):
+    """Watch windows: open, signals, coverage, verdicts, close, tell."""
+
+    T0 = 1_800_000_000.0
+    WINDOW = 900
+
+    def setUp(self):
+        from huta import cfg, monitor as M, runtime, store, watch as W
+        self.M, self.W = M, W
+        self.dir = Path(tempfile.mkdtemp(prefix="huta-watch-"))
+        self.etc = etc_copy()
+        plat, reg = load(self.etc)
+        self.platform = dataclasses.replace(
+            plat, state_dir=self.dir / "state", secrets_dir=self.etc / "secrets",
+            crashes={"url": "http://127.0.0.1:8000", "host": ""},
+            monitoring={"prefix": "huta", "healthchecks": None, "matomo": None,
+                        "bugsink": {"dsn_host": "bugs.example.org", "team": FM.BUGSINK_TEAM},
+                        "watch": {"window": self.WINDOW, "button_ttl": 7200}})
+        self.project = reg["hello"]
+        self.t = dataclasses.replace(
+            self.project.targets["prod"], monitor={"uptime": True, "errors": True},
+            monitor_egress=["bugs.example.org:443"],
+            watch={"window": self.WINDOW, "new_issues": 1, "events": 10, "factor": 3.0,
+                   "on_degraded": "notify"})
+        self.project.targets["prod"] = self.t
+        self.registry = {"hello": self.project}
+        pdir = self.etc / "secrets" / "_platform"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "BUGSINK_TOKEN").write_text(FM.BUGSINK_TOKEN)
+        d = runtime.secret_dir(self.platform, "hello")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "HUTA_SENTRY_DSN_PROD").write_text("https://k@bugs.example.org/1")
+        self.fm = FM.FakeMonitoring(self.dir / "mon.json")
+        self.pid = self.fm.add_project("huta_hello_prod")
+        self.local = {"web": {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": True}}
+        self.patches = [mock.patch.object(store, "assert_root_dir", lambda _p: None),
+                        mock.patch.object(runtime, "_root_dir", _no_uid_root_dir),
+                        mock.patch.object(M, "read_secret", _plain_read_secret),
+                        mock.patch.object(cfg, "read_secret", _plain_read_secret),
+                        mock.patch.object(cfg, "_SECRETS", []),
+                        mock.patch.object(M, "transport", self.fm.handle),
+                        mock.patch.object(W, "_local_sample",
+                                          lambda t, slot, sha: json.loads(json.dumps(self.local)))]
+        for p in self.patches:
+            p.start()
+        self.st = store.Store(self.platform.state_dir)
+        self.st.set_monitor("hello", "prod", "errors", "huta_hello_prod", str(self.pid), None)
+        from tests._util import app_toml
+        app = app_toml("hello")
+        app["monitor"] = {"env": ["sentry"]}
+        self.rid = self.st.new_release(project="hello", target="prod", sha="a" * 40,
+                                       image_id="i", image_tag="t", app_toml=json.dumps(app),
+                                       plan={}, plan_hash="0", built_by="test")
+        self.st.set_state(self.rid, "live")
+        self.st.db.execute("INSERT INTO live (project, target, release_id, slot, since)"
+                           " VALUES (?,?,?,?,?)", ("hello", "prod", self.rid, "a", self.T0))
+
+    def tearDown(self):
+        self.st.db.close()
+        for p in reversed(self.patches):
+            p.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        shutil.rmtree(self.etc, ignore_errors=True)
+
+    def open(self, now=None):
+        return self.W.open_watch(self.platform, self.st, self.project, self.t, self.rid, self.T0,
+                                 now=self.T0 + 1 if now is None else now)
+
+    def row(self):
+        return self.st.db.execute("SELECT * FROM watches WHERE release_id=?", (self.rid,)).fetchone()
+
+    def look(self, at: float):
+        """One evaluation, `at` seconds after the switch; a probe sample just before it."""
+        f = self.M.samples_file(self.platform, self.t)
+        ring = self.M.samples(self.platform, self.t)
+        ring.append({"ts": self.T0 + at - 1, "release": self.rid, "since": self.T0,
+                     "ok": getattr(self, "probe_ok", True), "why": "x"})
+        self.M._write_json(f, ring)
+        r = self.row()
+        if r["state"] != "watching":
+            return r["state"]
+        return self.W.evaluate(self.platform, self.st, self.project, self.t, r,
+                               time.monotonic() + 30, now=self.T0 + at)
+
+    def quiet_window(self):
+        for at in (60, 360, 660, 901):
+            out = self.look(at)
+        return out
+
+    def test_open_once_and_late(self):
+        self.assertTrue(self.open())
+        self.assertFalse(self.open())
+        self.assertEqual(self.row()["state"], "watching")
+        pol = json.loads(self.row()["policy"])
+        self.assertEqual(pol["sources"], ["local", "probe", "errors"])
+
+    def test_missed_window_is_unknown(self):
+        self.assertTrue(self.open(now=self.T0 + 5000))
+        self.assertEqual(self.row()["state"], "unknown")
+        self.assertIn("not watched", self.row()["reasons"])
+
+    def test_quiet_is_ok(self):
+        self.open()
+        self.assertEqual(self.quiet_window(), "ok")
+        kinds = [e["kind"] for e in self.st.events(self.rid, limit=20)]
+        self.assertIn("watch-ok", kinds)
+
+    def test_not_ok_before_the_window_ends(self):
+        self.open()
+        self.assertIsNone(self.look(60))
+        self.assertIsNone(self.look(360))
+        self.assertEqual(self.row()["state"], "watching")
+
+    def test_local_restart_degrades_at_once(self):
+        self.open()
+        self.look(60)
+        self.local["web"]["restarts"] = 2
+        self.assertEqual(self.look(120), "degraded")
+        self.assertIn("restarted 2", self.row()["reasons"])
+        kinds = [e["kind"] for e in self.st.events(self.rid, limit=20)]
+        self.assertIn("watch-signal", kinds)
+        self.assertIn("watch-degraded", kinds)
+
+    def test_local_oom_and_stopped(self):
+        for change, why in ((("oomkilled", True), "OOM-killed"), (("running", False), "not running"),
+                            (("oom_kill", 3), "kernel OOM-killed")):
+            with self.subTest(why=why):
+                self.st.db.execute("DELETE FROM watches")
+                self.local = {"web": {"restarts": 0, "oomkilled": False, "oom_kill": 0, "running": True}}
+                self.open()
+                self.look(60)
+                self.local["web"][change[0]] = change[1]
+                self.assertEqual(self.look(120), "degraded")
+                self.assertIn(why, self.row()["reasons"])
+
+    def test_probe_three_in_a_row(self):
+        self.open()
+        self.probe_ok = False
+        self.assertIsNone(self.look(60))
+        self.assertIsNone(self.look(120))
+        self.assertEqual(self.look(180), "degraded")
+        self.assertIn("public health failed 3 times", self.row()["reasons"])
+
+    def test_probe_failures_far_apart_dont_fire(self):
+        self.open()
+        for at in (60, 300, 540):
+            self.probe_ok = False
+            self.look(at)
+            self.probe_ok = True
+            self.look(at + 30)
+        self.assertEqual(self.row()["state"], "watching")
+
+    def test_new_issue_degrades(self):
+        self.open()
+        self.look(60)
+        self.fm.add_event(self.pid, "boom", self.T0 + 100)
+        self.assertEqual(self.look(160), "degraded")
+        self.assertIn("new Bugsink issue", self.row()["reasons"])
+
+    def test_event_rate(self):
+        self.t.watch["new_issues"] = 0          # only the rate
+        for i in range(5):                      # an old issue, a few events before the switch
+            self.fm.add_event(self.pid, "old", self.T0 - 600 + i)
+        self.open()
+        self.look(60)
+        for i in range(12):
+            self.fm.add_event(self.pid, "old", self.T0 + 100 + i)
+        self.assertEqual(self.look(300), "degraded")
+        self.assertIn("event-rate", self.row()["reasons"])
+
+    def test_event_rate_needs_factor(self):
+        self.t.watch["new_issues"] = 0
+        for i in range(400):                    # busy before: 400 in the window before
+            self.fm.add_event(self.pid, "old", self.T0 - 890 + i * 2)
+        self.open()
+        for i in range(12):
+            self.fm.add_event(self.pid, "old", self.T0 + 100 + i)
+        self.assertIsNone(self.look(300))
+
+    def test_bugsink_down_all_window_is_unknown(self):
+        self.open()
+        self.fm.fault("bugsink", "down")
+        self.assertEqual(self.quiet_window(), "unknown")
+        self.assertIn("errors: no answer", self.row()["reasons"])
+
+    def test_a_gap_in_the_middle_is_unknown(self):
+        self.open()
+        self.look(60)
+        self.fm.fault("bugsink", "down")
+        self.look(360)
+        self.fm.fault("bugsink", None)
+        self.look(660)
+        self.assertEqual(self.look(901), "unknown")
+
+    def test_closed_when_no_longer_live(self):
+        self.open()
+        self.st.db.execute("UPDATE live SET since=since+1")
+        self.assertEqual(self.look(60), "closed")
+        self.assertEqual(self.row()["state"], "closed")
+
+    def test_stop_closes_it(self):
+        self.open()
+        self.W.close_stale(self.st, "hello", "prod", "stopped by the operator")
+        self.assertEqual(self.row()["state"], "closed")
+        self.assertIn("stopped", self.row()["reasons"])
+
+    def test_verdict_written_once(self):
+        self.open()
+        self.look(30)
+        self.local["web"]["restarts"] = 1
+        r = self.row()
+        self.assertEqual(self.W.evaluate(self.platform, self.st, self.project, self.t, r,
+                                         time.monotonic() + 30, now=self.T0 + 60), "degraded")
+        # A second evaluator holding the old row writes nothing.
+        self.assertIsNone(self.W.evaluate(self.platform, self.st, self.project, self.t, r,
+                                          time.monotonic() + 30, now=self.T0 + 61))
+        kinds = [e["kind"] for e in self.st.events(self.rid, limit=20)]
+        self.assertEqual(kinds.count("watch-degraded"), 1)
+
+    def test_lines(self):
+        self.open()
+        self.assertTrue(self.W.line(self.row()).startswith("👀 watching until"))
+        self.look(30)                              # the first look takes the local baseline
+        self.local["web"]["restarts"] = 1
+        self.look(60)
+        self.assertTrue(self.W.line(self.row()).startswith("⚠️ local: web restarted"))
+        self.assertIn("degraded", self.W.text(self.st, self.rid))
+
+    def test_tell_replies_once_and_retries(self):
+        from huta import notify as N
+        self.st.db.execute("INSERT INTO tg_messages (release_id, chat, message_id, text)"
+                           " VALUES (?,?,?,?)", (self.rid, -100, 7, "old"))
+        self.open()
+        self.look(30)
+        self.local["web"]["restarts"] = 1
+        self.look(60)
+        sent = []
+        fail = [True]
+
+        def call(token, method, payload):
+            if method == "sendMessage" and fail[0]:
+                raise OSError("telegram down")
+            sent.append((method, payload))
+            return {"result": {"message_id": 8}}
+        with mock.patch.object(N, "_token", lambda p: "tok"), mock.patch.object(N, "_call", call):
+            self.W._tell(self.platform, self.st, lambda m: None)
+            self.assertIsNone(self.row()["notified"])          # not sent: tried again
+            fail[0] = False
+            self.W._tell(self.platform, self.st, lambda m: None)
+            self.W._tell(self.platform, self.st, lambda m: None)
+        replies = [p for m, p in sent if m == "sendMessage"]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["reply_parameters"]["message_id"], 7)
+        self.assertIn("degraded after release", replies[0]["text"])
+        edits = [p for m, p in sent if m == "editMessageText"]
+        self.assertTrue(any("⚠️ local" in p["text"] for p in edits))
+        self.assertEqual(self.row()["notified"], "degraded")
+        self.assertEqual(self.row()["action"], "notified")
+
+    def test_monitor_tick_opens_and_evaluates(self):
+        self.st.db.execute("UPDATE live SET since=?", (time.time() - 60,))
+        self.local["web"]["restarts"] = 0
+        health = {"ok": True, "sha": "a" * 40}
+
+        def transport(method, url, headers, body, timeout=10):
+            if "/healthz" in url:
+                return 200, {}, json.dumps(health).encode()
+            return self.fm.handle(method, url, headers, body, timeout)
+        with mock.patch.object(self.M, "transport", transport):
+            self.M.tick(self.platform, self.registry, self.st)
+        r = self.st.db.execute("SELECT * FROM watches").fetchone()
+        self.assertEqual(r["state"], "watching")
+        self.assertIsNotNone(r["last_tick"])
+        cov = json.loads(r["coverage"])
+        self.assertEqual(set(cov), {"local", "probe", "errors"})
+
+    def test_effective_shows_the_watch(self):
+        from tests._util import app_toml
+        eff = self.M.effective(self.platform, self.project, self.t, app_toml("hello"))
+        self.assertEqual(eff["watch"]["window"], self.WINDOW)
+
+
+class WatchTickCrash(Watch):
+    """(Watch's tests run here too.) The tick killed after each of its writes, twice over: the
+    next ticks end with one verdict, recorded once, told at least once."""
+
+    def test_crash_after_every_write(self):
+        from huta import notify as N, store as S
+
+        def run(crash_after, steps_file):
+            steps_file.write_text("[]")
+
+            def op(name):
+                steps = json.loads(steps_file.read_text()) + [name]
+                steps_file.write_text(json.dumps(steps))
+                if crash_after is not None and len(steps) == crash_after:
+                    os._exit(77)
+            real_open, real_eval, real_deg = self.W.open_watch, self.W.evaluate, self.W.on_degraded
+
+            def open_(*a, **k):
+                r = real_open(*a, **k)
+                op("open")
+                return r
+
+            def ev(*a, **k):
+                r = real_eval(*a, **k)
+                op(f"evaluate {r}")
+                return r
+
+            def deg(*a, **k):
+                real_deg(*a, **k)
+                op("action")
+
+            def call(token, method, payload):
+                replies = self.dir / "replies.json"
+                n = json.loads(replies.read_text()) if replies.exists() else []
+                if method == "sendMessage":
+                    replies.write_text(json.dumps(n + [payload["text"]]))
+                    op("reply sent")
+                return {"result": {"message_id": 8}}
+            pid = os.fork()
+            if pid == 0:
+                code = 0
+                try:
+                    self.st = S.Store(self.platform.state_dir)
+                    with mock.patch.object(self.W, "open_watch", open_), \
+                            mock.patch.object(self.W, "evaluate", ev), \
+                            mock.patch.object(self.W, "on_degraded", deg), \
+                            mock.patch.object(N, "_token", lambda p: "tok"), \
+                            mock.patch.object(N, "_call", call):
+                        self.tick_at(60)
+                        self.local["web"]["restarts"] = 1
+                        self.tick_at(120)
+                except BaseException:  # noqa: BLE001
+                    import traceback
+                    (self.dir / "err.txt").write_text(traceback.format_exc())
+                    code = 1
+                os._exit(code)
+            _, status = os.waitpid(pid, 0)
+            return os.waitstatus_to_exitcode(status), json.loads(steps_file.read_text())
+
+        code, steps = run(None, self.dir / "steps.json")
+        self.assertEqual(code, 0, (self.dir / "err.txt").read_text() if code else "")
+        for k in range(1, len(steps) + 1):
+            for second in (False, True):
+                with self.subTest(after=steps[k - 1], second=second):
+                    self.tearDown()
+                    self.setUp()
+                    self.assertEqual(run(k, self.dir / "steps.json")[0], 77)
+                    if second:          # the next tick dies at the same point again
+                        self.local["web"]["restarts"] = 1
+                        run(k, self.dir / "steps.json")
+                    self.local["web"]["restarts"] = 1
+                    replies = self.dir / "replies.json"
+                    with mock.patch.object(N, "_token", lambda p: "tok"), \
+                            mock.patch.object(N, "_call", lambda tok, m, p: (
+                                replies.write_text(json.dumps(
+                                    (json.loads(replies.read_text()) if replies.exists() else [])
+                                    + ([p["text"]] if m == "sendMessage" else []))),
+                                {"result": {"message_id": 8}})[1]):
+                        self.tick_at(130)
+                        self.tick_at(140)
+                    r = self.row()
+                    self.assertEqual(r["state"], "degraded")
+                    self.assertEqual(r["notified"], "degraded")
+                    self.assertEqual(r["action"], "notified")
+                    kinds = [e["kind"] for e in self.st.events(self.rid, limit=50)]
+                    self.assertEqual(kinds.count("watch-degraded"), 1)
+                    self.assertGreaterEqual(len(json.loads(replies.read_text())), 1)
+
+    def tick_at(self, at):
+        """The watch part of a tick, at T0 + at (the first look takes the baseline)."""
+        self.st.db.execute("INSERT OR IGNORE INTO tg_messages (release_id, chat, message_id,"
+                           " text) VALUES (?,?,?,?)", (self.rid, -100, 7, "old"))
+        with mock.patch.object(self.W.time, "time", lambda: self.T0 + at):
+            self.W.tick(self.platform, self.registry, self.st, time.monotonic() + 30)

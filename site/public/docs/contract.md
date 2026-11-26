@@ -518,6 +518,7 @@ see each other: the box is the unit huta can tell apart.
 | `crashes` | int | | the target's Bugsink project id (`huta crashes`); with `monitor.errors` huta uses this project instead of making one |
 | `monitor` | table | | `{ uptime, jobs, errors, analytics }` booleans: what huta wires the target into (needs `[monitoring]` in `huta.toml`; `errors` needs `[monitoring.bugsink]`, `jobs` `[monitoring.healthchecks]`; `jobs` and the uptime probe are *planned*). With `errors`, a release that gets `SENTRY_DSN` may also reach the Bugsink host on 443 |
 | `matomo` | int | | a Matomo site id to use instead of making one (needs `monitor.analytics`) |
+| `watch` | table | | a watch window after each release (needs `monitor`): `window` (5m..2h, default the host's, 15m), `new_issues` (default 1; 0: off), `events` (default 10; 0: off), `factor` (default 3.0), `on_degraded` (`"notify"` only; `"rollback"` is *planned*) |
 | `components.<name>.monitor_env` | bool | `false` | this component also gets the monitoring variables (the public one always does) |
 | `legacy.<name>` | table | | project level: `unit` (`*.service`), `env_file` (absolute; required), `crashes` (optional); the name may not also be a target |
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |

@@ -167,7 +167,55 @@ def render(st: S.Store, rid: str) -> str:
     else:
         why = next((ev["msg"] for ev in st.events(rid, limit=5) if ev["kind"] == state), "")
         lines += [head + (f" — {esc(why[:300])}" if why and why != state else "")]
+    w = _watch_line(st, rid)
+    if w:
+        lines.append(esc(w))
     return "\n".join(lines)
+
+
+def _watch_line(st: S.Store, rid: str) -> str:
+    """The release's watch window (docs/PLAN-monitoring.md §6), if it has one."""
+    try:
+        from . import watch as W
+        return W.line(W.row_of(st, rid))
+    except Exception:  # noqa: BLE001 — a database from before watches, or none yet
+        return ""
+
+
+def watch_reply(st: S.Store, row) -> str:
+    """The reply a degraded or unknown verdict sends (an edit doesn't notify)."""
+    from . import watch as W
+    esc = html.escape
+    head = {"degraded": "⚠️ degraded after release", "unknown": "❔ couldn't tell after release"}
+    return (f"{head.get(row['state'], row['state'])} <b>{esc(row['project'])} → "
+            f"{esc(row['target'])}</b> · <code>{esc(row['release_id'])}</code>\n"
+            f"{esc(W.line(row))}\n<code>sudo huta watch {esc(row['release_id'])}</code>")
+
+
+def reply(platform, st: S.Store, rid: str, text: str) -> bool:
+    """A reply to the release's history message, which notifies. True when sent, or when there
+    is nothing to send it with (no Telegram configured, no history message); never raises."""
+    try:
+        token = _token(platform)
+        row = st.db.execute("SELECT chat, message_id FROM tg_messages WHERE release_id=?",
+                            (rid,)).fetchone()
+        if not token or not row:
+            return True
+        payload = {"chat_id": row["chat"], "text": text, "parse_mode": "HTML",
+                   "disable_web_page_preview": True,
+                   "reply_parameters": {"message_id": row["message_id"],
+                                        "allow_sending_without_reply": True}}
+        if row["chat"] == platform.telegram.get("history_chat") \
+                and platform.telegram.get("history_thread"):
+            payload["message_thread_id"] = platform.telegram["history_thread"]
+        _call(token, "sendMessage", payload)
+        return True
+    except Exception as e:  # noqa: BLE001
+        try:
+            st.event("notify-failed", f"telegram reply: {type(e).__name__}", rid)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
 
 def history(platform, st: S.Store, rid: str, create: bool = True) -> None:

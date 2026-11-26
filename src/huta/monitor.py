@@ -588,7 +588,8 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
     what is missing and why, the egress it adds."""
     env, missing = env_for(platform, project, t, app, "<sha>", with_secrets=False)
     return {"kinds": sorted(t.monitor), "env": sorted(env), "missing": missing,
-            "egress": list(t.monitor_egress) if "SENTRY_DSN" in env else []}
+            "egress": list(t.monitor_egress) if "SENTRY_DSN" in env else [],
+            **({"watch": dict(sorted(t.watch.items()))} if t.watch else {})}
 
 
 def secret_names(platform: Platform, project: Project, t: Target, app: dict) -> list[str]:
@@ -836,6 +837,12 @@ def tick(platform: Platform, registry: dict, st, log=lambda _m: None) -> dict:
                 log(f"{project.name}/{t.name}: probe failed: {type(e).__name__}")
         else:
             state["cursor"] = int(state.get("cursor", 0)) + 1
+        # Watch windows (§6): after the probes, whose samples they read.
+        try:
+            from . import watch as W
+            W.tick(platform, registry, st, end, log)
+        except Exception as e:  # noqa: BLE001
+            log(f"watch: {type(e).__name__}")
         if hc and hc.get("self") and time.monotonic() < end:
             try:
                 _self_ping(platform, st, state, end, log)

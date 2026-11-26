@@ -73,7 +73,10 @@ them, get:
 - Events go out through the egress proxy to the Bugsink host on 443 (`HTTPS_PROXY` is set; no
   DNS). Most Sentry SDKs honour `HTTPS_PROXY`; check yours.
 - Migrations and diagnostics never get these variables.
-- Planned: per-release watch windows that read Bugsink, checks and probes after a release.
+- With `watch` on the target, each release is watched after it goes live; new Bugsink issues
+  and a jump in error events count against it ([Approval](approval.md#notifications)).
+  Errors your app reports before a release don't: only those after the switch, against the
+  rate before it.
 
 ## Egress
 

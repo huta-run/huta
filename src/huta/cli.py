@@ -931,6 +931,16 @@ def cmd_approve(a):
         if staged:
             # Values go live with the release or not at all (grok secrets #1, #2).
             _settle(platform, st, project, a.release, outcome)
+        if t.watch:
+            # The watch window of what is live now opens (docs/PLAN-monitoring.md §6); an older
+            # episode's closes. If huta dies before this, the tick opens it.
+            from . import watch as W
+            W.close_stale(st, project.name, t.name)
+            try:
+                if outcome == S.LIVE:
+                    W.open_live(platform, st, project, t)
+            except Exception as e:  # noqa: BLE001 — the tick opens it
+                say(f"watch not opened ({type(e).__name__}); the monitoring tick will")
         if t.monitor_egress:
             # Whatever the outcome, the Bugsink grant now follows the releases that are live:
             # one dropped by this release, or by a failed one, goes (docs/PLAN-monitoring.md §3).
@@ -1092,8 +1102,12 @@ def handle_request(platform, registry, st, req: dict, transport: str, box: str) 
                              " ORDER BY created DESC LIMIT 10", (project.name, t.name)).fetchall()
         text = "\n".join(f"{r['id']}  {time.strftime('%m-%d %H:%M', time.localtime(r['created']))}  "
                          f"{r['sha'][:12]}  {r['state']}" for r in rows)
+        w = ""
+        if t.watch:
+            from . import watch as W
+            w = W.status_line(st, project.name, t.name)
         return {"ok": True, "live": dict(live) if live else None,
-                "text": text + "\n\n" + _runtime(platform, st, project, t)}
+                "text": text + "\n\n" + _runtime(platform, st, project, t) + (f"\n{w}" if w else "")}
     if op == "jobs":
         # Read-only: schedules and the outcome of recent runs, never their output (a job's
         # output can carry data or a secret the redactor doesn't know).
@@ -1470,6 +1484,11 @@ def cmd_status(a):
             say(f"{r['id']}  {time.strftime('%m-%d %H:%M', time.localtime(r['created']))}  "
                 f"{r['sha'][:12]}  {r['state']:<18} slot {r['slot'] or '-'}")
         say("\n" + _runtime(platform, st, project, t))
+        if t.watch:
+            from . import watch as W
+            w = W.status_line(st, project.name, t.name)
+            if w:
+                say(w)
         return 0
     st = S.Store(load_platform().state_dir)
     for r in st.releases(a.project, limit=a.n):
@@ -1542,6 +1561,16 @@ def _platform_secret(a):
                 say(f"{n} removed")
         return 0
     raise ConfigError("secret list|set|rm _platform")
+
+
+def cmd_watch(a):
+    from . import watch as W
+    if getattr(a, "ack", False):
+        raise ConfigError("huta watch --ack is planned (milestone 6)")
+    platform = load_platform()
+    st = S.Store(platform.state_dir)
+    say(W.text(st, a.release))
+    return 0
 
 
 def cmd_monitor(a):
@@ -1807,6 +1836,9 @@ def cmd_stop(a):
                 recipe._stop_members(t, slot)          # every container of the slot
                 say(f"stopped slot {slot}")
         st.event("stopped", "stopped by the operator", None, project.name, t.name)
+        if t.watch:
+            from . import watch as W
+            W.close_stale(st, project.name, t.name, "stopped by the operator")
     return 0
 
 
@@ -1918,6 +1950,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("secret"); s.add_argument("action", choices=["list", "set", "import", "rm", "discard"])
     s.add_argument("project"); s.add_argument("names", nargs="*")
     s.add_argument("--from", dest="file"); s.set_defaults(f=cmd_secret)
+    s = sub.add_parser("watch"); s.add_argument("release"); s.add_argument("--ack", action="store_true")
+    s.set_defaults(f=cmd_watch)
     s = sub.add_parser("monitor"); s.add_argument("action", choices=["status", "ensure", "tick"])
     s.add_argument("project", nargs="?"); s.add_argument("target", nargs="?")
     s.set_defaults(f=cmd_monitor)

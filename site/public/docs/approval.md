@@ -154,6 +154,13 @@ Configured by the operator, all available:
   activated / needs a human / rejected / expired (with the reason), and replaced when a newer
   release goes live. With buttons turned on, this same message carries ✅ Deploy / ❌ Reject
   while the plan waits (above).
+- **Watch window** (targets with `watch` in the registry): after a release goes live, the
+  host watches it for a while (15 minutes by default) and adds a line to its history message:
+  `👀 watching until 14:32`, then `✓ quiet for 15 min`, or `⚠️ <reasons>` as soon as something
+  is wrong (new Bugsink issues, a jump in error events, the public health failing three times
+  in a row, a container restarting, OOM-killed or stopped), or `❔ watch unknown: <why>` when
+  a source didn't answer through the window. A `⚠️` or `❔` verdict also sends a reply to the
+  message, which notifies. `sudo huta watch <release>` shows the details.
 - **Fallback** `platform.notify` (an argv that gets a plain-text message on stdin when a plan
   waits), used only when no Telegram history is configured.
 
