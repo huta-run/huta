@@ -22,7 +22,8 @@ Data only. Strict:
 
 - **top level:** only the keys in the table below; anything else is refused;
 - **`[components.<name>]`**, **`[images.<name>]`**, **`[state]`**, **`[build]`**,
-  **`[[smoke]]`**, **`[[jobs]]`**, **`[[diag]]`:** only their listed keys; anything else is refused;
+  **`[[smoke]]`**, **`[[jobs]]`**, **`[[diag]]`**, **`[[snapshot]]`:** only their listed keys;
+  anything else is refused;
 - `preflight` is a known key but must be absent or empty (*planned*).
 
 ### TOML pitfall: top-level keys first
@@ -120,6 +121,7 @@ timeout = "10m"
 | `smoke` | array of tables | optional; at most 20 checks (below) |
 | `jobs` | array of tables | optional; at most 20 jobs (below) |
 | `diag` | array of tables | optional; at most 20 diagnostics (below) |
+| `snapshot` | array of tables | optional; 1..5 sanitize commands for data snapshots (below) |
 | `monitor` | table | optional; `env`, the monitoring variables your app wants (below) |
 | `preflight` | array of tables | must be absent or empty (*planned*) |
 
@@ -355,6 +357,34 @@ cmd = ["node", "scripts/db-check.js"]   # integrity check, migration version, ro
 timeout = "2m"
 ```
 
+### `[[snapshot]]`
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `name` | string | required | `^[a-z][a-z0-9-]{0,31}$`, unique; at most 5 snapshots |
+| `cmd` | array of strings | required | the sanitize command (argv), run in your image |
+| `check` | array of strings | | optional; run after `cmd` on its result; non-zero refuses the snapshot |
+| `timeout` | string | `"10m"` | for `cmd`; at most `30m` (`check` has 5m) |
+| `component` | string | the one that mounts the data | whose image and limits; with a database, the public component |
+
+Only with `[state] kind = "data"` or `"postgres"`. A dev box will be able to ask for a copy of
+the target's data made by this command, approved by the owner with one tap (*planned*:
+asking, preparing and delivering; see docs/PLAN-snapshot.md). The command will run on the last
+backup copy, mounted read-only at the component's data path, without network or secrets, and
+write its result to `/snapshot` (so the data path may not be or contain `/snapshot`). With a
+database, it will change a throwaway copy in place through `DATABASE_URL`. huta does not know
+what personal data is: removing it is this command's job. Adding, changing or removing one is
+shown in the release plan on its own 📦 line with the commands, and such a release always needs
+the owner's tap.
+
+```toml
+[[snapshot]]
+name = "db"
+cmd = ["node", "tools/sanitize.mjs"]                 # writes /snapshot/db.sqlite
+check = ["node", "tools/sanitize.mjs", "--verify"]   # optional
+timeout = "10m"
+```
+
 ### `[monitor]`
 
 | Key | Type | Default | Notes |
@@ -516,10 +546,11 @@ see each other: the box is the unit huta can tell apart.
 | `data` | table | | `size` 64m..512g (required), `backup` `hourly`/`daily`/`off`/an OnCalendar (default `daily`), `concurrent` bool (default `false`). Needs `[backup]` in `huta.toml` (its directory holds the copies; `backup = "off"` only turns off the schedule and shipping) |
 | `access_log` | bool | `true` | |
 | `crashes` | int | | the target's Bugsink project id (`huta crashes`); with `monitor.errors` huta uses this project instead of making one |
-| `monitor` | table | | `{ uptime, jobs, errors, analytics }` booleans: what huta wires the target into (needs `[monitoring]` in `huta.toml`; `errors` needs `[monitoring.bugsink]`, `jobs` `[monitoring.healthchecks]`; `jobs` and the uptime probe are *planned*). With `errors`, a release that gets `SENTRY_DSN` may also reach the Bugsink host on 443 |
+| `monitor` | table | | `{ uptime, jobs, errors, analytics }` booleans: what huta wires the target into (needs `[monitoring]` in `huta.toml`; `errors` needs `[monitoring.bugsink]`, `jobs` `[monitoring.healthchecks]`; `jobs` is *planned*). With `errors`, a release that gets `SENTRY_DSN` may also reach the Bugsink host on 443 |
 | `matomo` | int | | a Matomo site id to use instead of making one (needs `monitor.analytics`) |
 | `watch` | table | | a watch window after each release (needs `monitor`): `window` (5m..2h, default the host's, 15m), `new_issues` (default 1; 0: off), `events` (default 10; 0: off), `factor` (default 3.0), `on_degraded` (`"notify"` only; `"rollback"` is *planned*) |
 | `components.<name>.monitor_env` | bool | `false` | this component also gets the monitoring variables (the public one always does) |
+| `snapshot` | table | | data snapshots for dev boxes (needs `data` or `postgres`; asking for one is *planned*): `max` packed size (1m..2g, default `200m`), `keep` how long a delivered copy stays on the host (1m..7d, default `24h`), `per_day` accepted requests a day, failures included (1..24, default 4), `scratch` work space (64m..16g, at least `max`, default `2g`), `max_age` refuse an older backup copy (optional), `canaries` names of secret files no target uses whose values must never appear in a snapshot |
 | `legacy.<name>` | table | | project level: `unit` (`*.service`), `env_file` (absolute; required), `crashes` (optional); the name may not also be a target |
 | `logs` | table | `{days=7, max="200m", boxes=true, jobs=false}` | `days` 1..90, `max` 16m..20g; `boxes`: the project's boxes may read the slots' logs; `jobs`: and the jobs' output |
 | `adopt` | string | | a file name in Caddy's sites directory (`*.caddy`) |

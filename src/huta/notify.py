@@ -169,7 +169,8 @@ def render(st: S.Store, rid: str) -> str:
     if warn or note.startswith("rollback"):
         lines.append(esc(note))
     for c in p.get("changes", []):
-        if c.startswith(("🔑", "☁️")):   # secret-bearing jobs, Cloudflare publishing: always shown
+        # Secret-bearing jobs, Cloudflare publishing, snapshot commands: always shown.
+        if c.startswith(("🔑", "☁️", "📦")):
             lines.append(esc(c[:300]))
     state = r["state"]
     head = STATE_LINE.get(state, state)

@@ -260,6 +260,9 @@ class Target:
     # Set by load_registry from the host's [monitoring]: <dsn_host>:443 when errors is on.
     monitor_egress: list = field(default_factory=list)
     watch: dict = field(default_factory=dict)       # the watch window's thresholds (§6)
+    # Data snapshots for dev boxes (docs/PLAN-snapshot.md): {max, keep, per_day, scratch,
+    # max_age, canaries}; empty: the target allows none.
+    snapshot: dict = field(default_factory=dict)
 
     @property
     def egress_allow(self) -> list[str]:
@@ -903,10 +906,16 @@ def _pull_cfg(p: dict) -> dict:
         raise ConfigError("[transport.pull] container: bad name")
     if not isinstance(p.get("owner_uid"), int) or p["owner_uid"] <= 0:
         raise ConfigError("[transport.pull] owner_uid must be the dev user's uid as seen on the host")
+    gid = p.get("owner_gid")
+    if gid is not None and (not isinstance(gid, int) or isinstance(gid, bool) or gid <= 0):
+        raise ConfigError("[transport.pull] owner_gid must be the dev user's group id as seen on "
+                          "the host")
     inbox = Path(p["inbox"])
     work = Path(p.get("work", str(inbox.parent / "work")))   # root-only, same filesystem as inbox
     return {"inbox": inbox, "outbox": Path(p["outbox"]), "work": work,
-            "container": p["container"], "owner_uid": p["owner_uid"]}
+            "container": p["container"], "owner_uid": p["owner_uid"],
+            # Snapshots delivered over pull are readable by this group only (PLAN-snapshot).
+            **({"owner_gid": gid} if gid is not None else {})}
 
 
 def _push_cfg(p: dict) -> dict:
@@ -1018,7 +1027,7 @@ def load_project(name: str, etc: Path = ETC) -> Project:
                             "upstreams", "data", "adopt", "access_log", "job_secrets", "logs",
                             "crashes", "kind", "edge", "health_timeout", "migrate_secrets",
                             "components", "worker_liveness", "postgres", "external",
-                            "migrate_online", "monitor", "matomo", "watch"}
+                            "migrate_online", "monitor", "matomo", "watch", "snapshot"}
         if unknown:
             raise ConfigError(f"{tw}: unknown keys {sorted(unknown)}")
         env = t.get("env", {})
@@ -1100,7 +1109,22 @@ def load_project(name: str, etc: Path = ETC) -> Project:
             monitor=_monitor_cfg(t.get("monitor"), tw),
             matomo=_matomo_id(t.get("matomo"), tw),
             watch=_watch_cfg(t.get("watch"), tw),
+            snapshot=_snapshot_cfg(t.get("snapshot"), tw),
         )
+        tgt = targets[tname]
+        if tgt.snapshot and not (tgt.data or tgt.postgres):
+            raise ConfigError(f"{tw}: snapshot needs data or postgres (a copy to start from)")
+    # A canary is a tripwire: no target of the project may hand it to its code, and no box may
+    # stage it (docs/PLAN-snapshot.md).
+    used = {n for x in targets.values() for n in (
+        *x.secrets, *x.env, *x.migrate_secrets, *(n for v in x.job_secrets.values() for n in v),
+        *(n for c in x.components.values() for n in (*c.get("secrets", []), *c.get("env", {}))),
+        *([x.gateway["secret"]] if x.gateway and x.gateway.get("secret") else []))}
+    for x in targets.values():
+        clash = sorted(set(x.snapshot.get("canaries", [])) & used)
+        if clash:
+            raise ConfigError(f"{where} {x.name}: snapshot canaries {clash} are also used by a "
+                              "target (a canary must be used by nothing)")
     # Which dev boxes may submit this project and read its status, log and jobs (pull: the
     # dev container's name; push: the enrolled box). Absent or empty: no box, the host CLI only.
     boxes = d.get("boxes", [])
@@ -1223,7 +1247,7 @@ def zone_for(host: str, platform: Platform) -> str:
 
 
 APP_KEYS = {"schema", "project", "order", "build", "images", "components", "state",
-            "preflight", "smoke", "jobs", "external", "diag", "migrate", "monitor"}
+            "preflight", "smoke", "jobs", "external", "diag", "migrate", "monitor", "snapshot"}
 MONITOR_ENV = ("sentry", "matomo")
 COMPONENT_KEYS = {"image", "kind", "port", "health", "data", "concurrent_safe", "upstream_api",
                   "public", "cmd"}
@@ -1306,6 +1330,8 @@ def parse_app_toml(text: str, project: str) -> dict:
     d["diag"] = _diag(d.get("diag", []))
     if "monitor" in d:
         d["monitor"] = _monitor_app(d["monitor"])
+    if "snapshot" in d:
+        d["snapshot"] = _snapshot_app(d["snapshot"], comps, order, st_kind)
     for j in d["jobs"] + d["diag"]:
         if "component" in j and j["component"] not in comps:
             raise ConfigError(f"app.toml: {j['name']}: no component {j['component']!r}")
@@ -1490,6 +1516,48 @@ def _smoke(items) -> list[dict]:
 DURATION_RE = re.compile(r"^(\d{1,5})(s|m|h)$")
 
 
+LONG_DURATION_RE = re.compile(r"^(\d{1,5})(m|h|d)$")
+SNAPSHOT_DEFAULTS = {"max": "200m", "keep": "24h", "per_day": 4, "scratch": "2g"}
+
+
+def _long_duration(v, where: str, hi: int) -> int:
+    m = LONG_DURATION_RE.match(v) if isinstance(v, str) else None
+    if not m:
+        raise ConfigError(f"{where}: a duration like 30m, 24h or 7d")
+    n = int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    if not 60 <= n <= hi:
+        raise ConfigError(f"{where}: {v} is out of range")
+    return n
+
+
+def _snapshot_cfg(v, where: str) -> dict:
+    """snapshot = { max, keep, per_day, scratch, max_age, canaries } (docs/PLAN-snapshot.md)."""
+    if v is None:
+        return {}
+    keys = {"max", "keep", "per_day", "scratch", "max_age", "canaries"}
+    if not isinstance(v, dict) or set(v) - keys:
+        raise ConfigError(f"{where}: snapshot = {{ {', '.join(sorted(keys))} }}")
+    v = {**SNAPSHOT_DEFAULTS, **v}
+    out = {"max": size_bytes(v["max"], f"{where} snapshot.max", 1 << 20, 2 << 30),
+           "keep": _long_duration(v["keep"], f"{where} snapshot.keep", 7 * 86400),
+           "scratch": size_bytes(v["scratch"], f"{where} snapshot.scratch", 64 << 20, 16 << 30)}
+    if out["scratch"] < out["max"]:
+        raise ConfigError(f"{where}: snapshot.scratch must be at least snapshot.max")
+    pd = v["per_day"]
+    if not isinstance(pd, int) or isinstance(pd, bool) or not 1 <= pd <= 24:
+        raise ConfigError(f"{where}: snapshot.per_day must be 1..24")
+    out["per_day"] = pd
+    if "max_age" in v:
+        out["max_age"] = _long_duration(v["max_age"], f"{where} snapshot.max_age", 90 * 86400)
+    can = v.get("canaries", [])
+    if not isinstance(can, list) or len(can) > 20 or len(set(can)) != len(can):
+        raise ConfigError(f"{where}: snapshot.canaries must be a list of distinct secret names")
+    for c in can:
+        _env_name(c, f"{where} snapshot.canaries")
+    out["canaries"] = list(can)
+    return out
+
+
 def duration_s(v, where: str, hi: int) -> int:
     m = DURATION_RE.match(v) if isinstance(v, str) else None
     if not m:
@@ -1498,6 +1566,64 @@ def duration_s(v, where: str, hi: int) -> int:
     if not 1 <= n <= hi:
         raise ConfigError(f"{where}: {v} is out of range")
     return n
+
+
+SNAPSHOT_OUT = "/snapshot"
+
+
+def _argv(cmd, where: str) -> list[str]:
+    if not isinstance(cmd, list) or not 1 <= len(cmd) <= 64 or not all(
+            isinstance(a, str) and 0 < len(a) <= 1024 and "\0" not in a for a in cmd):
+        raise ConfigError(f"{where} must be an argv list of strings (no shell)")
+    return list(cmd)
+
+
+def _snapshot_app(items, comps: dict, order: list, st_kind: str) -> list[dict]:
+    """[[snapshot]]: the repo's sanitize commands a box may ask to run on a backup copy
+    (docs/PLAN-snapshot.md). Only with data or a database; the component defaults to the one
+    that mounts the data (with a database: the public one), and its data path may not overlap
+    /snapshot, where the command writes its result."""
+    if not isinstance(items, list) or not 1 <= len(items) <= 5:
+        raise ConfigError("app.toml: [[snapshot]] is a list of 1 to 5 snapshots")
+    if st_kind not in ("data", "postgres"):
+        raise ConfigError('app.toml: [[snapshot]] needs [state] kind = "data" or "postgres"')
+    if st_kind == "data":
+        default = next(n for n in order if comps[n].get("data"))
+    else:
+        default = next((n for n in order if comps[n].get("public")),
+                       next(n for n in order if comps[n].get("kind", "http") == "http"))
+    out, names = [], set()
+    for i, j in enumerate(items):
+        w = f"app.toml: snapshot[{i}]"
+        if not isinstance(j, dict) or set(j) - {"name", "cmd", "check", "timeout", "component"}:
+            raise ConfigError(f"{w}: keys are name, cmd, check, timeout, component")
+        name = j.get("name")
+        if not isinstance(name, str) or not NAME_RE.match(name) or len(name) > 32 \
+                or name in names:
+            raise ConfigError(f"{w}: name must be a unique lowercase name")
+        names.add(name)
+        comp = j.get("component", default)
+        if comp not in comps:
+            raise ConfigError(f"{w}: no component {comp!r}")
+        if comps[comp].get("kind", "http") not in ("http", "worker"):
+            raise ConfigError(f"{w}: component {comp!r} can't run it")
+        mnt = comps[comp].get("data")
+        if st_kind == "data" and not mnt:
+            raise ConfigError(f"{w}: component {comp!r} mounts no data (the copy is mounted at "
+                              "the component's data path)")
+        if mnt:
+            m = mnt.rstrip("/")
+            if m == SNAPSHOT_OUT or m.startswith(SNAPSHOT_OUT + "/") \
+                    or SNAPSHOT_OUT.startswith(m + "/"):
+                raise ConfigError(f"{w}: component {comp!r} mounts its data at {mnt}, which "
+                                  f"overlaps {SNAPSHOT_OUT} (where the result goes)")
+        d = {"name": name, "cmd": _argv(j.get("cmd"), f"{w}.cmd"),
+             "timeout": duration_s(j.get("timeout", "10m"), f"{w}.timeout", 1800),
+             "component": comp}
+        if "check" in j:
+            d["check"] = _argv(j["check"], f"{w}.check")
+        out.append(d)
+    return out
 
 
 def _monitor_app(v) -> dict:

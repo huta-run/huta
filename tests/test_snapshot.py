@@ -19,6 +19,14 @@ from huta import snapshot as SN
 from huta import store as S
 
 
+SNAP_TOML = '[[snapshot]]\nname = "db"\ncmd = ["python", "/app/app.py", "sanitize"]\n'
+
+
+def json_plan(st, rid):
+    import json
+    return json.loads(st.release(rid)["plan"])
+
+
 class Host:
     """A platform in a temporary directory, with the host commands sweep runs faked: units
     and containers by flags, mounts never, `rm` for real."""
@@ -382,6 +390,161 @@ class HostRemove(unittest.TestCase):
         self.assertIn("4 KiB", SN.list_text(self.st))
         self.assertIn("sha256 " + "ab" * 32, SN.show_text(self.st, sid))
         self.assertEqual(SN.list_text(self.st, "other"), "no snapshots")
+
+
+class Contract(unittest.TestCase):
+    """S1: the registry's snapshot key, the pull group, effective and the 📦 plan line."""
+
+    def setUp(self):
+        self.etc = etc_copy()
+
+    def tearDown(self):
+        shutil.rmtree(self.etc, ignore_errors=True)
+
+    def target(self, line, project="notes", target="prod"):
+        from huta import cfg
+        f = self.etc / "projects.d" / f"{project}.toml"
+        head, sep, tail = f.read_text().partition(f"[targets.{target}]\n")
+        f.write_text(head + sep + line + "\n" + tail)
+        with mock.patch.object(cfg, "assert_root_dir", lambda _p: None):
+            return cfg.load_project(project, self.etc).targets[target]
+
+    def test_defaults(self):
+        t = self.target("snapshot = {}")
+        self.assertEqual(t.snapshot, {"max": 200 << 20, "keep": 86400, "per_day": 4,
+                                      "scratch": 2 << 30, "canaries": []})
+        self.assertEqual(self.target("", "notes", "staging").snapshot, {})
+
+    def test_values(self):
+        t = self.target('snapshot = { max = "1g", keep = "7d", per_day = 2, scratch = "8g", '
+                        'max_age = "3d", canaries = ["CANARY_EMAIL"] }')
+        self.assertEqual((t.snapshot["max"], t.snapshot["keep"], t.snapshot["max_age"]),
+                         (1 << 30, 7 * 86400, 3 * 86400))
+        self.assertEqual(t.snapshot["canaries"], ["CANARY_EMAIL"])
+
+    def test_refused(self):
+        from huta.cfg import ConfigError
+        for line, pattern in (
+                ('snapshot = { max = "3g" }', "out of range"),
+                ('snapshot = { keep = "8d" }', "out of range"),
+                ('snapshot = { scratch = "100m", max = "200m" }', "at least snapshot.max"),
+                ('snapshot = { scratch = "17g" }', "out of range"),
+                ("snapshot = { per_day = 0 }", "1..24"),
+                ('snapshot = { per_day = true }', "1..24"),
+                ('snapshot = { shell = true }', "snapshot = "),
+                ('snapshot = { canaries = ["lower"] }', "canaries"),
+                ('snapshot = { canaries = ["NOTES_TOKEN"] }', "also used by a target"),
+                ('snapshot = { canaries = ["ROTATE_KEY"] }', "also used by a target"),
+                ('snapshot = { canaries = ["PRICE"] }', "also used by a target")):
+            with self.subTest(line=line):
+                etc = self.etc
+                self.etc = etc_copy()
+                try:
+                    with self.assertRaisesRegex(ConfigError, pattern):
+                        self.target(line)
+                finally:
+                    shutil.rmtree(self.etc, ignore_errors=True)
+                    self.etc = etc
+
+    def test_needs_data_or_postgres(self):
+        from huta.cfg import ConfigError
+        with self.assertRaisesRegex(ConfigError, "needs data or postgres"):
+            self.target("snapshot = {}", "hello", "prod")
+
+    def test_pull_owner_gid(self):
+        from huta import cfg
+        p = {"inbox": "/srv/i", "outbox": "/srv/o", "container": "dev", "owner_uid": 1001000}
+        self.assertNotIn("owner_gid", cfg._pull_cfg(p))
+        self.assertEqual(cfg._pull_cfg({**p, "owner_gid": 1001000})["owner_gid"], 1001000)
+        for bad in (0, -1, True, "1"):
+            with self.subTest(bad=bad), self.assertRaises(cfg.ConfigError):
+                cfg._pull_cfg({**p, "owner_gid": bad})
+
+    def test_effective_only_when_declared(self):
+        from tests._util import app_toml
+        from huta import recipe
+        plat, reg = load(self.etc)
+        project = reg["notes"]
+        t = project.targets["prod"]
+        app = app_toml("notes")
+        self.assertNotIn("snapshot", recipe.effective(plat, project, t, app))
+        app["snapshot"] = [{"name": "db", "cmd": ["x"], "timeout": 600, "component": "web"}]
+        self.assertEqual(recipe.effective(plat, project, t, app)["snapshot"], app["snapshot"])
+
+    def test_plan_lines(self):
+        from huta import cli
+        a = {"name": "db", "cmd": ["node", "s.mjs"], "timeout": 600, "component": "web"}
+        b = {**a, "cmd": ["node", "s2.mjs"], "check": ["node", "v.mjs"], "timeout": 90}
+        self.assertEqual(cli.snapshot_lines([a], [a]), [])
+        new = cli.snapshot_lines([], [a])
+        self.assertEqual(len(new), 1)
+        self.assertTrue(new[0].startswith("📦 snapshot db (new): runs node s.mjs"))
+        self.assertIn("10 min", new[0])
+        changed = cli.snapshot_lines([a], [b])[0]
+        self.assertIn("(changed): runs node s2.mjs; check node v.mjs", changed)
+        self.assertIn("90 s", changed)
+        self.assertEqual(cli.snapshot_lines([a], []), ["📦 snapshot db removed"])
+
+    def test_a_release_adding_a_snapshot_is_infra(self):
+        """The unattended plan approves only code-only releases: a [[snapshot]] change never
+        is one (docs/PLAN-snapshot.md)."""
+        from tests._util import IMAGE, ROOT, SHA
+        from huta import cli, recipe, runtime as R
+        h = Host()
+        try:
+            _plat, reg = load(self.etc)
+            project, t = reg["notes"], reg["notes"].targets["prod"]
+            plat = h.platform
+            base = (ROOT / "examples/notes/deploy/app.toml").read_text()
+            gh = mock.Mock()
+            gh.compare.return_value = {"status": "ahead", "ahead": 1, "behind": 0}
+            ctx = [mock.patch.object(recipe, "check_image_map", lambda *a, **k: None),
+                   mock.patch.object(R, "secret_value", lambda *a: "x" * 16),
+                   mock.patch.object(R, "staged", lambda *a: {}),
+                   mock.patch.object(R, "staged_list", lambda *a: []),
+                   mock.patch.object(R, "live_versions", lambda *a: {}),
+                   mock.patch.object(recipe, "migration", lambda *a: None)]
+            for c in ctx:
+                c.start()
+            try:
+                gh.read_file.return_value = base
+                r1 = cli.plan_release(plat, project, h.st, t, SHA, IMAGE, "huta-build/notes:x", gh)
+                h.st.db.execute("UPDATE releases SET state='live' WHERE id=?", (r1,))
+                h.st.db.execute("INSERT INTO live (project, target, release_id, slot, since)"
+                                " VALUES ('notes','prod',?,'a',0)", (r1,))
+                self.assertEqual(json_plan(h.st, r1)["class"], "infra")   # first release
+                gh.read_file.return_value = base + "\n" + SNAP_TOML
+                r2 = cli.plan_release(plat, project, h.st, t, "b" * 40, IMAGE,
+                                      "huta-build/notes:y", gh)
+                p2 = json_plan(h.st, r2)
+                self.assertEqual(p2["class"], "infra")
+                self.assertEqual([c for c in p2["changes"] if c.startswith("📦")],
+                                 ["📦 snapshot db (new): runs python /app/app.py sanitize; "
+                                  "component web, at most 10 min, on a backup copy, no network, "
+                                  "no secrets"])
+                self.assertFalse([c for c in p2["changes"] if "changed:" in c and "snapshot" in c])
+            finally:
+                for c in ctx:
+                    c.stop()
+        finally:
+            h.close()
+
+    def test_plan_line_is_shown_in_telegram(self):
+        from huta import notify as N
+        with mock.patch.object(S, "assert_root_dir", lambda _p: None):
+            st = S.Store(Path(tempfile.mkdtemp(prefix="huta-snap-st-")))
+        try:
+            plan = {"project": "notes", "target": "prod", "sha": "a" * 40, "class": "infra",
+                    "changes": ["changed: env", "📦 snapshot db (new): runs node s.mjs"],
+                    "checks": {}, "effective": {}, "from": None}
+            rid = st.new_release(project="notes", target="prod", sha="a" * 40, image_id="i",
+                                 image_tag="t", app_toml="{}", plan=plan, plan_hash="0",
+                                 built_by="dev")
+            text = N.render(st, rid)
+            self.assertIn("📦 snapshot db (new): runs node s.mjs", text)
+            self.assertNotIn("changed: env", text)
+        finally:
+            shutil.rmtree(st.dir, ignore_errors=True)
 
 
 class PublishLock(unittest.TestCase):

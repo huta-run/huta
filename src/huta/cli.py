@@ -266,6 +266,32 @@ def _resolve_image(ref: str) -> tuple[str, str]:
     return image_id, tag
 
 
+def _secs(n: int) -> str:
+    return f"{n // 60} min" if n % 60 == 0 else f"{n} s"
+
+
+def snapshot_lines(old: list, new: list) -> list[str]:
+    """📦 lines for [[snapshot]] added, changed or removed (docs/PLAN-snapshot.md): the
+    commands in full, since a box's snapshot runs them on production data and the owner's tap
+    trusts them. Any such line makes the release infra (never auto-approved)."""
+    before = {x["name"]: x for x in old}
+    after = {x["name"]: x for x in new}
+    out = []
+    for name in sorted(set(before) | set(after)):
+        a, b = before.get(name), after.get(name)
+        if a == b:
+            continue
+        if b is None:
+            out.append(f"📦 snapshot {name} removed")
+            continue
+        what = "new" if a is None else "changed"
+        out.append(f"📦 snapshot {name} ({what}): runs {' '.join(b['cmd'])[:300]}"
+                   + (f"; check {' '.join(b['check'])[:200]}" if b.get("check") else "")
+                   + f"; component {b['component']}, at most {_secs(b['timeout'])}, on a "
+                   "backup copy, no network, no secrets")
+    return out
+
+
 def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", images=None) -> str:
     """images: {name: image id} for a project with several images (DESIGN-v2 §3); image_id and
     tag are then the public component's."""
@@ -361,11 +387,14 @@ def plan_release(platform, project, st, t, sha, image_id, tag, gh, note="", imag
         dflt = {"env": {}, "secrets": [], "upstreams": {}, "data": None, "jobs": [], "smoke": [],
                 "adopt": "", "access_log": True, "job_secrets": {}, "diag": [], "edge": {},
                 "health_timeout": 30, "migrate": None, "migrate_secrets": [], "schema": None,
-                "runs_on": None}
-        diff = sorted(k for k in set(old) | set(eff) if k != "compose"
+                "runs_on": None, "snapshot": []}
+        # [[snapshot]] gets its own 📦 lines below, with the commands.
+        diff = sorted(k for k in set(old) | set(eff) if k not in ("compose", "snapshot")
                       and old.get(k, dflt.get(k)) != eff.get(k, dflt.get(k)))
         if diff or old.get("compose") != eff.get("compose"):
             changes.append("changed: " + (", ".join(diff) if diff else "runtime config"))
+    changes += snapshot_lines((json.loads(live_rel["plan"]).get("effective") or {})
+                              .get("snapshot", []) if live_rel else [], eff.get("snapshot", []))
     mon = eff.get("monitor")
     old_mon = (json.loads(live_rel["plan"]).get("effective") or {}).get("monitor") if live_rel else None
     if mon and mon != old_mon:

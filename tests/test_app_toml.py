@@ -222,6 +222,65 @@ class Monitor(unittest.TestCase):
                 parse_app_toml(with_lines(HELLO, after=bad), "hello")
 
 
+SNAP = '[[snapshot]]\nname = "db"\ncmd = ["python", "/app/app.py", "sanitize"]\n'
+
+
+class Snapshot(unittest.TestCase):
+    """[[snapshot]] (docs/PLAN-snapshot.md, milestone S1)."""
+
+    def parse(self, extra, text=NOTES, project="notes"):
+        return parse_app_toml(with_lines(text, after=extra), project)
+
+    def test_accepted_with_defaults(self):
+        app = self.parse(SNAP)
+        self.assertEqual(app["snapshot"], [{"name": "db", "cmd": ["python", "/app/app.py",
+                                                                  "sanitize"],
+                                            "timeout": 600, "component": "web"}])
+        self.assertNotIn("snapshot", parse_app_toml(NOTES, "notes"))
+
+    def test_check_timeout_component(self):
+        app = self.parse(SNAP + 'check = ["python", "/app/app.py", "verify"]\ntimeout = "30m"\n'
+                         'component = "web"\n')
+        self.assertEqual(app["snapshot"][0]["check"], ["python", "/app/app.py", "verify"])
+        self.assertEqual(app["snapshot"][0]["timeout"], 1800)
+
+    def test_component_defaults_to_the_data_mount(self):
+        app = parse_app_toml(MULTI + "\n" + SNAP, "shop")
+        self.assertEqual(app["snapshot"][0]["component"], "api")
+
+    def test_postgres_defaults_to_the_public_component(self):
+        text = HELLO.replace('kind = "none"', 'kind = "postgres"')
+        app = parse_app_toml(text + "\n" + SNAP, "hello")
+        self.assertEqual(app["snapshot"][0]["component"], "web")
+
+    def test_refused(self):
+        bad = {
+            "no state": (HELLO, "hello", SNAP, "needs \\[state\\]"),
+            "shell": (NOTES, "notes", SNAP.replace('["python", "/app/app.py", "sanitize"]',
+                                                   '"python sanitize"'), "argv"),
+            "check shell": (NOTES, "notes", SNAP + 'check = "verify"\n', "argv"),
+            "timeout": (NOTES, "notes", SNAP + 'timeout = "31m"\n', "out of range"),
+            "unknown key": (NOTES, "notes", SNAP + 'network = true\n', "keys are"),
+            "duplicate": (NOTES, "notes", SNAP + SNAP, "unique"),
+            "bad name": (NOTES, "notes", SNAP.replace('"db"', '"DB"'), "unique lowercase"),
+            "no component": (NOTES, "notes", SNAP + 'component = "api"\n', "no component"),
+            "six": (NOTES, "notes", "".join(SNAP.replace('"db"', f'"s{i}"') for i in range(6)),
+                    "1 to 5"),
+            "overlap": (NOTES.replace('data = "/data"', 'data = "/snapshot/db"'), "notes", SNAP,
+                        "overlaps"),
+            "overlap above": (NOTES.replace('data = "/data"', 'data = "/snapshot"'), "notes",
+                              SNAP, "overlaps"),
+        }
+        for why, (text, project, extra, pattern) in bad.items():
+            with self.subTest(why=why), self.assertRaisesRegex(ConfigError, pattern):
+                self.parse(extra, text, project)
+
+    def test_worker_without_data_refused(self):
+        text = MULTI + "\n" + SNAP + 'component = "web"\n'
+        with self.assertRaisesRegex(ConfigError, "mounts no data"):
+            parse_app_toml(text, "shop")
+
+
 class PlannedFeaturesRefused(unittest.TestCase):
     """Today's refusals. A v2 step that builds a feature replaces its test here."""
 

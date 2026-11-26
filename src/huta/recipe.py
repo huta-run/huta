@@ -166,7 +166,9 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
                 "worker_liveness": t.worker_liveness} if SP.several(app) else {}),
             **({"external": {n: {**t.external.get(n, {}), "kind": e["kind"]}
                              for n, e in app["external"].items()}} if app.get("external") else {}),
-            **({"monitor": _monitor_effective(platform, project, t, app)} if t.monitor else {})}
+            **({"monitor": _monitor_effective(platform, project, t, app)} if t.monitor else {}),
+            # The repo's sanitize commands (docs/PLAN-snapshot.md): code a later tap trusts.
+            **({"snapshot": app["snapshot"]} if app.get("snapshot") else {})}
 
 
 def _monitor_effective(platform, project, t, app) -> dict:

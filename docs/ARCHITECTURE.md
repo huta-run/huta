@@ -51,7 +51,12 @@ plan stays `planned` or becomes `superseded` / `rejected`.
 **Repo side** (`deploy/app.toml`, data only). Strict where it matters: unknown top-level keys,
 unknown keys in `[components.*]`, `[images.*]` (`dockerfile`, `context`), `[state]` (`kind`:
 `none` or `data`), `[build]` (`test`), `[[smoke]]` and `[[jobs]]` are errors; `preflight` and
-`external` must be empty; `components.*.image` must name the one `[images.*]` table. v1 keys
+`external` must be empty; `components.*.image` must name the one `[images.*]` table.
+`[[snapshot]]` (docs/PLAN-snapshot.md) names the repo's sanitize commands: 1..5, `name`, `cmd`
+and `check` (argv), `timeout` (≤ 30m), `component` (default: the one that mounts the data);
+only with data or a database, and the data path may not overlap `/snapshot`. It is part of
+`recipe.effective` only when declared, and `plan_release` shows each added, changed or removed
+one as a `📦` line with its commands (Telegram shows it too), which makes the release `infra`. v1 keys
 (data mount, `concurrent_safe`, smoke checks, jobs) are specified in `DESIGN-v1.md` and the
 agent docs (`site/public/docs/contract.md`, `runtime.md`).
 
@@ -115,6 +120,8 @@ monitor = { uptime = true, errors = true, analytics = true }   # jobs = true: pl
 matomo = 7                     # optional: adopt this Matomo site instead of creating one
 watch = { window = "15m", new_issues = 1, events = 10, factor = 3.0 }   # after each release
 # [targets.prod.components.api] monitor_env = true   also gives that component the variables
+# Data snapshots for dev boxes (docs/PLAN-snapshot.md; built: the key and the records):
+snapshot = { max = "200m", keep = "24h", per_day = 4, scratch = "2g", canaries = ["CANARY_EMAIL"] }
 
 # v2: a gateway, a hostname for a service huta doesn't run (DESIGN-v2 §1). No slots, uid or repo.
 [targets.media]
@@ -149,6 +156,7 @@ inbox = "/srv/huta-dev/inbox"
 outbox = "/srv/huta-dev/outbox"
 container = "devbox"
 owner_uid = 1001000
+owner_gid = 1001000            # optional: the group a pull-delivered snapshot is readable by (planned)
 [transport.push]               # optional
 registry_local = "127.0.0.1:5000"
 registry_public = "registry.example.org:4882"

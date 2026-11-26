@@ -89,6 +89,7 @@ inbox = "/srv/huta-dev/inbox"     # the same directory, seen from the host
 outbox = "/srv/huta-dev/outbox"
 container = "devbox"              # the dev container's name
 owner_uid = 1001000               # the dev user's uid as seen on the host
+owner_gid = 1001000               # optional: its group, for snapshots delivered here (planned)
 # work = "/srv/huta-dev/work"     # root-only claim directory; default: next to the inbox
 ```
 
