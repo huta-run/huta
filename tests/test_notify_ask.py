@@ -61,9 +61,8 @@ class AskOwner(unittest.TestCase):
         self.assertEqual(self.failures(), [])
 
     def test_not_modified_means_done(self):
-        e = urllib.error.HTTPError("u", 400, "Bad Request", {},
-                                   io.BytesIO(b'{"ok":false,"description":"Bad Request: message '
-                                              b'is not modified"}'))
+        e = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b""))
+        e.tg_body = '{"ok":false,"description":"Bad Request: message is not modified"}'
         self.ask([TimeoutError("lost answer"), e])
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.failures(), [])
@@ -73,6 +72,16 @@ class AskOwner(unittest.TestCase):
         self.assertEqual(len(self.calls), N.ASK_TRIES)
         self.assertEqual(self.failures(), ["telegram buttons: TimeoutError"])
         self.assertIsNotNone(self.row(), "kept: the last try may have reached Telegram")
+
+    def test_call_reads_the_error_body_in_its_thread(self):
+        body = b'{"description":"Bad Request: message is not modified"}'
+
+        def urlopen(_req, timeout):
+            raise urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(body))
+        with mock.patch.object(N.urllib.request, "urlopen", urlopen), \
+                self.assertRaises(urllib.error.HTTPError) as cm:
+            N._call("t", "editMessageReplyMarkup", {}, timeout=2)
+        self.assertTrue(N._not_modified(cm.exception))
 
     def test_other_http_errors_are_retried_too(self):
         e = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b"message not found"))

@@ -18,6 +18,7 @@ import html
 import json
 import secrets
 import time
+import urllib.error
 import urllib.request
 
 from . import store as S
@@ -94,6 +95,11 @@ def _call(token: str, method: str, payload: dict, timeout: float = 15) -> dict:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 box.append(("ok", json.loads(r.read(65536))))
         except BaseException as e:  # noqa: BLE001 — handed to the caller
+            if isinstance(e, urllib.error.HTTPError):
+                try:             # the error's body is read here, within the deadline
+                    e.tg_body = e.read(4096).decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001
+                    e.tg_body = ""
             box.append(("err", e))
     th = threading.Thread(target=run, daemon=True, name="huta-telegram")
     th.start()
@@ -293,14 +299,10 @@ ASK_TRIES, ASK_TIMEOUT, ASK_PAUSE = 3, 10, 2
 
 
 def _not_modified(e: Exception) -> bool:
-    """Telegram's 400 for an edit that changes nothing: the keyboard is already there."""
-    import urllib.error
-    if not isinstance(e, urllib.error.HTTPError) or e.code != 400:
-        return False
-    try:
-        return "message is not modified" in e.read(4096).decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001
-        return False
+    """Telegram's 400 for an edit that changes nothing: the keyboard is already there. The body
+    was read by _call, inside its deadline."""
+    return isinstance(e, urllib.error.HTTPError) and e.code == 400 \
+        and "message is not modified" in getattr(e, "tg_body", "")
 
 
 def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
