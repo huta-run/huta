@@ -493,24 +493,10 @@ class WatchRollback(Base):
         r3 = self.st.releases(self.project.name, limit=1)[0]
         self.assertEqual(r3["state"], S.PLANNED, "a plan the owner can approve")
         self.assertEqual(self.state(self.r2), S.LIVE)
-
-    def test_dies_after_planning_then_the_tick_posts_the_plan(self):
-        import time
-        real = cli._plan_rollback
-
-        def plan_then_die(*a, **k):
-            rid = real(*a, **k)
-            W.set_action(self.host.store(), W.pressed_row(self.host.store(), self.r2),
-                         W.PLANNED_PREFIX + rid)
-            os._exit(CRASH_EXIT)
-        with mock.patch.object(cli, "_plan_rollback", plan_then_die):
-            self.child(self.unit)
-        r3 = self.st.releases(self.project.name, limit=1)[0]["id"]
-        self.assertIsNone(self.message(r3))
-        W.post_planned(self.platform, self.st, time.monotonic() + 30)
-        self.assertIsNotNone(self.message(r3), "its history message is posted")
-        self.assertIsNotNone(self.st.db.execute("SELECT 1 FROM approvals WHERE release_id=?",
-                                                (r3,)).fetchone(), "with its buttons")
+        # Left visible: unattended releases wait for an ack, and huta watch says what's left.
+        self.st.db.execute("UPDATE watches SET state=? WHERE release_id=?", (W.OK, self.r2))
+        self.assertIn("↩️", W.blocks(self.st, self.project.name, self.t.name))
+        self.assertIn("didn't finish", W.text(self.st, self.r2))
 
     def test_dies_during_the_approval(self):
         base = len(self.host.ops())

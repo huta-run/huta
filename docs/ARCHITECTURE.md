@@ -408,8 +408,11 @@ for unattended releases (`ready`, `blocks`, `--ack`). Job checks (milestone 3) a
   ack of the verdict doesn't cover it). The unit takes the spent keyboard off; the tick does it
   for any button no longer due or spent (the hash goes first, the keyboard edit is retried until
   Telegram takes it). Crash: the unit dead before planning leaves the press spent and nothing
-  changed; after planning, a plan waiting for approval, whose message and buttons the tick posts
-  if the unit didn't; during the approval, a release like any other. Known limit as for the approval buttons: the relay is
+  changed; after planning, a plan waiting for approval (30 min, `huta approve` on the host; its
+  Telegram message and buttons only if the unit got that far); during the approval, a release
+  like any other. A unit that dies is a failed systemd unit (host alerting sees it), the row
+  stays `pressed` or planned, `huta watch` says so, and `blocks` holds unattended releases until
+  `--ack`. Known limit as for the approval buttons: the relay is
   trusted with the presser's id; one-tap only for clean plans bounds a forged press to rolling
   code back one release.
 - **Interface for unattended releases** (plan 3): `monitor.ready` (every source the watch needs

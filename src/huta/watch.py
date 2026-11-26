@@ -672,37 +672,20 @@ def drop_keyboard(platform: Platform, st, row, timeout: float = 10) -> bool:
     """Take a spent or retired ↩️ off its message, unless another episode of the same release
     has a live button on it. True when it is off (message_id cleared)."""
     from . import notify as N
-    if st.db.execute("SELECT 1 FROM watches WHERE release_id=? AND button_hash IS NOT NULL",
-                     (row["release_id"],)).fetchone():
+    live_button = ("SELECT 1 FROM watches WHERE release_id=? AND button_hash IS NOT NULL")
+    if st.db.execute(live_button, (row["release_id"],)).fetchone():
         gone = True                   # the newer episode's keyboard replaced it
     else:
         gone = N.clear_keyboard(platform, row["chat"], row["message_id"], timeout=timeout)
+        if st.db.execute(live_button, (row["release_id"],)).fetchone():
+            # A newer episode posted its ↩️ meanwhile, and the clear may have come after it:
+            # post the message again, with a fresh keyboard.
+            st.db.execute("UPDATE tg_messages SET text='' WHERE release_id=?", (row["release_id"],))
+            N.history(platform, st, row["release_id"], create=False, timeout=timeout)
     if gone:
         st.db.execute("UPDATE watches SET message_id=NULL WHERE release_id=? AND since=? AND"
                       " button_hash IS NULL", (row["release_id"], row["since"]))
     return gone
-
-
-def post_planned(platform: Platform, st, end: float, log=lambda _m: None) -> None:
-    """A ↩️ unit that died after planning leaves a plan nobody was shown: post its history
-    message and its buttons (each tick, while it waits and has no buttons)."""
-    from . import notify as N
-    for r in st.db.execute("SELECT action FROM watches WHERE action LIKE ?",
-                           (PLANNED_PREFIX + "%",)).fetchall():
-        if end - time.monotonic() < 5:
-            return
-        rid = r["action"][len(PLANNED_PREFIX):]
-        try:
-            rel = st.release(rid)
-        except KeyError:
-            continue
-        if rel["state"] != "planned" or time.time() - rel["created"] > 30 * 60:
-            continue
-        if st.db.execute("SELECT 1 FROM approvals WHERE release_id=?", (rid,)).fetchone():
-            continue
-        per = min(10.0, (end - time.monotonic() - 1) / 2)
-        if N.history(platform, st, rid, create=True, timeout=per):
-            N.ask_owner(platform, st, rid)
 
 
 # ------------------------------------------------------------------ the unattended interface
@@ -791,6 +774,13 @@ def text(st, rid: str) -> str:
         out.append(f"  sources: {', '.join(pol.get('sources', []))}")
         for x in json.loads(r["reasons"] or "[]"):
             out.append(f"  {x}")
+        if (r["action"] or "").startswith(SPENT):
+            out.append(f"  ↩️ {r['action']}" + (" (the unit didn't finish: see huta status and"
+                                                 " journalctl -u 'huta-rollback-*')"
+                                                 if r["action"] == PRESSED else ""))
+        if r["acked"]:
+            out.append(f"  acknowledged by {r['acked_by']} "
+                       f"{time.strftime('%m-%d %H:%M', time.localtime(r['acked']))}")
         cov = json.loads(r["coverage"] or "{}")
         if cov:
             out.append("  answers: " + ", ".join(f"{k} {len(v)}" for k, v in sorted(cov.items())))
@@ -835,11 +825,10 @@ def tick(platform: Platform, registry: dict, st, end: float, log=lambda _m: None
             except Exception as e:  # noqa: BLE001 — one target never stops the others
                 log(f"{project.name}/{t.name} watch: {type(e).__name__}")
     _tell(platform, st, end, log)
-    for step in (post_planned, retire_buttons):
-        try:
-            step(platform, st, end, log)
-        except Exception as e:  # noqa: BLE001
-            log(f"watch buttons: {type(e).__name__}")
+    try:
+        retire_buttons(platform, st, end, log)
+    except Exception as e:  # noqa: BLE001
+        log(f"watch buttons: {type(e).__name__}")
 
 
 def _tell(platform: Platform, st, end: float, log) -> None:
