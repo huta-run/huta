@@ -380,6 +380,38 @@ bounds what a forged press can do (it rolls code back one release).
 - `on_degraded`: only `"notify"` is accepted; `"rollback"` is the seam for automatic rollback.
 - `unknown` is never treated as `ok`.
 
+## Milestone 5 build notes
+
+Prepared after milestone 4, from what milestones 1–4 left in the code.
+
+- **Sources a host may have.** A host can run with Bugsink only (no healthchecks, no Matomo).
+  The sources are then `errors`, `probe` and `local`; `checks` exists only with healthchecks.
+  Coverage asks only for the sources the target has: `errors` when `monitor.errors` and the
+  release got `SENTRY_DSN`; `probe` when `monitor.uptime`; `checks` when healthchecks is
+  configured and the target has a check; `local` always.
+- **Local signals need a sampler.** The tick reads the live slot's containers
+  (`docker inspect`: `RestartCount`, `OOMKilled`, `State.Running`; for workers, exited) and the
+  cgroup's `memory.events` `oom_kill`, and stores the counts in the watch row at the first tick
+  of the episode; later ticks compare against them. This is the only baseline the watch keeps,
+  and it is local. Bounded: one `docker inspect` per tick per watched target.
+- **Probe signal** reads the ring file (`monitor.samples`): samples of this episode (release id
+  and `since` match), three failed in a row, each within 150 s of the last.
+- **Errors signal.** New issues: `first_seen` ≥ switch. Event rate: per issue with `last_seen`
+  ≥ switch − window, events by `timestamp` (caps: 20 issues, 500 events a tick, as planned).
+  Bugsink calls share the tick's deadline, after the probes.
+- **Order inside a tick:** probes first (cheap, bounded), then watches (open, evaluate,
+  notify), then pings. A watch evaluation that runs out of time leaves coverage unchanged for
+  that tick, which `unknown` then shows.
+- **Config:** `[monitoring.watch]` (`window`, `button_ttl`) and the target's `watch` stop being
+  refused; `on_degraded` accepts only `"notify"`.
+- **Notification:** `notify.render` reads the live episode's watch row and adds its line;
+  `degraded` and `unknown` send a reply to the history message (`notified` trails `state`). The
+  ↩️ keyboard is milestone 6, so milestone 5 edits carry no `reply_markup` yet.
+- **Gate on a test host:** turn `watch` on for the test target; release it; quiet window → `ok`.
+  Release again and call its test-error endpoint 10+ times in the window → `degraded`
+  (event rate). With Bugsink unreachable for the window (wrong `[crashes]` port on purpose) →
+  `unknown`.
+
 ## Failure matrix
 
 | Step | Recorded first | Crash right after → reconcile / next run | Outcome |
@@ -413,7 +445,7 @@ Each is one install; each leaves every target working. The rules of `BUILD-v2.md
 | 1 | Config, `huta secret set _platform`, migration 4, clients, `ensure`, check ids in the redactor, `huta monitor status\|ensure` | `ensure` twice on a test target creates each thing once; with the API down a release still goes live | unit: parsing, URL rules, hostile answers (oversize, redirect, wrong shape, two matches, bad DSN); redaction of a bare uuid; crash: `MonitorEnsure` (die after each create, capability, row and the DSN secret), API down; old golden cases byte-identical (the plan's `effective` doesn't change until milestone 2) | built; gate passed on a test host (Bugsink; healthchecks and Matomo not configured there) |
 | 2 | Env injection, one effective egress list, `[monitor] env` and `monitor_env` accepted | a test release shows the variables, the plan shows the egress line; an event reaches Bugsink with the release sha | golden: new case `notes-monitored` (compose and effective), old cases byte-identical; unit: registry value wins, DSN missing → variable absent and plan says why, component filtering; crash: a monitored release with every service down plans and goes live | built; gate passed on a test host: the release's plan showed the variables and the egress line, and its test event reached Bugsink tagged with the release sha |
 | 3 | Job checks (tick convergence, OnCalendar schedules) and pings | a job run turns its check up; a failing job turns it down; removing a job pauses it | unit: schedule, fallback period and grace (weekday schedule), exit code mapping; ping failure doesn't change the exit; crash: tick killed after a convergence call | |
-| 4 | Tick: timer, budget, probe, self-ping; `public_check` requires `ok` | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip and revalidation rules, sample ring, budget; `test_monitor_tick` | built; on a test host the timer probes every minute and records ok samples; the failure path (a stopped slot) is checked in tests, not yet on the host |
+| 4 | Tick: timer, budget, probe, self-ping; `public_check` requires `ok` | stop a test slot → uptime check down within its grace; a release in progress is skipped | unit: skip and revalidation rules, sample ring, budget; `test_monitor_tick` | built; gate passed on a test host: the live container stopped by hand gave `probe-down` (502) within a minute, started again gave `probe-up` |
 | 5 | Watch: episodes, signals (local included), coverage, verdicts, history lines, `huta watch`, `status` | a release that throws on a test target ends `degraded` with reasons; a quiet one `ok`; API down for the window → `unknown` | unit: each signal, each state change, coverage thirds, re-evaluation from rows; crash: tick killed after each write, twice (`WatchTick`) | |
 | 6 | ↩️ button and the press; `ready`, `blocks`, `--ack`, the `on_degraded` hook | one press rolls a stateless test target back; a forged, reused, foreign or expired press is refused; a one-writer target gets a plan with buttons, not a rollback | `test_press` (as the approval-button tests); crash: `WatchRollback` (unit dies before planning, after planning, after approval) | |
 
