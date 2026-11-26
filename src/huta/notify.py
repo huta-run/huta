@@ -289,6 +289,20 @@ def _h(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+ASK_TRIES, ASK_TIMEOUT, ASK_PAUSE = 3, 10, 2
+
+
+def _not_modified(e: Exception) -> bool:
+    """Telegram's 400 for an edit that changes nothing: the keyboard is already there."""
+    import urllib.error
+    if not isinstance(e, urllib.error.HTTPError) or e.code != 400:
+        return False
+    try:
+        return "message is not modified" in e.read(4096).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
     """Put Deploy / Reject buttons on the release's history message (the configured topic), so
     there is one message per release, in one place (owner, 2026-11-09). Never raises."""
@@ -310,15 +324,28 @@ def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
                "postgres": "✅ Upgrade (site down meanwhile)"}.get(
             plan["kind"], "✅ Apply") if plan else "✅ Deploy"
         expires = created(st, rid) + ttl
-        _call(token, "editMessageReplyMarkup", {
-            "chat_id": msg["chat"], "message_id": msg["message_id"],
-            "reply_markup": {"inline_keyboard": [[
-                {"text": yes, "callback_data": f"{PREFIX}a:{a}"},
-                {"text": "❌ Reject", "callback_data": f"{PREFIX}r:{r}"}]]}})
+        # Recorded before the call: an answer lost on the way back (the keyboard is on the
+        # message) or a press faster than our write must still find its secrets.
         st.db.execute("INSERT OR REPLACE INTO approvals (release_id, approve_hash, reject_hash, expires,"
                       " chat, message_id) VALUES (?,?,?,?,?,?)",
                       (rid, _h(a), _h(r), expires, msg["chat"], msg["message_id"]))
+        markup = {"chat_id": msg["chat"], "message_id": msg["message_id"],
+                  "reply_markup": {"inline_keyboard": [[
+                      {"text": yes, "callback_data": f"{PREFIX}a:{a}"},
+                      {"text": "❌ Reject", "callback_data": f"{PREFIX}r:{r}"}]]}}
         del a, r
+        # One slow answer from Telegram left a plan with no buttons: try a few times, the same
+        # keyboard each time (a repeat that finds it already there is "not modified": done).
+        for attempt in range(ASK_TRIES):
+            try:
+                _call(token, "editMessageReplyMarkup", markup, timeout=ASK_TIMEOUT)
+                break
+            except Exception as e:  # noqa: BLE001
+                if _not_modified(e):
+                    break
+                if attempt == ASK_TRIES - 1:
+                    raise
+                time.sleep(ASK_PAUSE)
     except Exception as e:  # noqa: BLE001
         try:
             st.event("notify-failed", f"telegram buttons: {type(e).__name__}", rid)
