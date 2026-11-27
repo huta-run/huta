@@ -51,8 +51,9 @@ class Prep(Host):
                             "check": ["verify"]}]
         self.rid = self.st.new_release(project="notes", target="prod", sha="a" * 40,
                                        image_id="sha256:" + "1" * 64, image_tag="t",
-                                       app_toml=json.dumps(app), plan={}, plan_hash="0",
-                                       built_by="test")
+                                       app_toml=json.dumps(app),
+                                       plan={"effective": {"snapshot": app["snapshot"]}},
+                                       plan_hash="0", built_by="test")
         self.st.set_state(self.rid, "live")
         self.st.db.execute("INSERT INTO live (project, target, release_id, slot, since)"
                            " VALUES ('notes','prod',?,'a',0)", (self.rid,))
@@ -349,6 +350,15 @@ class Prepare(unittest.TestCase):
             self.assertEqual(h.st.snapshot(sid)["refusal"], "no-backup")
         finally:
             h.close()
+
+    def test_only_a_definition_the_owner_saw(self):
+        for plan in ({}, {"effective": {"snapshot": [{"name": "db", "cmd": ["other"],
+                                                       "timeout": 60, "component": "web"}]}}):
+            with self.subTest(plan=plan):
+                self.h.st.db.execute("UPDATE releases SET plan=? WHERE id=?",
+                                     (json.dumps(plan), self.h.rid))
+                with self.assertRaisesRegex(RuntimeError, "didn't show snapshot 'db'"):
+                    self.h.make()
 
     def test_create_refusals(self):
         with self.assertRaisesRegex(RuntimeError, "declares no snapshot 'other'"):

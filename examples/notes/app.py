@@ -152,11 +152,20 @@ def sanitize():
 
 
 def verify():
+    """The whole result must be counts: one file, exactly these keys, names of hit logs only,
+    whole numbers, and a total that adds up."""
+    import re
     out = os.environ.get("HUTA_SNAPSHOT_OUT", "/snapshot")
     if os.listdir(out) != ["hits.json"]:
         sys.exit("unexpected files in the snapshot")
-    d = json.load(open(f"{out}/hits.json"))
-    if not all(isinstance(v, int) for v in d["files"].values()):
+    with open(f"{out}/hits.json") as fh:
+        d = json.load(fh)
+    files = d.get("files") if isinstance(d, dict) else None
+    ok = (isinstance(d, dict) and set(d) == {"files", "total"} and isinstance(files, dict)
+          and all(re.fullmatch(r"hits\.[a-z]\.log(\.\d{8}-\d{6})?", k)
+                  and type(v) is int and v >= 0 for k, v in files.items())
+          and type(d["total"]) is int and d["total"] == sum(files.values()))
+    if not ok:
         sys.exit("hits.json holds more than counts")
     print("ok")
 

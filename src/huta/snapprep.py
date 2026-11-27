@@ -416,6 +416,13 @@ def create(platform: Platform, st, project: Project, t: Target, name: str, box: 
         raise RuntimeError(f"the live release declares no snapshot {name!r} (it has: {have})")
     if (app.get("state") or {}).get("kind") != "data":
         raise RuntimeError("snapshots of a database are planned (milestone S5)")
+    # Only a definition the owner saw: the live release's approved plan showed it as a 📦 line
+    # (it is in effective only where the registry allowed snapshots at planning time).
+    shown = (json.loads(rel["plan"] or "{}").get("effective") or {}).get("snapshot") or []
+    if d not in shown:
+        raise RuntimeError(f"the live release's plan didn't show snapshot {name!r} (it was planned "
+                           "before this target allowed snapshots, or the definition differs): "
+                           "release again so its 📦 line is approved")
     return st.new_snapshot(project=project.name, target=t.name, name=name, box=box,
                            transport=transport, release_id=rel["id"], definition=d,
                            reason=reason, per_day=t.snapshot["per_day"])
