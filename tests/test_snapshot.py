@@ -467,9 +467,14 @@ class Contract(unittest.TestCase):
         plat, reg = load(self.etc)
         project = reg["notes"]
         t = project.targets["prod"]
-        app = app_toml("notes")
+        app = {**app_toml("notes")}
+        app.pop("snapshot", None)
         self.assertNotIn("snapshot", recipe.effective(plat, project, t, app))
         app["snapshot"] = [{"name": "db", "cmd": ["x"], "timeout": 600, "component": "web"}]
+        self.assertNotIn("snapshot", recipe.effective(plat, project, t, app),
+                         "a target that allows none: nothing to run, nothing to show")
+        t = dataclasses.replace(t, snapshot={"max": 1, "keep": 1, "per_day": 1, "scratch": 1,
+                                             "canaries": []})
         self.assertEqual(recipe.effective(plat, project, t, app)["snapshot"], app["snapshot"])
 
     def test_plan_lines(self):
@@ -504,8 +509,11 @@ class Contract(unittest.TestCase):
         try:
             _plat, reg = load(self.etc)
             project, t = reg["notes"], reg["notes"].targets["prod"]
+            t = dataclasses.replace(t, snapshot={"max": 1 << 20, "keep": 3600, "per_day": 1,
+                                                 "scratch": 1 << 21, "canaries": []})
             plat = h.platform
-            base = (ROOT / "examples/notes/deploy/app.toml").read_text()
+            base = (ROOT / "examples/notes/deploy/app.toml").read_text().split(
+                "\n# A data snapshot")[0] + "\n"
             gh = mock.Mock()
             gh.compare.return_value = {"status": "ahead", "ahead": 1, "behind": 0}
             ctx = [mock.patch.object(recipe, "check_image_map", lambda *a, **k: None),

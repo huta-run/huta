@@ -48,7 +48,8 @@ component = "web"                        # whose image; default: the component t
 - Env: the registry's non-secret `env` of that component, `RELEASE_SHA`, `HUTA_PROJECT`,
   `HUTA_TARGET`, `HUTA_SNAPSHOT`. No secrets, no network. The box's `reason` never reaches it.
   The component's `limits` apply.
-- `[[snapshot]]` is part of `recipe.effective` only when non-empty (an absent key leaves every
+- `[[snapshot]]` is part of `recipe.effective` only when non-empty and the registry allows the
+  target snapshots (an absent key, or a target that allows none, leaves every
   golden byte-identical; `plan_release`'s defaults gain `"snapshot": []`). Adding, changing or
   removing one shows in the release plan on its own `📦` line with `cmd`, `check`, `component`
   and `timeout` (the code a later tap trusts), and `notify.render` shows that line in

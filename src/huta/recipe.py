@@ -168,7 +168,8 @@ def effective(platform: Platform, project: Project, t: Target, app: dict) -> dic
                              for n, e in app["external"].items()}} if app.get("external") else {}),
             **({"monitor": _monitor_effective(platform, project, t, app)} if t.monitor else {}),
             # The repo's sanitize commands (docs/PLAN-snapshot.md): code a later tap trusts.
-            **({"snapshot": app["snapshot"]} if app.get("snapshot") else {})}
+            # Only where the registry allows snapshots: elsewhere nothing can run them.
+            **({"snapshot": app["snapshot"]} if app.get("snapshot") and t.snapshot else {})}
 
 
 def _monitor_effective(platform, project, t, app) -> dict:

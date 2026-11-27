@@ -16,6 +16,9 @@ NOTES_FAIL=cf     every request that came through Cloudflare gets 503: loopback 
                   public checks fail, so huta switches back (rolled-back)
 NOTES_FAIL=root   / answers 500: the smoke check on the new slot fails (nothing-activated)
 python app.py rotate    the job: gzip-free rotation, keeps the last 3 rotated files
+python app.py sanitize  the [[snapshot]] "hits": reads the backup copy at /data and writes only
+                        counts (hits per file, no line of the logs) to /snapshot/hits.json
+python app.py verify    its check: /snapshot holds exactly hits.json, and it is only numbers
 """
 
 import glob
@@ -134,9 +137,37 @@ def rotate():
     print(f"rotated at {stamp}; {len(old[-3:])} rotated files kept")
 
 
+def sanitize():
+    out = os.environ.get("HUTA_SNAPSHOT_OUT", "/snapshot")
+    counts = {}
+    for f in sorted(glob.glob(f"{DATA}/hits.*.log*")):
+        try:
+            with open(f, "rb") as fh:
+                counts[os.path.basename(f)] = sum(1 for _ in fh)
+        except OSError:
+            pass
+    with open(f"{out}/hits.json", "w") as fh:
+        json.dump({"files": counts, "total": sum(counts.values())}, fh, indent=1, sort_keys=True)
+    print(f"{len(counts)} files, {sum(counts.values())} hits")
+
+
+def verify():
+    out = os.environ.get("HUTA_SNAPSHOT_OUT", "/snapshot")
+    if os.listdir(out) != ["hits.json"]:
+        sys.exit("unexpected files in the snapshot")
+    d = json.load(open(f"{out}/hits.json"))
+    if not all(isinstance(v, int) for v in d["files"].values()):
+        sys.exit("hits.json holds more than counts")
+    print("ok")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["rotate"]:
         rotate()
+    elif sys.argv[1:] == ["sanitize"]:
+        sanitize()
+    elif sys.argv[1:] == ["verify"]:
+        verify()
     else:
         # As PID 1 the process gets no default SIGTERM handling: exit cleanly when stopped.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

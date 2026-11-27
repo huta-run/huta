@@ -374,8 +374,9 @@ backup copy, mounted read-only at the component's data path, without network or 
 write its result to `/snapshot` (so the data path may not be or contain `/snapshot`). With a
 database, it will change a throwaway copy in place through `DATABASE_URL`. huta does not know
 what personal data is: removing it is this command's job. Adding, changing or removing one is
-shown in the release plan on its own 📦 line with the commands, and such a release always needs
-the owner's tap.
+shown in the release plan on its own 📦 line with the commands (on a target the host allows
+snapshots for; elsewhere the section does nothing), and such a release always needs the
+owner's tap.
 
 ```toml
 [[snapshot]]

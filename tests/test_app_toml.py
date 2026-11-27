@@ -223,20 +223,26 @@ class Monitor(unittest.TestCase):
 
 
 SNAP = '[[snapshot]]\nname = "db"\ncmd = ["python", "/app/app.py", "sanitize"]\n'
+NOTES_BARE = NOTES.split("\n# A data snapshot")[0] + "\n"     # the example without its own
 
 
 class Snapshot(unittest.TestCase):
     """[[snapshot]] (docs/PLAN-snapshot.md, milestone S1)."""
 
-    def parse(self, extra, text=NOTES, project="notes"):
+    def parse(self, extra, text=NOTES_BARE, project="notes"):
         return parse_app_toml(with_lines(text, after=extra), project)
+
+    def test_the_example_declares_one(self):
+        app = parse_app_toml(NOTES, "notes")
+        self.assertEqual([x["name"] for x in app["snapshot"]], ["hits"])
+        self.assertEqual(app["snapshot"][0]["check"], ["python", "/app/app.py", "verify"])
 
     def test_accepted_with_defaults(self):
         app = self.parse(SNAP)
         self.assertEqual(app["snapshot"], [{"name": "db", "cmd": ["python", "/app/app.py",
                                                                   "sanitize"],
                                             "timeout": 600, "component": "web"}])
-        self.assertNotIn("snapshot", parse_app_toml(NOTES, "notes"))
+        self.assertNotIn("snapshot", parse_app_toml(NOTES_BARE, "notes"))
 
     def test_check_timeout_component(self):
         app = self.parse(SNAP + 'check = ["python", "/app/app.py", "verify"]\ntimeout = "30m"\n'
@@ -256,20 +262,20 @@ class Snapshot(unittest.TestCase):
     def test_refused(self):
         bad = {
             "no state": (HELLO, "hello", SNAP, "needs \\[state\\]"),
-            "shell": (NOTES, "notes", SNAP.replace('["python", "/app/app.py", "sanitize"]',
+            "shell": (NOTES_BARE, "notes", SNAP.replace('["python", "/app/app.py", "sanitize"]',
                                                    '"python sanitize"'), "argv"),
-            "check shell": (NOTES, "notes", SNAP + 'check = "verify"\n', "argv"),
-            "timeout": (NOTES, "notes", SNAP + 'timeout = "31m"\n', "out of range"),
-            "unknown key": (NOTES, "notes", SNAP + 'network = true\n', "keys are"),
-            "duplicate": (NOTES, "notes", SNAP + SNAP, "unique"),
-            "bad name": (NOTES, "notes", SNAP.replace('"db"', '"DB"'), "unique lowercase"),
-            "no component": (NOTES, "notes", SNAP + 'component = "api"\n', "no component"),
-            "component type": (NOTES, "notes", SNAP + 'component = []\n', "no component"),
-            "six": (NOTES, "notes", "".join(SNAP.replace('"db"', f'"s{i}"') for i in range(6)),
+            "check shell": (NOTES_BARE, "notes", SNAP + 'check = "verify"\n', "argv"),
+            "timeout": (NOTES_BARE, "notes", SNAP + 'timeout = "31m"\n', "out of range"),
+            "unknown key": (NOTES_BARE, "notes", SNAP + 'network = true\n', "keys are"),
+            "duplicate": (NOTES_BARE, "notes", SNAP + SNAP, "unique"),
+            "bad name": (NOTES_BARE, "notes", SNAP.replace('"db"', '"DB"'), "unique lowercase"),
+            "no component": (NOTES_BARE, "notes", SNAP + 'component = "api"\n', "no component"),
+            "component type": (NOTES_BARE, "notes", SNAP + 'component = []\n', "no component"),
+            "six": (NOTES_BARE, "notes", "".join(SNAP.replace('"db"', f'"s{i}"') for i in range(6)),
                     "1 to 5"),
-            "overlap": (NOTES.replace('data = "/data"', 'data = "/snapshot/db"'), "notes", SNAP,
+            "overlap": (NOTES_BARE.replace('data = "/data"', 'data = "/snapshot/db"'), "notes", SNAP,
                         "overlaps"),
-            "overlap above": (NOTES.replace('data = "/data"', 'data = "/snapshot"'), "notes",
+            "overlap above": (NOTES_BARE.replace('data = "/data"', 'data = "/snapshot"'), "notes",
                               SNAP, "overlaps"),
         }
         for why, (text, project, extra, pattern) in bad.items():

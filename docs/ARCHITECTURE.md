@@ -55,7 +55,8 @@ unknown keys in `[components.*]`, `[images.*]` (`dockerfile`, `context`), `[stat
 `[[snapshot]]` (docs/PLAN-snapshot.md) names the repo's sanitize commands: 1..5, `name`, `cmd`
 and `check` (argv), `timeout` (≤ 30m), `component` (default: the one that mounts the data);
 only with data or a database, and the data path may not overlap `/snapshot`. It is part of
-`recipe.effective` only when declared, and `plan_release` shows each added, changed or removed
+`recipe.effective` only when declared on a target whose registry entry allows snapshots
+(elsewhere nothing can run it), and `plan_release` shows each added, changed or removed
 one as a `📦` line with its commands (Telegram shows it too), which makes the release `infra`. v1 keys
 (data mount, `concurrent_safe`, smoke checks, jobs) are specified in `DESIGN-v1.md` and the
 agent docs (`site/public/docs/contract.md`, `runtime.md`).

@@ -37,3 +37,11 @@ name = "rotate"
 cmd = ["python", "/app/app.py", "rotate"]
 schedule = "*-*-* 04:20:00"
 timeout = "5m"
+
+# A data snapshot a dev box may ask for (the host must allow it: snapshot = { … } on the target).
+# Runs on the last backup copy, without network or secrets; writes only counts.
+[[snapshot]]
+name = "hits"
+cmd = ["python", "/app/app.py", "sanitize"]
+check = ["python", "/app/app.py", "verify"]
+timeout = "2m"
