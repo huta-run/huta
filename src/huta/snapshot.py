@@ -367,7 +367,7 @@ def list_text(st, project: str | None = None, target: str | None = None,
                      + (f" {r['size'] >> 10} KiB" if r["size"] else "") for r in rows)
 
 
-def show_text(st, sid: str) -> str:
+def show_text(st, sid: str, platform: Platform | None = None) -> str:
     r = st.snapshot(sid)
     if r is None:
         raise SnapshotError(f"no snapshot {sid}")
@@ -384,4 +384,12 @@ def show_text(st, sid: str) -> str:
         out.append(f"  box says: {r['reason']}")
     for e in reversed(st.events(sid, limit=30)):
         out.append(f"  {_when(e['ts'])}  {e['kind']:<24} {e['msg']}")
+    for e in st.db.execute("SELECT * FROM events WHERE kind='snapshot-refused' AND msg LIKE ?"
+                           " ORDER BY id", (sid + ":%",)):
+        out.append(f"  {_when(e['ts'])}  {e['kind']:<24} {e['msg']}")   # host-only detail
+    log = work_dir(platform, r["project"], r["target"], sid) / "output.log" if platform else None
+    if log is not None and log.is_file() and not log.is_symlink():
+        text = log.read_text(errors="replace")
+        out.append("  output (root only, redacted):")
+        out += ["    " + x for x in text[-8192:].splitlines()]
     return "\n".join(out)

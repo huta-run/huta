@@ -22,7 +22,7 @@
   huta units <project> <target>                rewrite the job and backup timers
   huta egress sync                             refresh the egress daemon's policy
   huta stop|start|restart <project> <target>   the live slot (restart: picks up new secrets)
-  huta snapshot list|show|rm|sweep [id | project [target]]   data snapshots for dev boxes (records)
+  huta snapshot list|show|rm|sweep|prepare|export ...   data snapshots for dev boxes (host side)
 """
 
 from __future__ import annotations
@@ -1721,13 +1721,47 @@ def cmd_snapshot(a):
         SN.sweep(platform, st, a.args[0] if a.args else None,
                  a.args[1] if len(a.args) > 1 else None, log=say)
         return 0
+    sudo = os.environ.get("SUDO_USER", "")
+    who = sudo if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sudo) else "root"
+    if a.action == "prepare":
+        # Host only (milestone S2): make one for the operator; `--id` runs an existing row (the
+        # unit a box's request starts, S3).
+        from . import snapprep as SP_
+        registry = load_registry(platform=platform)
+        if a.id:
+            row = st.snapshot(a.id)
+            if row is None:
+                raise ConfigError(f"no snapshot {a.id}")
+            project = registry[row["project"]]
+            t = target_of(project, row["target"])
+            sid = a.id
+        else:
+            if len(a.args) != 3:
+                raise ConfigError("huta snapshot prepare <project> <target> <name>")
+            project = registry[a.args[0]]
+            t = target_of(project, a.args[1])
+            sid = SP_.create(platform, st, project, t, a.args[2], "host", "host")
+            say(f"snapshot {sid}: preparing")
+        state = SP_.prepare(platform, st, project, t, sid, log=say)
+        say(SN.show_text(st, sid, platform))
+        return 0 if state == S.SNAP_READY else 1
     if len(a.args) != 1:
         raise ConfigError(f"huta snapshot {a.action} <id>")
     if a.action == "show":
-        say(SN.show_text(st, a.args[0]))
+        say(SN.show_text(st, a.args[0], platform))
         return 0
-    sudo = os.environ.get("SUDO_USER", "")
-    who = sudo if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sudo) else "root"
+    if a.action == "export":
+        from . import snapprep as SP_
+        if not a.out:
+            raise ConfigError("huta snapshot export <id> --out FILE (or --out - for stdout)")
+        if a.out == "-":
+            n = SP_.export(platform, st, a.args[0], sys.stdout.buffer, who)
+        else:
+            fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                n = SP_.export(platform, st, a.args[0], f, who)
+        print(f"exported {n} bytes", file=sys.stderr)
+        return 0
     say(f"{a.args[0]}: {SN.remove(platform, st, a.args[0], who, log=say)}")
     return 0
 
@@ -2112,8 +2146,11 @@ def main(argv=None) -> int:
     s.add_argument("--from", dest="file"); s.set_defaults(f=cmd_secret)
     s = sub.add_parser("watch"); s.add_argument("release"); s.add_argument("--ack", action="store_true")
     s.set_defaults(f=cmd_watch)
-    s = sub.add_parser("snapshot"); s.add_argument("action", choices=["list", "show", "rm", "sweep"])
+    s = sub.add_parser("snapshot")
+    s.add_argument("action", choices=["list", "show", "rm", "sweep", "prepare", "export"])
     s.add_argument("args", nargs="*"); s.add_argument("--all", action="store_true")
+    s.add_argument("--id", help="prepare: an existing snapshot (the unit a request starts)")
+    s.add_argument("--out", help="export: the file to write (created, 0600), or - for stdout")
     s.set_defaults(f=cmd_snapshot)
     s = sub.add_parser("monitor"); s.add_argument("action", choices=["status", "ensure", "tick"])
     s.add_argument("project", nargs="?"); s.add_argument("target", nargs="?")

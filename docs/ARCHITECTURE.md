@@ -451,9 +451,10 @@ for unattended releases (`ready`, `blocks`, `--ack`). Job checks (milestone 3) a
 
 ## Snapshots (`snapshot.py`)
 
-Data snapshots for dev boxes (docs/PLAN-snapshot.md). Built so far (milestone S0): the records
-and their recovery; nothing creates a snapshot yet, and everything else in that plan is
-*planned*.
+Data snapshots for dev boxes (docs/PLAN-snapshot.md). Built so far (milestones S0-S2): the
+records and their recovery, the contract, and preparing a snapshot of a data volume on the
+host (`huta snapshot prepare`, `export`). Asking from a box, approval, delivery and Postgres
+are *planned*.
 
 - `snapshots` table (database version 5): one row per request, states `preparing → ready →
   approved → delivered → deleted`, or `failed` / `rejected` / `expired` / `needs-human`. At most
@@ -475,9 +476,38 @@ and their recovery; nothing creates a snapshot yet, and everything else in that 
   device; the work directory; the input links; the outbox copy) and strict (fixed parent, a
   name of the id's shape, never a symlink, `--one-file-system`); one that can't finish keeps
   the record as `needs-human` with an event and is retried by every sweep.
-- Host commands: `huta snapshot list [--all] [project [target]]`, `show <id>`, `rm <id>` (an
-  open snapshot is rejected with its plan, a running prepare stopped, then its files go),
-  `sweep`.
+- Host commands: `huta snapshot list [--all] [project [target]]`, `show <id>` (with the
+  refusal's detail and the command's output, root only), `rm <id>` (an open snapshot is
+  rejected with its plan, a running prepare stopped, then its files go), `sweep`,
+  `prepare <project> <target> <name>` (or `--id <id>`, what a box's request will run), and
+  `export <id> --out FILE|-` (the operator's own copy of a ready artifact, hash re-checked from
+  the fd it sends; a bypass of the owner's tap like `huta data export`, recorded).
+- **Prepare** (`snapprep.py`, data volumes): under the target's snapshot lock and one host-wide
+  prepare lock, never the target lock. The live release's definition and image
+  (`recipe.check_image`); a fresh needle set for the project (its live and all retired secret
+  files, the host's own tokens, the canaries; never staged or temporary files; a missing or
+  short canary fails closed); the current backup generation hard-linked to `snaps/<id>` under
+  the publish lock (refused past `max_age`); a room check (volumes, other scratch images, this
+  scratch and its packed copy, the reserve; `data._check_room` counts scratch images too); a
+  sparse ext4 image of `scratch` bytes mounted `loop,nodev,nosuid,noexec` at `<work>/mnt`, with
+  `mnt/out` (project uid, 0700) bound as `/snapshot`. Sanitize, then the repo's `check` with
+  `/snapshot` read-only, each as `docker run` with the diag hardening (`--network none`, no
+  secrets, the component's limits and env, the copy read-only at its data path), output
+  (256 KiB) through the needle set and the log gate into a root-only `output.log`. Every
+  container removed and verified gone, then the frozen tree: walked with directory fds, never
+  following a link (regular files with one link and directories only, one filesystem, names
+  `[A-Za-z0-9._-]` not starting with `-`, depth 16, 100 000 entries, paths 1024, a logical-size
+  cap of `scratch` so sparse files can't make root read zeros); every name and byte scanned
+  for the needles in 1 MiB chunks with an overlap; huta's own tar (sorted, 0:0, fixed modes and
+  mtime, GNU format, gzip mtime 0), capped at `max` while it is written, fsynced, renamed,
+  directory fsynced; scratch and input removed; then `ready` with size, sha256, file count,
+  the needle sources' fingerprint and the source (copy time, release, sha, image). A refusal
+  is a code (`sanitize-failed`, `check-failed`, `timeout`, `shape`, `too-big`, `secret-found`,
+  `secrets-unreadable`, `no-backup`, `too-old`, `no-room`, `error`); its detail (file names,
+  which secret) goes to a host event with no release id and to `huta snapshot show`, never to
+  the row a box will read. Each durable step is a step in the crash tests: killed after any,
+  the sweep leaves no container, mount, loop device, input links or scratch, and the backup
+  copy unchanged.
 - Backups: rotating a generation (`data._publish`, `recover_publish`, used by `pg.copy` too)
   and pinning one (`huta diag`'s hard links now, a snapshot's later) share a short lock,
   `<backup dir>/<p>/<t>/.publish.lock`, so a pin never sees a tree half-renamed or

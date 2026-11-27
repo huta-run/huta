@@ -375,7 +375,9 @@ You, the agent, cannot run these. They are listed so you can tell the human exac
 | `huta secret list\|set\|rm _platform [NAME]` | the host's own tokens (`GITHUB_TOKEN`, `CLOUDFLARE_API_TOKEN`, `BUGSINK_TOKEN`, `HEALTHCHECKS_API_KEY`, `MATOMO_TOKEN`); `set` reads the value from stdin; containers never get them |
 | `huta diag <project> <target> <name>` | as on dev; recorded with the operator's name |
 | `huta logs-collect` | store new slot output of every target, then apply the size caps (run every minute by `huta-logs.timer`) |
-| `huta snapshot list\|show\|rm\|sweep [id \| project [target]]` | data snapshots for dev boxes: the records, and the sweep that expires, deletes and cleans up after them (run hourly by `huta-snapshot.timer`). Asking for a snapshot from a box is *planned* (docs/PLAN-snapshot.md), so nothing creates one yet |
+| `huta snapshot list\|show\|rm\|sweep [id \| project [target]]` | data snapshots for dev boxes: the records (`show` adds the refusal's detail and the command's output, for the host only), and the sweep that expires, deletes and cleans up after them (run hourly by `huta-snapshot.timer`). Asking for a snapshot from a box is *planned* (docs/PLAN-snapshot.md) |
+| `huta snapshot prepare <project> <target> <name>` | make a snapshot on the host from the last backup copy of a data volume: the live release's `[[snapshot]]` command, then its `check`, no network or secrets; the result is validated (only plain files and directories, safe names, size caps, no secret or canary value in it) and packed. Refused with a code that says why |
+| `huta snapshot export <id> --out FILE\|-` | the operator's own copy of a ready snapshot (hash checked; recorded). Delivering one to a box is *planned* |
 | `huta log [release] [-n N]` | events (default 50) |
 | `huta intake` | pull: process the inbox (run by `huta-intake.service`, triggered by `huta-intake.path`) |
 | `huta push-request` | push: one request from `huta-ssh` (run by `huta-push.socket`). A refused request is answered and exits 0; only a huta error fails the unit |

@@ -143,7 +143,8 @@ def _check_room(platform: Platform, t: Target, img: Path) -> None:
     if t.data["bytes"] <= have:
         return
     outstanding = 0          # what all other volumes may still grow into
-    for other in (platform.state_dir / "data").glob("*/*.img"):
+    for other in [*(platform.state_dir / "data").glob("*/*.img"),
+                  *(platform.state_dir / "snapshots").glob("*/*/*/scratch.img")]:
         if other != img and other.is_file() and not other.is_symlink():
             st = other.stat()
             outstanding += max(0, st.st_size - st.st_blocks * 512)
