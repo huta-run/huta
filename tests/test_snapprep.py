@@ -258,6 +258,40 @@ class Prepare(unittest.TestCase):
         finally:
             h.close()
 
+    def test_partial_pin_is_removed_at_once(self):
+        real = self.h.sh
+
+        def cp_fails(cmd, timeout=600):
+            if cmd[0] == "cp":
+                tmp = cmd[-1]
+                os.makedirs(tmp)
+                open(os.path.join(tmp, "db.sqlite"), "wb").write(DB)
+                return subprocess.CompletedProcess(cmd, 1, "", "No space left")
+            return real(cmd, timeout)
+        with mock.patch.object(SN, "_sh", cp_fails):
+            sid, state = self.h.prepare()
+        self.assertEqual(state, S.SNAP_FAILED)
+        snaps = SN.input_dir(self.h.platform, "notes", "prod", sid).parent
+        self.assertEqual(sorted(os.listdir(snaps)), [], "no production data left behind")
+
+    def test_non_ascii_canary_fails_closed(self):
+        (self.h.etc / "secrets" / "notes" / "CANARY").write_text("cänary-123456\n")
+        sid, _ = self.h.prepare()
+        self.assertEqual(self.h.st.snapshot(sid)["refusal"], "secrets-unreadable")
+
+    def test_export_never_through_a_symlinked_parent(self):
+        sid, _ = self.h.prepare()
+        real = self.h.root / "real"
+        real.mkdir()
+        (self.h.root / "link").symlink_to(real)
+        with self.assertRaisesRegex(RuntimeError, "no symlink"):
+            SP.create_file(str(self.h.root / "link" / "x.tar.gz"))
+        self.assertEqual(list(real.iterdir()), [])
+        fd = SP.create_file(str(real / "x.tar.gz"))
+        os.close(fd)
+        with self.assertRaisesRegex(RuntimeError, "exists"):
+            SP.create_file(str(real / "x.tar.gz"))
+
     def test_check_failure(self):
         self.h.check_rc = 1
         sid, state = self.h.prepare()

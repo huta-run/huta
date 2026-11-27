@@ -481,12 +481,13 @@ are *planned*.
   rejected with its plan, a running prepare stopped, then its files go), `sweep`,
   `prepare <project> <target> <name>` (or `--id <id>`, what a box's request will run), and
   `export <id> --out FILE|-` (the operator's own copy of a ready artifact, hash re-checked from
-  the fd it sends; a bypass of the owner's tap like `huta data export`, recorded).
+  the fd it sends, written to a new 0600 file opened with no symlink anywhere on its path; a
+  bypass of the owner's tap like `huta data export`, recorded).
 - **Prepare** (`snapprep.py`, data volumes): under the target's snapshot lock and one host-wide
   prepare lock, never the target lock. The live release's definition and image
   (`recipe.check_image`); a fresh needle set for the project (its live and all retired secret
-  files, the host's own tokens, the canaries; never staged or temporary files; a missing or
-  short canary fails closed); the current backup generation hard-linked to `snaps/<id>` under
+  files, the host's own tokens, the canaries; never staged or temporary files; a missing,
+  short or non-ASCII canary fails closed); the current backup generation hard-linked to `snaps/<id>` under
   the publish lock (refused past `max_age`); a room check (volumes, other scratch images, this
   scratch and its packed copy, the reserve; `data._check_room` counts scratch images too); a
   sparse ext4 image of `scratch` bytes mounted `loop,nodev,nosuid,noexec` at `<work>/mnt`, with

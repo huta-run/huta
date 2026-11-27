@@ -1757,7 +1757,7 @@ def cmd_snapshot(a):
         if a.out == "-":
             n = SP_.export(platform, st, a.args[0], sys.stdout.buffer, who)
         else:
-            fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fd = SP_.create_file(os.path.abspath(a.out))
             with os.fdopen(fd, "wb") as f:
                 n = SP_.export(platform, st, a.args[0], f, who)
         print(f"exported {n} bytes", file=sys.stderr)

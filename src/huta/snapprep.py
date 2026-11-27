@@ -116,6 +116,9 @@ def needle_set(platform: Platform, project: str, canaries: list[str]):
             raise Refused("secrets-unreadable", f"canary {c} is missing") from None
         if len(v) < MIN_NEEDLE:
             raise Refused("secrets-unreadable", f"canary {c} is shorter than {MIN_NEEDLE}")
+        if not v.isascii():
+            # Matched in any case byte by byte, which only ASCII allows (codex review of S2).
+            raise Refused("secrets-unreadable", f"canary {c} must be ASCII")
         canary[v.lower().encode()] = f"canary {c}"
         for n in needles(v):
             out.setdefault(n.encode(), f"canary {c}")
@@ -476,7 +479,8 @@ def _release(platform: Platform, project: str, target: str, sid: str) -> None:
         img.unlink()
     inp = SN.input_dir(platform, project, target, sid)
     if inp is not None:
-        SN._rm_strict(inp, inp.parent, platform.backup["dir"])
+        for p in (inp, inp.parent / f".{sid}.tmp"):        # a pin cut short leaves the temp
+            SN._rm_strict(p, inp.parent, platform.backup["dir"])
 
 
 def _prepare(platform: Platform, st, project: Project, t: Target, row, log) -> dict:
@@ -609,6 +613,27 @@ def open_verified(platform: Platform, row) -> int:
     except BaseException:
         os.close(fd)
         raise
+
+
+def create_file(path: str) -> int:
+    """Create a new 0600 file at an absolute path for root to write, resolving every directory
+    with O_NOFOLLOW (another user can't redirect it through a symlinked parent); never an
+    existing file."""
+    p = Path(path)
+    if not p.is_absolute() or ".." in p.parts or not p.name:
+        raise RuntimeError(f"{path}: an absolute path to a new file")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in p.parts[1:-1]:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.open(p.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                       dir_fd=fd)
+    except OSError as e:
+        raise RuntimeError(f"{path}: {e.strerror} (a new file, no symlink on the way)") from None
+    finally:
+        os.close(fd)
 
 
 def export(platform: Platform, st, sid: str, out, who: str) -> int:
