@@ -158,8 +158,12 @@ def verify():
     out = os.environ.get("HUTA_SNAPSHOT_OUT", "/snapshot")
     if os.listdir(out) != ["hits.json"]:
         sys.exit("unexpected files in the snapshot")
+    def no_dupes(pairs):
+        if len({k for k, _v in pairs}) != len(pairs):
+            sys.exit("hits.json repeats a key")       # json.load would keep only the last
+        return dict(pairs)
     with open(f"{out}/hits.json") as fh:
-        d = json.load(fh)
+        d = json.load(fh, object_pairs_hook=no_dupes)
     files = d.get("files") if isinstance(d, dict) else None
     ok = (isinstance(d, dict) and set(d) == {"files", "total"} and isinstance(files, dict)
           and all(re.fullmatch(r"hits\.[a-z]\.log(\.\d{8}-\d{6})?", k)
