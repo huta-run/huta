@@ -295,7 +295,7 @@ same commit.
 |---|---|---|
 | S0 | Records: `snapshots` table, one id with plans, states, `sweep`, host `list/show/rm/sweep`; the publish lock and the copy time in backups | built |
 | S1 | Contract: `[[snapshot]]`, registry `snapshot`, `owner_gid`, the `📦` plan line | built |
-| S2 | Prepare for data volumes, validation, host-only `prepare`/`export` | built |
+| S2 | Prepare for data volumes, validation, host-only `prepare`/`export` | gate passed on a test host |
 | S3 | Approval and pull delivery: plan kind, history message, buttons, expiry, outbox, retention, box ops and client commands | planned |
 | S4 | Push delivery: the answer stream | planned |
 | S5 | Postgres targets: scratch server | planned |
