@@ -254,7 +254,8 @@ that server.
   CA certificate, the Cloudflare-only filter, and `reverse_proxy` to the **one** live slot (or a
   503 `not released yet` before the first release). Its first line names the project and
   target; when the registry changes the first host, huta still finds the file under the old
-  name by that line (two such files: refused, never guessed), and the next vhost change (a
+  name by that line (two such files, or one beside the new name: refused, never guessed), and
+  the next vhost change (a
   release, `huta edge --apply`) writes the new name and removes the old file in the same
   transaction.
 - **Cloudflare**: one Origin CA certificate per target covering all its hosts; a per-host
@@ -819,8 +820,9 @@ the call). An edit is tried again while time is left; the first message only whe
 left (no connection), since one that timed out after sending may have landed. Buttons whose
 posting failed are forgotten. Every minute the monitoring tick (`huta monitor tick`, with or
 without `[monitoring]`) gives a plan that has waited over 90 s, and hasn't expired, the message
-or buttons it lacks, and a box's submit answer says when the message didn't get there
-(`sudo huta approve <id>` meanwhile).
+or buttons it lacks (one retry at a time on the host; a first message whose send timed out
+after leaving may arrive twice, never not at all), and a box's submit answer says when the
+message didn't get there (`sudo huta approve <id>` meanwhile).
 
 ## One-tap approval
 

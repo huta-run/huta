@@ -17,6 +17,7 @@ import hmac
 import html
 import http.client
 import json
+import os
 import secrets
 import ssl
 import time
@@ -519,9 +520,24 @@ def pending(st: S.Store, now: float | None = None) -> list[str]:
 
 def retry_pending(platform, st: S.Store, end: float, log=lambda _m: None) -> int:
     """A waiting plan whose message or buttons never reached Telegram gets them now (run every
-    minute by the monitoring tick). Bounded by `end`. Returns how many it delivered."""
+    minute by the monitoring tick; one at a time on the host). Bounded by `end`. Returns how
+    many it delivered. A first message whose send timed out after leaving may in fact have
+    arrived; it is sent again (a message twice beats an approval nobody sees)."""
     if not _token(platform):
         return 0
+    import fcntl
+    fd = os.open(st.dir / "notify-retry.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0                       # another tick is at it
+        return _retry_pending(platform, st, end, log)
+    finally:
+        os.close(fd)
+
+
+def _retry_pending(platform, st: S.Store, end: float, log) -> int:
     n = 0
     for rid in pending(st):
         left = end - time.monotonic()

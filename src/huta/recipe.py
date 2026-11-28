@@ -486,7 +486,7 @@ def _http_check(url: str, check: dict, host_header: str | None,
             while len(body) <= SMOKE_BODY:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    return "answer too slow"
+                    return "answer too slow", False
                 try:
                     resp.fp.raw._sock.settimeout(left)       # type: ignore[attr-defined]
                 except AttributeError:

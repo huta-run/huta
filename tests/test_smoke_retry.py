@@ -79,6 +79,24 @@ class SmokeRetry(unittest.TestCase):
                                     30)
         self.assertEqual((out, len(calls)), ([], 2))
 
+    def test_slow_body_is_a_failure_not_a_crash(self):
+        class Slow(Resp):
+            def __init__(self):
+                super().__init__(200)
+                self.fp = mock.Mock()
+        out, calls = self.run_smoke_with_body([Slow()], {"path": "/", "status": 200,
+                                                         "contains": "ok"})
+        self.assertEqual(out, ["/: answer too slow"])
+
+    def run_smoke_with_body(self, answers, check):
+        clock = Clock()
+        ticks = iter([1000.0, 1000.0] + [1020.0] * 50)
+        fake_time = types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=clock.sleep)
+        with mock.patch.object(recipe, "_OPENER", mock.Mock(open=lambda req, timeout:
+                                                             answers[0])), \
+                mock.patch.object(recipe, "time", fake_time):
+            return recipe.smoke("https://www.example.org", [check], None, retry_for=30), None
+
     def test_no_retry_by_default(self):
         out, calls = self.run_smoke([self.nxdomain(), Resp(200)], 0)
         self.assertEqual(len(out), 1)

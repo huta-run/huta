@@ -287,12 +287,13 @@ def installed_path(platform: Platform, target: Target) -> Path | None:
     """Where this target's managed vhost is now: its first host's file, else the one file of
     this target under an older name (hosts changed). Two old ones: refused, never guessed."""
     p = vhost_path(platform, target)
+    stale = stale_vhosts(platform, target)
+    if len(stale) > 1 or (stale and p.exists()):
+        names = ([p.name] if p.exists() else []) + [x.name for x in stale]
+        raise EdgeError(f"{target.project}/{target.name} has several vhost files "
+                        f"({', '.join(names)}): keep one, then huta edge --apply")
     if p.exists():
         return p
-    stale = stale_vhosts(platform, target)
-    if len(stale) > 1:
-        raise EdgeError(f"{target.project}/{target.name} has several vhost files "
-                        f"({', '.join(x.name for x in stale)}): keep one, then huta edge --apply")
     return stale[0] if stale else None
 
 
@@ -311,9 +312,9 @@ def installed(platform: Platform, target: Target) -> str | None:
     `hosts[0]` the target's file under its old name is still its vhost (found by its marker
     line), until the next vhost change renames it."""
     p = vhost_path(platform, target)
+    where = installed_path(platform, target)      # refuses several files of the target
     if not p.exists():
-        old = installed_path(platform, target)
-        return old.read_text() if old is not None else None
+        return where.read_text() if where is not None else None
     text = p.read_text()
     if not _managed(text):
         if target.adopt == p.name:
@@ -443,7 +444,8 @@ def change_vhost(platform: Platform, target: Target, text: str, adopt: bool = Fa
     foreign = adopt_pending(platform, target) if adopt else None
     if foreign is not None and foreign != path:
         changes.append((foreign, None))
-    # hosts[0] changed: the file under the old name goes in the same transaction.
+    # hosts[0] changed: the file under the old name goes in the same transaction (only ever
+    # the one file of this target; several are refused by installed_path above).
     stale = stale_vhosts(platform, target)
     changes += [(x, None) for x in stale]
     if old != text or foreign is not None or stale:

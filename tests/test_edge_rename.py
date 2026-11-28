@@ -68,6 +68,13 @@ class FirstHostChanges(unittest.TestCase):
         with self.assertRaisesRegex(edge.EdgeError, "several vhost files"):
             edge.installed_path(self.host.platform, self.t)
 
+    def test_old_file_beside_the_new_one_is_refused(self):
+        self.new.write_text(self.old.read_text())
+        with self.assertRaisesRegex(edge.EdgeError, "several vhost files"):
+            edge.installed_path(self.host.platform, self.t)
+        with self.assertRaisesRegex(edge.EdgeError, "several vhost files"):
+            edge.installed(self.host.platform, self.t)
+
     def test_another_targets_file_is_left_alone(self):
         text = self.old.read_text().replace("target prod.", "target staging.")
         stray = self.host.platform.caddy_sites / "x.example.org.caddy"
