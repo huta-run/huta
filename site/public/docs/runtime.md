@@ -268,7 +268,9 @@ secret: redact in the app first, and name such lines in `log_drop`.
    and `X-Forwarded-Proto: https`. A failure stops the new slot; nothing changed
    (`nothing-activated`).
 2. **After the switch**, through Cloudflare at `https://<host>`, together with the public
-   `/healthz` check, while the old slot still runs. A failure reverts automatically for
+   `/healthz` check, while the old slot still runs. A check that gets no answer at all (the
+   name doesn't resolve yet, the connection fails) is tried again for up to 30 s, as the
+   `/healthz` check is; a wrong status, header or body is not. A failure reverts automatically for
    concurrent targets (`rolled-back`, the old release serves again) and for an adopted site's
    first release (the old config serves again). For one-writer targets it ends `needs-human`
    (see the table above). A first release with nothing to go back to ends `needs-human` too.

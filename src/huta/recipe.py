@@ -444,9 +444,28 @@ SMOKE_BODY = 1 << 20
 
 
 def http_check(url: str, check: dict, host_header: str | None, timeout: float = 10) -> str | None:
-    """One [[smoke]] check. None if it passed, else what was wrong. The app is untrusted: a real
-    wall-clock deadline for headers and body (each socket read is bounded by what is left),
-    no redirects, no proxies, the response always closed (codex code review #11)."""
+    """One [[smoke]] check. None if it passed, else what was wrong."""
+    return _http_check(url, check, host_header, timeout)[0]
+
+
+def _unreachable(e: Exception) -> bool:
+    """No answer at all: the name didn't resolve, the connection failed or timed out before
+    any response. Worth trying again (a resolver's cached NXDOMAIN for a name just created, a
+    dropped SYN); a wrong status, header or body never is."""
+    import socket
+    if isinstance(e, urllib.error.HTTPError):
+        return False
+    if isinstance(e, urllib.error.URLError):
+        return isinstance(e.reason, (OSError, socket.gaierror))
+    return isinstance(e, (ConnectionError, TimeoutError, socket.gaierror))
+
+
+def _http_check(url: str, check: dict, host_header: str | None,
+                timeout: float = 10) -> tuple[str | None, bool]:
+    """(None if it passed else what was wrong, whether it was unreachable). The app is
+    untrusted: a real wall-clock deadline for headers and body (each socket read is bounded by
+    what is left), no redirects, no proxies, the response always closed (codex code review
+    #11)."""
     headers = {"User-Agent": UA, "Accept-Encoding": "identity", **check.get("request_headers", {})}
     if host_header:
         headers.update({"Host": host_header, "X-Forwarded-Proto": "https"})
@@ -477,7 +496,7 @@ def http_check(url: str, check: dict, host_header: str | None, timeout: float = 
                     break
                 body += chunk
     except Exception as e:  # noqa: BLE001
-        return f"{type(e).__name__}: {e}"[:160]
+        return f"{type(e).__name__}: {e}"[:160], _unreachable(e) and resp is None
     finally:
         try:
             if resp is not None:
@@ -485,25 +504,37 @@ def http_check(url: str, check: dict, host_header: str | None, timeout: float = 
         except Exception:  # noqa: BLE001
             pass
     if status != check["status"]:
-        return f"status {status}, expected {check['status']}"
+        return f"status {status}, expected {check['status']}", False
     for name, want in check.get("headers", {}).items():
         got = ", ".join(hdrs.get_all(name) or []) if hdrs else ""
         if want not in got:
-            return f"header {name} does not contain {want!r} (got {got[:80]!r})"
+            return f"header {name} does not contain {want!r} (got {got[:80]!r})", False
     for name in check.get("headers_absent", []):
         got = hdrs.get_all(name) if hdrs else None
         if got:
-            return f"header {name} must be absent (got {', '.join(got)[:80]!r})"
+            return f"header {name} must be absent (got {', '.join(got)[:80]!r})", False
     if check.get("contains") and check["contains"].encode() not in body[:SMOKE_BODY]:
-        return f"body does not contain {check['contains']!r}"
-    return None
+        return f"body does not contain {check['contains']!r}", False
+    return None, False
 
 
-def smoke(base: str, checks: list[dict], host_header: str | None) -> list[str]:
-    """Every check against base; the list of failures (empty: all passed)."""
+PUBLIC_SMOKE_RETRY = 30     # seconds a public check may keep trying while there is no answer
+
+
+def smoke(base: str, checks: list[dict], host_header: str | None,
+          retry_for: float = 0) -> list[str]:
+    """Every check against base; the list of failures (empty: all passed). With retry_for, a
+    check that got no answer at all (a resolver or connection error) is tried again, every
+    2 s, until retry_for seconds have passed since the first try; an answer that is wrong is
+    never retried."""
     out = []
+    end = time.monotonic() + retry_for
     for c in checks:
-        why = http_check(base + c["path"], c, host_header)
+        while True:
+            why, unreachable = _http_check(base + c["path"], c, host_header)
+            if not (why and unreachable and time.monotonic() + 2 < end):
+                break
+            time.sleep(2)
         if why:
             out.append(f"{c['path']}: {why}")
     return out
@@ -1303,7 +1334,7 @@ def run(platform: Platform, st: S.Store, project: Project, t: Target, rid: str, 
     #    Cloudflare (crash-harness reviews).
     undo_pre = []
     if live and not adopting:
-        undo_pre = [[str(edge.vhost_path(platform, t)), edge.installed(platform, t)]]
+        undo_pre = edge.undo_state(platform, t)      # with a file under an older host name
     if adopting:
         vp, fp = edge.vhost_path(platform, t), edge.adopt_pending(platform, t)
         undo_pre = [[str(fp), fp.read_text()]]
@@ -1632,7 +1663,9 @@ def after_switch(platform, st, project, t, log) -> str | None:
         except RecipeError as e:
             problems.append(str(e))
     if not problems and checks:
-        problems = smoke(f"https://{t.hosts[0]}", checks, None)
+        # Through the CDN and public DNS: a name just created can be cached as NXDOMAIN by a
+        # resolver for a while, so no answer is tried again (a wrong answer never is).
+        problems = smoke(f"https://{t.hosts[0]}", checks, None, retry_for=PUBLIC_SMOKE_RETRY)
         if not problems:
             log(f"public smoke: {len(checks)} checks passed")
     if not problems:

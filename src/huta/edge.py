@@ -170,7 +170,7 @@ def render_vhost(platform: Platform, target: Target, cf_ranges: list[str],
     names = ", ".join(target.hosts)
     pem, key = cert
     lines = [
-        f"{MARKER} — project {target.project}, target {target.name}.",
+        marker_line(target),
         f"# Generated from /etc/huta/projects.d/{target.project}.toml. Do not edit by hand.",
         f"{names} {{",
         f"\ttls {pem} {key}",
@@ -255,12 +255,65 @@ def _managed(text: str) -> bool:
     return text.startswith((MARKER, *LEGACY_MARKERS))
 
 
+def marker_line(target: Target) -> str:
+    return f"{MARKER} — project {target.project}, target {target.name}."
+
+
+def stale_vhosts(platform: Platform, target: Target) -> list[Path]:
+    """This target's managed vhost files under another name than its first host's: left when
+    the registry changed `hosts[0]`. Found by their marker line, never by name."""
+    want = vhost_path(platform, target)
+    line = marker_line(target)
+    legacy = tuple(f"{m} — project {target.project}, target {target.name}."
+                   for m in LEGACY_MARKERS)
+    out = []
+    d = platform.caddy_sites
+    if not d.is_dir():
+        return out
+    for p in sorted(d.glob("*.caddy")):
+        if p == want or p.is_symlink() or not p.is_file():
+            continue
+        try:
+            with open(p, errors="replace") as f:
+                first = f.readline().rstrip("\n")
+        except OSError:
+            continue
+        if first == line or first in legacy:
+            out.append(p)
+    return out
+
+
+def installed_path(platform: Platform, target: Target) -> Path | None:
+    """Where this target's managed vhost is now: its first host's file, else the one file of
+    this target under an older name (hosts changed). Two old ones: refused, never guessed."""
+    p = vhost_path(platform, target)
+    if p.exists():
+        return p
+    stale = stale_vhosts(platform, target)
+    if len(stale) > 1:
+        raise EdgeError(f"{target.project}/{target.name} has several vhost files "
+                        f"({', '.join(x.name for x in stale)}): keep one, then huta edge --apply")
+    return stale[0] if stale else None
+
+
+def undo_state(platform: Platform, target: Target) -> list:
+    """[path, text or None] for every file a vhost change of this target touches: what puts
+    the served config back."""
+    p = vhost_path(platform, target)
+    out = [[str(p), p.read_text() if p.exists() else None]]
+    out += [[str(x), x.read_text()] for x in stale_vhosts(platform, target)]
+    return out
+
+
 def installed(platform: Platform, target: Target) -> str | None:
     """huta's vhost text, or None. A foreign file at that path is refused, unless it is the
-    file this target adopts (it will be replaced by the first release)."""
+    file this target adopts (it will be replaced by the first release). After a change of
+    `hosts[0]` the target's file under its old name is still its vhost (found by its marker
+    line), until the next vhost change renames it."""
     p = vhost_path(platform, target)
     if not p.exists():
-        return None
+        old = installed_path(platform, target)
+        return old.read_text() if old is not None else None
     text = p.read_text()
     if not _managed(text):
         if target.adopt == p.name:
@@ -390,7 +443,10 @@ def change_vhost(platform: Platform, target: Target, text: str, adopt: bool = Fa
     foreign = adopt_pending(platform, target) if adopt else None
     if foreign is not None and foreign != path:
         changes.append((foreign, None))
-    if old != text or foreign is not None:
+    # hosts[0] changed: the file under the old name goes in the same transaction.
+    stale = stale_vhosts(platform, target)
+    changes += [(x, None) for x in stale]
+    if old != text or foreign is not None or stale:
         changes.insert(0, (path, text))
     if not changes:
         return "vhost unchanged", []

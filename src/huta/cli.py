@@ -517,9 +517,11 @@ def cmd_submit(a):
             images[name] = _resolve_image(ref)[0]
     rid = submit_release(platform, project, st, t, sha, image_id, tag, images)
     st.event("submitted-by", f"CLI on {platform.host}", rid, project.name, t.name)
-    tell(platform, st, rid)
-    ask(platform, st, rid)
+    delivered = tell(platform, st, rid)
+    delivered = ask(platform, st, rid) and delivered
     print_plan(st, rid)
+    if not delivered:
+        say("\n" + UNDELIVERED.format(rid=rid))
     say(f"\napprove with: huta approve {rid}")
     return 0
 
@@ -581,19 +583,25 @@ def print_plan(st, rid):
     say(plan_text(st, rid))
 
 
-def tell(platform, st, rid: str, create: bool = True) -> None:
+def tell(platform, st, rid: str, create: bool = True) -> bool:
     """Update this release's history message (Telegram, edited in place) and, if the owner was
-    DMed buttons for it, that DM too. Never fails."""
+    DMed buttons for it, that DM too. Never fails; False when the message didn't get there."""
     from . import notify as N
     # 25 s: room for a second try of an edit when Telegram is slow (it was, now and then).
-    N.history(platform, st, rid, create, timeout=25)
+    ok = N.history(platform, st, rid, create, timeout=25)
     N.refresh_ask(platform, st, rid)
+    return ok
 
 
-def ask(platform, st, rid: str) -> None:
-    """DM the owner Deploy / Reject buttons for a new plan. Never fails."""
+def ask(platform, st, rid: str) -> bool:
+    """Put Deploy / Reject buttons on a new plan's message. Never fails; False when they
+    couldn't be posted (the monitoring tick tries again every minute)."""
     from . import notify as N
-    N.ask_owner(platform, st, rid, PLAN_TTL)
+    return N.ask_owner(platform, st, rid, PLAN_TTL)
+
+
+UNDELIVERED = ("the approval message did not reach Telegram; huta tries again every minute. "
+               "Approve on the host meanwhile: sudo huta approve {rid}")
 
 
 def retire_buttons(platform, st, rid: str) -> None:
@@ -1276,14 +1284,17 @@ def handle_request(platform, registry, st, req: dict, transport: str, box: str) 
         raise
     st.event("submitted-by", f"from {box} ({transport})", rid, project.name, t.name)
     text = plan_text(st, rid)
-    tell(platform, st, rid)
-    ask(platform, st, rid)
+    delivered = tell(platform, st, rid)
+    delivered = ask(platform, st, rid) and delivered
     notify(platform, f"huta: plan {rid} for {project.name}/{t.name} (from {box}, {transport}) "
                      f"waits for approval\n\napprove: sudo huta approve {rid}")
     from .notify import history_note
     note, warn = history_note(json.loads(st.release(rid)["plan"]))
+    # The box prints "next" as it is (every client version): an approval message that didn't
+    # reach Telegram is said there, so the agent can tell the owner.
     ans = {"ok": True, "release": rid, "state": S.PLANNED, "text": text,
-           "next": "waiting for the owner's approval"}
+           "next": "waiting for the owner's approval"
+           + ("" if delivered else "; " + UNDELIVERED.format(rid=rid))}
     if warn:
         ans["warning"] = note       # the client repeats it last, where it can't be missed
     return ans
@@ -1770,6 +1781,13 @@ def cmd_monitor(a):
     from . import monitor as M
     if a.action == "tick":
         platform, registry, st = ctx()
+        # Plans whose message or buttons didn't reach Telegram (every minute, with or without
+        # [monitoring]): a lost first message must not leave the owner unaware of a plan.
+        from . import notify as N
+        try:
+            N.retry_pending(platform, st, time.monotonic() + 15, log=say)
+        except Exception as e:  # noqa: BLE001
+            say(f"retrying plan messages: {type(e).__name__}")
         res = M.tick(platform, registry, st, log=say)
         if res.get("left"):
             say(f"tick out of time: {res['left']} target(s) wait for the next one")

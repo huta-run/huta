@@ -71,14 +71,14 @@ class AskOwner(unittest.TestCase):
         self.ask([TimeoutError("x")] * N.ASK_TRIES)
         self.assertEqual(len(self.calls), N.ASK_TRIES)
         self.assertEqual(self.failures(), ["telegram buttons: TimeoutError"])
-        self.assertIsNotNone(self.row(), "kept: the last try may have reached Telegram")
+        self.assertIsNone(self.row(), "forgotten, so the next try posts a fresh keyboard")
 
     def test_call_reads_the_error_body_in_its_thread(self):
         body = b'{"description":"Bad Request: message is not modified"}'
 
         def urlopen(_req, timeout):
             raise urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(body))
-        with mock.patch.object(N.urllib.request, "urlopen", urlopen), \
+        with mock.patch.object(N._OPENER, "open", urlopen), \
                 self.assertRaises(urllib.error.HTTPError) as cm:
             N._call("t", "editMessageReplyMarkup", {}, timeout=2)
         self.assertTrue(N._not_modified(cm.exception))
@@ -88,6 +88,130 @@ class AskOwner(unittest.TestCase):
         self.ask([e, {"ok": True}])
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.failures(), [])
+
+
+class Connect(unittest.TestCase):
+    """One address whose connects hang can't use up the call: each gets CONNECT_TRY seconds,
+    then the next is tried."""
+
+    def test_falls_back_to_the_next_address(self):
+        import socket
+        tried = []
+
+        class Sock:
+            def __init__(self, family, kind, proto):
+                self.family = family
+
+            def settimeout(self, t):
+                tried.append(("timeout", t))
+
+            def connect(self, addr):
+                tried.append(addr)
+                if self.family == socket.AF_INET6:
+                    raise TimeoutError("timed out")
+
+            def close(self):
+                pass
+        infos = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::9", 443, 0, 0)),
+                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.9", 443))]
+        conn = N._Conn("api.telegram.org", timeout=15)
+        conn._context = mock.Mock(wrap_socket=lambda sock, server_hostname: ("tls", sock))
+        with mock.patch.object(socket, "getaddrinfo", lambda *a: infos), \
+                mock.patch.object(socket, "socket", Sock):
+            conn.connect()
+        self.assertEqual([x for x in tried if x[0] != "timeout"],
+                         [("2001:db8::9", 443, 0, 0), ("192.0.2.9", 443)])
+        self.assertEqual(tried[0], ("timeout", N.CONNECT_TRY))
+        self.assertEqual(conn.sock[0], "tls")
+
+    def test_nothing_reachable_is_not_sent(self):
+        import socket
+
+        class Sock:
+            def __init__(self, *a):
+                pass
+
+            def settimeout(self, t):
+                pass
+
+            def connect(self, addr):
+                raise ConnectionRefusedError()
+
+            def close(self):
+                pass
+        conn = N._Conn("api.telegram.org", timeout=15)
+        with mock.patch.object(socket, "getaddrinfo", lambda *a: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.9", 443))]), \
+                mock.patch.object(socket, "socket", Sock), self.assertRaises(N.NotSent):
+            conn.connect()
+
+
+class FirstMessage(unittest.TestCase):
+    """The first send is tried again only when it never left; a plan whose message or buttons
+    didn't get there is retried by the tick, and the box is told."""
+
+    def setUp(self):
+        self.host = FakeHost()
+        self.project = self.host.registry["hello"]
+        self.t = self.project.targets["prod"]
+        self.platform = self.host.platform
+        self.platform.telegram.update({"owner_id": 1, "buttons": True, "history_chat": -100})
+        self.st = self.host.store()
+        self.rid = self.host.plan(self.project, self.t, app_toml("hello"), "1" * 40)
+        self.st.db.execute("UPDATE releases SET state='planned', plan=? WHERE id=?",
+                           ('{"project": "hello", "target": "prod", "sha": "' + "1" * 40 +
+                            '", "class": "code-only", "changes": [], "checks": {},'
+                            ' "effective": {}, "from": null}', self.rid))
+        self.sent = []
+
+    def tearDown(self):
+        self.st.db.close()
+        self.host.close()
+
+    def call(self, answers):
+        def call(_token, method, payload, timeout=15):
+            self.sent.append(method)
+            a = answers.pop(0) if answers else {"ok": True, "result": {"message_id": 7}}
+            if isinstance(a, BaseException):
+                raise a
+            return a
+        return call
+
+    def test_unsent_is_retried_sent_is_not(self):
+        with mock.patch.object(N, "_token", lambda _p: "t"), \
+                mock.patch.object(N, "_call", self.call([N.NotSent("no route")])), \
+                mock.patch.object(N.time, "sleep", lambda _s: None):
+            self.assertTrue(N.history(self.platform, self.st, self.rid, timeout=25))
+        self.assertEqual(self.sent, ["sendMessage", "sendMessage"])
+        self.sent.clear()
+        self.st.db.execute("DELETE FROM tg_messages")
+        with mock.patch.object(N, "_token", lambda _p: "t"), \
+                mock.patch.object(N, "_call", self.call([TimeoutError("telegram too slow")])):
+            self.assertFalse(N.history(self.platform, self.st, self.rid, timeout=25))
+        self.assertEqual(self.sent, ["sendMessage"], "may have landed: never sent twice")
+
+    def test_tick_retries_a_plan_that_never_got_there(self):
+        self.st.db.execute("UPDATE releases SET created=? WHERE id=?",
+                           (__import__("time").time() - 300, self.rid))
+        with mock.patch.object(N, "_token", lambda _p: "t"), \
+                mock.patch.object(N, "_call", self.call([])):
+            n = N.retry_pending(self.platform, self.st, __import__("time").monotonic() + 30)
+        self.assertEqual(n, 1)
+        self.assertEqual(self.sent, ["sendMessage", "editMessageReplyMarkup"])
+        self.sent.clear()
+        with mock.patch.object(N, "_token", lambda _p: "t"), \
+                mock.patch.object(N, "_call", self.call([])):
+            self.assertEqual(N.retry_pending(self.platform, self.st,
+                                             __import__("time").monotonic() + 30), 0)
+        self.assertEqual(self.sent, [], "delivered: left alone")
+
+    def test_fresh_and_expired_plans_are_left_to_others(self):
+        import time as _t
+        for age in (10, 31 * 60):
+            with self.subTest(age=age):
+                self.st.db.execute("UPDATE releases SET created=? WHERE id=?",
+                                   (_t.time() - age, self.rid))
+                self.assertEqual(N.pending(self.st), [])
 
 
 class Edit(unittest.TestCase):

@@ -52,6 +52,7 @@ class Scenario:
     online = False                 # r2 migrates online (r1 runs on both schemas; never restores)
     check_r2 = True                # with online: the repo's [migrate] check exists
     monitored = False              # the target reports errors, the repo asks for SENTRY_DSN
+    hosts_r1 = hosts_r2 = None     # the registry's hosts for r1, then for r2 (hosts[0] changes)
 
     def app(self):
         """The manifest both releases use (scenarios with several components shape it)."""
@@ -80,6 +81,10 @@ class Scenario:
             d = runtime.secret_dir(host.platform, project.name)
             d.mkdir(parents=True, exist_ok=True)
             (d / "HUTA_SENTRY_DSN_PROD").write_text("https://k@bugs.example.org/1\n")
+        import dataclasses as _dc
+        if self.hosts_r1:
+            t = _dc.replace(t, hosts=list(self.hosts_r1))
+            project.targets[t.name] = t
         app = self.app()
         r1 = None
         if self.adopt_file:
@@ -92,6 +97,9 @@ class Scenario:
                 a1["state"]["runs_on"] = [self.schema_r1, self.schema_r2]
             r1 = host.plan(project, t, a1, SHA1)
             self.assertEqual(host.release(project, t, r1), LIVE, "setup: r1 did not go live")
+        if self.hosts_r2:
+            t = _dc.replace(t, hosts=list(self.hosts_r2))
+            project.targets[t.name] = t
         if self.faults:
             host.fault(**self.faults)
         a2 = versioned(app, self.schema_r2, self.migrate_r2)
@@ -290,6 +298,14 @@ def versioned(app, schema, migrate=False):
 class StatelessRelease(Scenario, unittest.TestCase):
     """Both slots run during the swap; the vhost switch is the only cut-over."""
     project_name, target_name = "hello", "prod"
+
+
+class FirstHostChanges(Scenario, unittest.TestCase):
+    """The registry drops the apex between r1 and r2: r2's switch writes the vhost under its new
+    first host and removes the old file in the same transaction; a crash anywhere leaves one."""
+    project_name, target_name = "hello", "prod"
+    hosts_r1 = ("hello.example.org", "www.hello.example.org")
+    hosts_r2 = ("www.hello.example.org",)
 
 
 class MonitoredRelease(Scenario, unittest.TestCase):

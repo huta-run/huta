@@ -15,8 +15,10 @@ import base64
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import secrets
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -81,6 +83,51 @@ def _token(platform) -> str | None:
     return d if isinstance(d, str) and d else None
 
 
+CONNECT_TRY = 3       # seconds for one address's TCP connect before the next one is tried
+
+
+class NotSent(OSError):
+    """No connection to any of Telegram's addresses: the request never left, so even a
+    sendMessage may be tried again without posting twice."""
+
+
+class _Conn(http.client.HTTPSConnection):
+    """Connects to each of the host's addresses in turn with a short timeout, so one address
+    whose connects hang (seen with Telegram's IPv6 now and then) can't use up the whole call
+    before the next family gets a turn. The request's own timeout still bounds each read."""
+
+    def connect(self):
+        import socket
+        last: Exception | None = None
+        for family, kind, proto, _n, addr in socket.getaddrinfo(self.host, self.port, 0,
+                                                                 socket.SOCK_STREAM):
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(min(CONNECT_TRY, self.timeout or CONNECT_TRY))
+            try:
+                sock.connect(addr)
+            except OSError as e:
+                sock.close()
+                last = e
+                continue
+            sock.settimeout(self.timeout)
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            return
+        raise NotSent(f"no connection to {self.host}: {type(last).__name__ if last else 'no address'}")
+
+
+class _Handler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_Conn, req, context=ssl.create_default_context())
+
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _Handler)
+
+
+def _not_sent(e: BaseException) -> bool:
+    return isinstance(e, NotSent) or (isinstance(e, urllib.error.URLError)
+                                      and isinstance(getattr(e, "reason", None), NotSent))
+
+
 def _call(token: str, method: str, payload: dict, timeout: float = 15) -> dict:
     """One Bot API call, the whole exchange within `timeout` (the request runs in a thread
     abandoned at the deadline: socket timeouts only bound each wait)."""
@@ -92,7 +139,7 @@ def _call(token: str, method: str, payload: dict, timeout: float = 15) -> dict:
 
     def run():
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _OPENER.open(req, timeout=timeout) as r:
                 box.append(("ok", json.loads(r.read(65536))))
         except BaseException as e:  # noqa: BLE001 — handed to the caller
             if isinstance(e, urllib.error.HTTPError):
@@ -288,7 +335,17 @@ def history(platform, st: S.Store, rid: str, create: bool = True, timeout: float
             payload["message_thread_id"] = t["history_thread"]
         if due:             # the message id is known only after sending: recorded right after
             payload["reply_markup"] = _rollback_markup(platform, st, due, t["history_chat"], None)
-        res = _call(token, "sendMessage", payload, timeout)
+        # A send is tried again only when it never left (no connection): one that timed out
+        # after sending may have landed, and a second would post the message twice.
+        end = time.monotonic() + timeout
+        while True:
+            try:
+                res = _call(token, "sendMessage", payload, max(1.0, end - time.monotonic()))
+                break
+            except Exception as e:  # noqa: BLE001
+                if not _not_sent(e) or end - time.monotonic() < 3:
+                    raise
+                time.sleep(1)
         mid = res["result"]["message_id"]
         st.db.execute("INSERT OR REPLACE INTO tg_messages (release_id, chat, message_id, text)"
                       " VALUES (?,?,?,?)", (rid, t["history_chat"], mid, text))
@@ -382,20 +439,29 @@ def _not_modified(e: Exception) -> bool:
         and "message is not modified" in getattr(e, "tg_body", "")
 
 
-def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
+def buttons_on(platform) -> bool:
+    # Only once the relay plugin is installed: an unclaimed press would reach the chat agent as
+    # text, secret included.
+    return bool(_token(platform) and platform.telegram.get("owner_id")
+                and platform.telegram.get("buttons") is True)
+
+
+def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60, tries: int | None = None,
+              timeout: float | None = None) -> bool:
     """Put Deploy / Reject buttons on the release's history message (the configured topic), so
-    there is one message per release, in one place (owner, 2026-11-09). Never raises."""
+    there is one message per release, in one place (owner, 2026-11-09). Never raises. True when
+    the buttons are on the message, or there are none to put (buttons off); False when they
+    could not be posted: the secrets are forgotten then, and `retry_pending` tries again."""
+    tries = ASK_TRIES if tries is None else tries
+    timeout = ASK_TIMEOUT if timeout is None else timeout
     try:
         token = _token(platform)
-        owner = platform.telegram.get("owner_id")
-        # Only once the relay plugin is installed: an unclaimed press would reach the chat agent
-        # as text, secret included.
-        if not token or not owner or platform.telegram.get("buttons") is not True:
-            return
+        if not buttons_on(platform):
+            return True
         msg = st.db.execute("SELECT chat, message_id FROM tg_messages WHERE release_id=?",
                             (rid,)).fetchone()
         if not msg:
-            return
+            return False
         a = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
         r = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
         plan = st.plan_row(rid)
@@ -415,21 +481,65 @@ def ask_owner(platform, st: S.Store, rid: str, ttl: int = 30 * 60) -> None:
         del a, r
         # One slow answer from Telegram left a plan with no buttons: try a few times, the same
         # keyboard each time (a repeat that finds it already there is "not modified": done).
-        for attempt in range(ASK_TRIES):
+        for attempt in range(tries):
             try:
-                _call(token, "editMessageReplyMarkup", markup, timeout=ASK_TIMEOUT)
+                _call(token, "editMessageReplyMarkup", markup, timeout=timeout)
                 break
             except Exception as e:  # noqa: BLE001
                 if _not_modified(e):
                     break
-                if attempt == ASK_TRIES - 1:
+                if attempt == tries - 1:
                     raise
                 time.sleep(ASK_PAUSE)
+        return True
     except Exception as e:  # noqa: BLE001
         try:
+            # A keyboard that may not be there: its secrets go, so the next try posts a fresh
+            # one (a keyboard that did land answers "no longer valid" until then).
+            st.db.execute("DELETE FROM approvals WHERE release_id=?", (rid,))
             st.event("notify-failed", f"telegram buttons: {type(e).__name__}", rid)
         except Exception:  # noqa: BLE001
             pass
+        return False
+
+
+PENDING_AFTER = 90       # seconds a new plan is left to its own submit before the tick helps
+
+
+def pending(st: S.Store, now: float | None = None) -> list[str]:
+    """Plans still waiting, not expired, older than PENDING_AFTER (their submit is done)."""
+    now = time.time() if now is None else now
+    lo, hi = now - 30 * 60, now - PENDING_AFTER
+    out = [r["id"] for r in st.db.execute(
+        "SELECT id FROM releases WHERE state=? AND created BETWEEN ? AND ?", (S.PLANNED, lo, hi))]
+    out += [r["id"] for r in st.db.execute(
+        "SELECT id FROM plans WHERE state=? AND created BETWEEN ? AND ?", (S.PLANNED, lo, hi))]
+    return out
+
+
+def retry_pending(platform, st: S.Store, end: float, log=lambda _m: None) -> int:
+    """A waiting plan whose message or buttons never reached Telegram gets them now (run every
+    minute by the monitoring tick). Bounded by `end`. Returns how many it delivered."""
+    if not _token(platform):
+        return 0
+    n = 0
+    for rid in pending(st):
+        left = end - time.monotonic()
+        if left < 4:
+            break
+        has_msg = st.db.execute("SELECT 1 FROM tg_messages WHERE release_id=?",
+                                (rid,)).fetchone()
+        asked = st.db.execute("SELECT 1 FROM approvals WHERE release_id=?", (rid,)).fetchone()
+        if has_msg and (asked or not buttons_on(platform)):
+            continue
+        per = min(10.0, (left - 1) / 2)
+        if not has_msg and not history(platform, st, rid, create=True, timeout=per):
+            continue
+        if ask_owner(platform, st, rid, tries=1, timeout=min(10.0, end - time.monotonic() - 1)):
+            st.event("notified", "approval message delivered by the retry", rid)
+            log(f"plan {rid}: message delivered on a retry")
+            n += 1
+    return n
 
 
 def close_ask(platform, st: S.Store, rid: str) -> None:
