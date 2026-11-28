@@ -538,8 +538,11 @@ def retry_pending(platform, st: S.Store, end: float, log=lambda _m: None) -> int
 
 
 def _retry_pending(platform, st: S.Store, end: float, log) -> int:
+    import random
     n = 0
-    for rid in pending(st):
+    todo = pending(st)
+    random.shuffle(todo)           # plans that keep failing can't hold back the others
+    for rid in todo:
         left = end - time.monotonic()
         if left < 4:
             break
